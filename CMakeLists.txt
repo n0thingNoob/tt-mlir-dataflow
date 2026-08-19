@@ -44,6 +44,10 @@ option(TTMLIR_ENABLE_SHARED_LIB "Enable Shared lib building" ON)
 option(TTMLIR_ENABLE_EXPLORER "Enable cloning and building the explorer tool" ON)
 option(TTMLIR_ENABLE_TESTS "Enable building all tests" ON)
 option(TTMLIR_ENABLE_TOOLS "Enable building core tools (ttmlir-opt, ttmlir-lsp-server, ttmlir-translate, ttnn-standalone)" ON)
+option(TTMLIR_ENABLE_ASTRAIA "Enable the Astraia dataflow mapping extension" OFF)
+set(TTMLIR_ASTRAIA_SOURCE_DIR
+  "${CMAKE_CURRENT_SOURCE_DIR}/extensions/astraia"
+  CACHE PATH "Path to the Astraia extension source tree")
 option(TTMLIR_ENABLE_ALCHEMIST "Enable tt-alchemist lib" ON)
 option(TTMLIR_ENABLE_ALCHEMIST_WHEEL "Enable tt-alchemist wheel" OFF)  # Expensive to build
 option(CODE_COVERAGE "Enable coverage reporting" OFF)
@@ -200,6 +204,24 @@ endif()
 
 add_subdirectory(include)
 add_subdirectory(lib)
+if(TTMLIR_ENABLE_ASTRAIA)
+  get_filename_component(ASTRAIA_EXTENSION_SOURCE_DIR
+    "${TTMLIR_ASTRAIA_SOURCE_DIR}" ABSOLUTE
+    BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+  if(NOT EXISTS "${ASTRAIA_EXTENSION_SOURCE_DIR}/CMakeLists.txt")
+    message(FATAL_ERROR
+      "TTMLIR_ENABLE_ASTRAIA is ON, but Astraia was not found at "
+      "${ASTRAIA_EXTENSION_SOURCE_DIR}. Set TTMLIR_ASTRAIA_SOURCE_DIR to "
+      "an Astraia checkout or populate extensions/astraia.")
+  endif()
+  add_subdirectory("${ASTRAIA_EXTENSION_SOURCE_DIR}"
+                   "${CMAKE_CURRENT_BINARY_DIR}/extensions/astraia")
+  if(NOT TARGET AstraiaTransforms)
+    message(FATAL_ERROR
+      "The Astraia checkout did not define the required AstraiaTransforms "
+      "target: ${ASTRAIA_EXTENSION_SOURCE_DIR}")
+  endif()
+endif()
 if(MLIR_ENABLE_BINDINGS_PYTHON AND TTMLIR_ENABLE_BINDINGS_PYTHON)
   message(STATUS "Enabling Python API")
   set(TTMLIR_PYTHON_PACKAGES_DIR "${CMAKE_CURRENT_BINARY_DIR}/python_packages")
