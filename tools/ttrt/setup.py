@@ -47,8 +47,12 @@ ttmlir_build_dir = os.environ.get(
     os.path.join(src_dir, "build"),
 )
 
-metaldir = f"{src_dir}/third_party/tt-metal/src/tt-metal/build"
 ttmetalhome = os.environ.get("TT_METAL_RUNTIME_ROOT", "")
+metaldir = (
+    f"{ttmetalhome}/build"
+    if ttmetalhome
+    else f"{src_dir}/third_party/tt-metal/src/tt-metal/build"
+)
 
 os.environ["LDFLAGS"] = "-Wl,-rpath,'$ORIGIN'"
 enable_runtime = os.environ.get("TTMLIR_ENABLE_RUNTIME", "OFF") == "ON"
@@ -171,6 +175,19 @@ if enable_runtime:
         ]
 
         return ignored_items
+
+    # These directories are assembled from a version-pinned tt-metal checkout.
+    # Remove a previous wheel's contents first: copytree(..., dirs_exist_ok=True)
+    # otherwise preserves files removed or renamed between tt-metal revisions and
+    # can produce a mixed, uncompilable device-header tree.
+    runtime_source_dirs = [
+        f"{ttmlir_build_dir}/python_packages/ttrt/runtime/tt_metal",
+        f"{ttmlir_build_dir}/python_packages/ttrt/runtime/runtime",
+        f"{ttmlir_build_dir}/python_packages/ttrt/runtime/ttnn",
+        f"{ttmlir_build_dir}/python_packages/ttrt/runtime/tt-train",
+    ]
+    for runtime_source_dir in runtime_source_dirs:
+        shutil.rmtree(runtime_source_dir, ignore_errors=True)
 
     # copy metal dir folder
     shutil.copytree(

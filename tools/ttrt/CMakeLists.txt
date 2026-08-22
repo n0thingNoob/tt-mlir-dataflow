@@ -14,6 +14,12 @@ if(TT_RUNTIME_ENABLE_PERF_TRACE)
       COMMAND python -m pip install -r "${CMAKE_CURRENT_BINARY_DIR}/requirements-perf.txt")
 endif()
 
+set(TTRT_TT_METAL_RUNTIME_ROOT
+    "${TTMLIR_SOURCE_DIR}/third_party/tt-metal/src/tt-metal")
+if(TTMLIR_TTMETAL_SOURCE_DIR)
+  set(TTRT_TT_METAL_RUNTIME_ROOT "${TTMLIR_TTMETAL_SOURCE_DIR}")
+endif()
+
 add_custom_command(
   COMMAND rm -rf build
   COMMAND python -m pip install -r "${CMAKE_CURRENT_BINARY_DIR}/requirements.txt"
@@ -24,7 +30,7 @@ add_custom_command(
           TTMLIR_ENABLE_RUNTIME_TESTS=${TTMLIR_ENABLE_RUNTIME_TESTS}
           TT_RUNTIME_ENABLE_PERF_TRACE=${TT_RUNTIME_ENABLE_PERF_TRACE}
           TT_RUNTIME_DEBUG=${TT_RUNTIME_DEBUG}
-          TT_METAL_RUNTIME_ROOT=${TTMLIR_SOURCE_DIR}/third_party/tt-metal/src/tt-metal
+          TT_METAL_RUNTIME_ROOT=${TTRT_TT_METAL_RUNTIME_ROOT}
           TTMLIR_BINARY_DIR=${TTMLIR_BINARY_DIR}
           TTMLIR_VERSION_MAJOR=${TTMLIR_VERSION_MAJOR}
           TTMLIR_VERSION_MINOR=${TTMLIR_VERSION_MINOR}
@@ -76,3 +82,7 @@ add_mlir_python_modules(TTRTPythonModules
   INSTALL_PREFIX "python_packages/ttrt"
   DECLARED_SOURCES TTRTSources
 )
+
+# The wheel is assembled from TTMLIR_PYTHON_PACKAGES_DIR. Ensure the Python
+# package sources have been materialized there before setup.py scans it.
+add_dependencies(ttrt TTRTPythonModules)

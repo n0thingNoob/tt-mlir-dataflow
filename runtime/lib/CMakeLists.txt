@@ -39,7 +39,10 @@ target_link_libraries(TTMLIRRuntime
     TTRuntimeContext
     TTRuntimeDebug
     TTRuntimePerf
-    TTRuntimeWorkarounds
+    # WorkaroundEnv is part of the public runtime API and is also bound by the
+    # Python module. Keep it exported even when no other runtime object happens
+    # to reference it in a particular backend configuration.
+    "$<LINK_LIBRARY:WHOLE_ARCHIVE,TTRuntimeWorkarounds>"
     TTRuntimeDylibs
     TTRuntimeFabricConfig
     TTRuntimeMeshFabricConfig

@@ -4,8 +4,11 @@
 
 #include <numeric>
 
-#include "tt/runtime/detail/ttnn/types/global_tensor_cache.h"
 #include "tt/runtime/types.h"
+
+#if defined(TT_RUNTIME_ENABLE_TTNN)
+#include "tt/runtime/detail/ttnn/types/global_tensor_cache.h"
+#endif
 
 #include "tt/runtime/detail/python/nanobind_headers.h"
 #include <nanobind/stl/pair.h>
@@ -143,10 +146,12 @@ void registerBinaryBindings(nb::module_ &m) {
              return nb::bytearray(data, size);
            });
 
+#if defined(TT_RUNTIME_ENABLE_TTNN)
   nb::class_<tt::runtime::GlobalTensorCache>(m, "GlobalTensorCache")
       .def_static("get_instance", &tt::runtime::GlobalTensorCache::getInstance,
                   nb::rv_policy::reference)
       .def("clear", &tt::runtime::GlobalTensorCache::clear)
       .def("size", &tt::runtime::GlobalTensorCache::size);
+#endif
 }
 } // namespace tt::runtime::python
