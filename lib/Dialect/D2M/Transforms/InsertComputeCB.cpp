@@ -82,14 +82,16 @@ static unsigned getDMACBPort(GenericOp generic, Operation *op) {
 // can rewrite that operand to a wait/reserve result). Scratch and
 // reduction-scaler buffers are not CBs.
 static std::optional<std::pair<Value, OpOperand *>>
-traceCBUse(OpOperand &startUse, GenericOp generic) {
+traceCBUse(OpOperand &startUse, GenericOp generic,
+           const llvm::SetVector<Value> &dmaVisibleCBs) {
   OpOperand *cbUse = &startUse;
   Value value = startUse.get();
   while (value) {
     if (mlir::isa<MemRefType>(value.getType()) &&
         llvm::is_contained(generic.getAdditionalArgs(), value)) {
       Operation *definingOp = value.getDefiningOp();
-      if (definingOp && definingOp->getAttr("d2m.scratch_buffer")) {
+      if (definingOp && definingOp->getAttr("d2m.scratch_buffer") &&
+          !dmaVisibleCBs.contains(value)) {
         return std::nullopt;
       }
       if (utils::isReductionScalerBuffer(definingOp)) {
@@ -101,7 +103,8 @@ traceCBUse(OpOperand &startUse, GenericOp generic) {
     if (!definingOp || !generic->isProperAncestor(definingOp)) {
       return std::nullopt;
     }
-    if (mlir::isa<memref::CollapseShapeOp, memref::SubViewOp>(definingOp)) {
+    if (mlir::isa<memref::CollapseShapeOp, memref::ExpandShapeOp,
+                  memref::SubViewOp>(definingOp)) {
       cbUse = &definingOp->getOpOperand(0);
       value = definingOp->getOperand(0);
       continue;
@@ -113,16 +116,19 @@ traceCBUse(OpOperand &startUse, GenericOp generic) {
 
 // Compute-local L1 allocations, not CBs: no datamovement thread fills or drains
 // them, so a consumer naming one as an operand must not get a CB wait.
-static bool isComputeLocalBuffer(Value cb) {
+static bool isComputeLocalBuffer(Value cb,
+                                 const llvm::SetVector<Value> &dmaVisibleCBs) {
   Operation *definingOp = cb.getDefiningOp();
-  return definingOp && (definingOp->getAttr("d2m.scratch_buffer") ||
+  return definingOp && ((definingOp->getAttr("d2m.scratch_buffer") &&
+                         !dmaVisibleCBs.contains(cb)) ||
                         utils::isReductionScalerBuffer(definingOp));
 }
 
 // collapse_shape / subview compute an address into a CB; they do not wait
 // for or produce tiles. They are often hoisted above the loop that uses them.
 static bool isCBViewOp(Operation *op) {
-  return mlir::isa<memref::CollapseShapeOp, memref::SubViewOp>(op);
+  return mlir::isa<memref::CollapseShapeOp, memref::ExpandShapeOp,
+                   memref::SubViewOp>(op);
 }
 
 // Find the "raw" compute spans in a compute block: the outermost ancestor of
@@ -230,6 +236,7 @@ static LogicalResult insertCBOpsForCompute(
     Block *computeBlock, RewriterBase &rewriter,
     const llvm::SetVector<Value> &aliasedLoadCBs,
     const llvm::SetVector<Value> &aliasedStoreCBs,
+    const llvm::SetVector<Value> &dmaVisibleCBs,
     const llvm::DenseMap<unsigned, unsigned> &cbTransferDepth) {
   auto generic = cast<GenericOp>(computeBlock->getParentOp());
 
@@ -254,19 +261,19 @@ static LogicalResult insertCBOpsForCompute(
     using Access = std::pair<Operation *, OpOperand *>;
     llvm::MapVector<Value, SmallVector<Access>> spanConsumed, spanProduced;
     span->walk([&](memref::LoadOp ld) {
-      if (auto t = traceCBUse(ld->getOpOperand(0), generic)) {
+      if (auto t = traceCBUse(ld->getOpOperand(0), generic, dmaVisibleCBs)) {
         spanConsumed[t->first].push_back({ld, t->second});
       }
     });
     span->walk([&](memref::StoreOp st) {
       // memref.store operands: (value, memref, indices...).
-      if (auto t = traceCBUse(st->getOpOperand(1), generic)) {
+      if (auto t = traceCBUse(st->getOpOperand(1), generic, dmaVisibleCBs)) {
         spanProduced[t->first].push_back({st, t->second});
       }
     });
     span->walk([&](d2m::TileMatmulBlockOp mm) {
       for (OpOperand &operand : mm->getOpOperands()) {
-        auto t = traceCBUse(operand, generic);
+        auto t = traceCBUse(operand, generic, dmaVisibleCBs);
         if (!t) {
           continue;
         }
@@ -313,12 +320,12 @@ static LogicalResult insertCBOpsForCompute(
         return;
       }
       if (auto ld = mlir::dyn_cast<memref::LoadOp>(op)) {
-        if (auto t = traceCBUse(ld->getOpOperand(0), generic)) {
+        if (auto t = traceCBUse(ld->getOpOperand(0), generic, dmaVisibleCBs)) {
           blockConsumed[t->first].push_back({ld, t->second});
         }
       } else if (auto st = mlir::dyn_cast<memref::StoreOp>(op)) {
         // memref.store operands: (value, memref, indices...).
-        if (auto t = traceCBUse(st->getOpOperand(1), generic)) {
+        if (auto t = traceCBUse(st->getOpOperand(1), generic, dmaVisibleCBs)) {
           blockProduced[t->first].push_back({st, t->second});
         }
       }
@@ -352,7 +359,7 @@ static LogicalResult insertCBOpsForCompute(
       }
     }
     for (OpOperand &operand : op->getOpOperands()) {
-      if (isComputeLocalBuffer(operand.get())) {
+      if (isComputeLocalBuffer(operand.get(), dmaVisibleCBs)) {
         continue;
       }
       if (sync.isConsumer(operand)) {
@@ -375,7 +382,8 @@ static LogicalResult insertCBOpsForCompute(
       directCBUses;
   computeBlock->walk([&](Operation *op) {
     if (mlir::isa<memref::LoadOp, memref::StoreOp, memref::CollapseShapeOp,
-                  memref::SubViewOp, d2m::TileMatmulBlockOp>(op) ||
+                  memref::ExpandShapeOp, memref::SubViewOp,
+                  d2m::TileMatmulBlockOp>(op) ||
         mlir::isa<SynchronizableOpInterface>(op) ||
         mlir::isa<ShardDMAOpInterface>(op)) {
       return;
@@ -384,7 +392,7 @@ static LogicalResult insertCBOpsForCompute(
       if (!mlir::isa<MemRefType>(operand.get().getType())) {
         continue;
       }
-      if (auto t = traceCBUse(operand, generic)) {
+      if (auto t = traceCBUse(operand, generic, dmaVisibleCBs)) {
         directCBUses[t->first].push_back({op, t->second});
       }
     }
@@ -676,12 +684,36 @@ public:
       llvm::DenseMap<unsigned, unsigned>
           cbTransferDepth; // generic operand index --> loop nest depth of its
                            // DMA marker
+      llvm::SetVector<Value> dmaVisibleCBs;
+      bool invalidLocalCopy = false;
       dmBlock->walk([&](ShardDMAOpInterface dma) {
-        cbTransferDepth[getDMACBPort(generic, dma.getOperation())] =
-            forDepth(dma.getOperation());
+        unsigned port = getDMACBPort(generic, dma.getOperation());
+        unsigned depth = forDepth(dma.getOperation());
+        cbTransferDepth[port] = depth;
+        dmaVisibleCBs.insert(generic->getOperand(port));
+        // LocalCopy synchronizes two CBs. ShardDMAOpInterface exposes the
+        // destination port for scheduling, but its source is also shared with
+        // compute and needs a matching reserve/push cadence. This is most
+        // visible for a compute-produced scratch tile copied by the DMA thread.
+        if (auto copy = mlir::dyn_cast<LocalCopyOp>(dma.getOperation())) {
+          auto srcGetCB = copy.getSrcCb().getDefiningOp<GetCBOp>();
+          if (!srcGetCB) {
+            copy.emitError("explicit local_copy source must be a d2m.get_cb");
+            invalidLocalCopy = true;
+            return;
+          }
+          unsigned srcPort = srcGetCB.getCbOperandIdx();
+          cbTransferDepth[srcPort] = depth;
+          dmaVisibleCBs.insert(generic->getOperand(srcPort));
+        }
       });
+      if (invalidLocalCopy) {
+        signalPassFailure();
+        return;
+      }
       if (failed(insertCBOpsForCompute(computeBlock, rewriter, aliasedLoadCBs,
-                                       aliasedStoreCBs, cbTransferDepth))) {
+                                       aliasedStoreCBs, dmaVisibleCBs,
+                                       cbTransferDepth))) {
         signalPassFailure();
         return;
       }

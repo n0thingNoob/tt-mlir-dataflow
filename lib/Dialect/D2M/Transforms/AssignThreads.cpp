@@ -10,6 +10,7 @@
 #include "ttmlir/Dialect/D2M/Utils/CBUtils.h"
 
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/IRMapping.h"
 
 namespace mlir::tt::d2m {
@@ -160,6 +161,21 @@ public:
 
     for (GenericOp generic : generics) {
       Block *block = &generic.getRegion(0).front();
+      // One-shot bufferization may make an out-of-place tensor update explicit
+      // as memref.copy.  Inside a D2M generic that copy is a local DMA and must
+      // participate in CB/thread assignment like d2m.local_copy.
+      SmallVector<memref::CopyOp> memrefCopies;
+      generic.getRegion(0).walk(
+          [&](memref::CopyOp copy) { memrefCopies.push_back(copy); });
+      for (memref::CopyOp copy : memrefCopies) {
+        auto dstType = cast<ShapedType>(copy.getTarget().getType());
+        AffineMap identity = rewriter.getMultiDimIdentityMap(dstType.getRank());
+        rewriter.setInsertionPoint(copy);
+        rewriter.create<LocalCopyOp>(
+            copy.getLoc(), copy.getSource(), copy.getTarget(),
+            rewriter.getAffineMapArrayAttr({identity, identity}));
+        rewriter.eraseOp(copy);
+      }
       // Lower data-movement ops to explicit-CB form, then record each leaf op's
       // destination thread.
       lowerDMAOpsToExplicitCB(generic, block, rewriter);

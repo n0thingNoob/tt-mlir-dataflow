@@ -62,6 +62,17 @@ public:
     }
   }
 
+  static void
+  collectRuntimeOperandIndicesFromArgs(ArrayRef<ttkernel::ArgAttr> args,
+                                       DenseSet<size_t> &indices) {
+    for (ttkernel::ArgAttr arg : args) {
+      if (arg.getArgType() != ttkernel::ArgType::CBPort &&
+          arg.getArgType() != ttkernel::ArgType::NamedArgument) {
+        indices.insert(arg.getOperandIndex());
+      }
+    }
+  }
+
   DenseSet<size_t> collectReferencedCBOperandIndices(ArrayAttr threads) const {
     DenseSet<size_t> indices;
     for (Attribute threadAttr : threads) {
@@ -74,6 +85,23 @@ public:
       assert(kernelSpec && "thread kernel must have an ArgSpec");
       collectCBOperandIndicesFromArgs(kernelSpec.getRtArgs(), indices);
       collectCBOperandIndicesFromArgs(kernelSpec.getCtArgs(), indices);
+    }
+    return indices;
+  }
+
+  DenseSet<size_t>
+  collectReferencedRuntimeOperandIndices(ArrayAttr threads) const {
+    DenseSet<size_t> indices;
+    for (Attribute threadAttr : threads) {
+      d2m::ThreadAttr thread = mlir::cast<d2m::ThreadAttr>(threadAttr);
+      auto kernelFunc = symbolTable_->lookup<func::FuncOp>(
+          thread.getKernelSymbol().getRootReference());
+      assert(kernelFunc && "thread kernel symbol must resolve");
+      auto kernelSpec = kernelFunc->getAttrOfType<ttkernel::ArgSpecAttr>(
+          ttkernel::ArgSpecAttr::name);
+      assert(kernelSpec && "thread kernel must have an ArgSpec");
+      collectRuntimeOperandIndicesFromArgs(kernelSpec.getRtArgs(), indices);
+      collectRuntimeOperandIndicesFromArgs(kernelSpec.getCtArgs(), indices);
     }
     return indices;
   }
@@ -213,6 +241,8 @@ public:
     DenseMap<size_t, size_t> cbOperandIndexToPort;
     DenseSet<size_t> referencedCBOperandIndices =
         collectReferencedCBOperandIndices(op.getThreads());
+    DenseSet<size_t> referencedRuntimeOperandIndices =
+        collectReferencedRuntimeOperandIndices(op.getThreads());
     unsigned ioSize = op.getInputsAndOutputs().size();
     for (unsigned i = 0; i < op.getAdditionalArgs().size(); ++i) {
       auto operandIndex = ioSize + i;
@@ -227,6 +257,10 @@ public:
                      mlir::dyn_cast_if_present<MemRefType>(operand.getType());
                  memrefType) {
         if (!referencedCBOperandIndices.contains(operandIndex)) {
+          if (referencedRuntimeOperandIndices.contains(operandIndex)) {
+            argMapping[operandIndex] = args.size();
+            args.push_back(getUnderlyingMemref(operand));
+          }
           continue;
         }
         // Hoisted CB buffer (already converted to CreateBufferOp by

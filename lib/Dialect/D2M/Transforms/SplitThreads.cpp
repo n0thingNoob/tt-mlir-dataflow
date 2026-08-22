@@ -132,7 +132,8 @@ static LogicalResult checkComputeSyncScope(GenericOp generic) {
       Value v = worklist.pop_back_val();
       cbValueToPort.try_emplace(v, port);
       for (Operation *user : v.getUsers()) {
-        if (isa<memref::CollapseShapeOp, memref::SubViewOp>(user)) {
+        if (isa<memref::CollapseShapeOp, memref::ExpandShapeOp,
+                memref::SubViewOp>(user)) {
           worklist.push_back(user->getResult(0));
         }
       }
@@ -151,7 +152,8 @@ static LogicalResult checkComputeSyncScope(GenericOp generic) {
     if (isa<SynchronizableOpInterface>(op)) {
       synchronizableParents.insert(op->getParentOp());
     }
-    if (isa<memref::CollapseShapeOp, memref::SubViewOp>(op)) {
+    if (isa<memref::CollapseShapeOp, memref::ExpandShapeOp, memref::SubViewOp>(
+            op)) {
       return; // a view, not an access
     }
     if (isa<ShardDMAOpInterface>(op)) {

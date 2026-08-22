@@ -51,3 +51,45 @@ module attributes {ttcore.device = #any_device} {
 // CHECK: %[[GEN:.*]] = d2m.generic {block_factors = [1, 8], grid = #ttcore.grid<1x1>
 // CHECK: ins(%[[IN0_1X8]], %[[IN1_1X8]] : tensor<1x8x32x32xf32, {{.*}}>, tensor<1x8x32x32xf32, {{.*}}>)
 // CHECK: outs(%[[OUT_1X1]] : tensor<1x1x32x256xf32, {{.*}}>)
+
+// -----
+
+// tensor.insert is destination-style, but its destination is not its final
+// operand (dynamic indices follow it). GridSelection must derive the cloned
+// result type through DestinationStyleOpInterface instead of operand position.
+#any_device = #ttcore.device<workerGrid = #ttcore.grid<8x8, virt_to_physical_map = (d0, d1) -> (0, d0, d1), physical_to_virt_map = (d0, d1) -> (0, d0, d1)>, dramGrid = #ttcore.grid<1x12>, l1Map = (d0, d1, d2)[s0] -> (0, d0, d1, d2 + s0), dramMap = (d0, d1, d2)[s0, s1] -> (0, 0, 0, d0 * s1 + d1 * s1 + d2 + s0), meshShape = , chipIds = [0]>
+#layout2d = #ttcore.metal_layout<logical_shape = 32x256, dim_alignments = 32x32, collapsed_intervals = dense<> : tensor<0x2xi64>, l1, sharded>
+#parallel = #ttcore.iterator_type<parallel>
+
+module attributes {ttcore.device = #any_device} {
+  func.func @tensor_insert_result_type(%arg0: tensor<32x256xf32>) -> tensor<32x256xf32> {
+    %empty = d2m.empty() : tensor<1x1x32x256xf32, #layout2d>
+    %input = d2m.to_layout %arg0, %empty : tensor<32x256xf32> into tensor<1x1x32x256xf32, #layout2d> -> tensor<1x1x32x256xf32, #layout2d>
+    %output = d2m.empty() : tensor<1x1x32x256xf32, #layout2d>
+    %result = d2m.generic {
+      block_factors = [1, 1],
+      grid = #ttcore.grid<1x1>,
+      indexing_maps = [
+        affine_map<(d0, d1) -> (d0, d1)>,
+        affine_map<(d0, d1) -> (d0, d1)>],
+      iterator_types = [#parallel, #parallel],
+      threads = [#d2m.thread<unified>]
+    }
+    ins(%input : tensor<1x1x32x256xf32, #layout2d>)
+    outs(%output : tensor<1x1x32x256xf32, #layout2d>) {
+    ^unified0:
+      %c0 = arith.constant 0 : index
+      %tile = tensor.empty() : tensor<32x256xf32>
+      %value = tensor.extract %tile[%c0, %c0] : tensor<32x256xf32>
+      %inserted = tensor.insert %value into %tile[%c0, %c0] : tensor<32x256xf32>
+      d2m.yield %inserted : (tensor<32x256xf32>)
+    } : tensor<1x1x32x256xf32, #layout2d>
+    %host = d2m.empty() : tensor<32x256xf32>
+    %return = d2m.to_layout %result, %host : tensor<1x1x32x256xf32, #layout2d> into tensor<32x256xf32> -> tensor<32x256xf32>
+    return %return : tensor<32x256xf32>
+  }
+}
+
+// CHECK-LABEL: func.func @tensor_insert_result_type
+// CHECK: %[[INSERTED:.*]] = tensor.insert {{.*}} : tensor<32x32xf32>
+// CHECK: d2m.yield %[[INSERTED]] : (tensor<32x32xf32>)

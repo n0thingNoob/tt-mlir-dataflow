@@ -1195,7 +1195,12 @@ public:
         bcastType = ttkernel::BcastType::None;
         break;
       }
-      auto cb = getCB(rewriter, op.getInput());
+      // A fused reduction leaves its result in DST.  Unary bcast still needs
+      // a CB solely for data-format configuration, so use the output CB in
+      // that case instead of trying to convert the implicit DST memref to a
+      // CB handle.
+      auto cb = operandFromDst(op.getInput()) ? getOutCB(rewriter, op)
+                                              : getCB(rewriter, op.getInput());
       auto dstIdx = getDstIdxFromResult(op.getResult());
       ensureDominatesInsertionPoint(rewriter, dstIdx);
       rewriter.create<ttkernel::UnaryBcastInitOp>(op->getLoc(), cb, cb,

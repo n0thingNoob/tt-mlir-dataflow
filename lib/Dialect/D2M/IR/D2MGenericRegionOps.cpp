@@ -56,6 +56,23 @@ static Type getElemType(Type ty) {
   return ty;
 }
 
+static std::optional<unsigned>
+findGenericOperandIndexThroughViews(GenericOp genericOp, Value value) {
+  while (value) {
+    for (auto [index, operand] : llvm::enumerate(genericOp.getOperands())) {
+      if (operand == value) {
+        return index;
+      }
+    }
+    auto view = value.getDefiningOp<ViewOpInterface>();
+    if (!view || view.isComposite()) {
+      return std::nullopt;
+    }
+    value = view.getInput();
+  }
+  return std::nullopt;
+}
+
 static mlir::ConstantIntRanges getIndexRange(uint64_t umin, uint64_t umax) {
   unsigned width = mlir::IndexType::kInternalStorageBitWidth;
   return mlir::ConstantIntRanges::fromUnsigned(mlir::APInt(width, umin),
@@ -726,13 +743,8 @@ bool LocalCopyOp::hasTensorSemantics() {
   // when inside a generic.
   if (auto genericOp = getOperation()->getParentOfType<GenericOp>()) {
     Value memrefOperand = getMemref();
-    std::optional<unsigned> operandIndex;
-    for (auto [idx, operand] : llvm::enumerate(genericOp.getOperands())) {
-      if (operand == memrefOperand) {
-        operandIndex = idx;
-        break;
-      }
-    }
+    std::optional<unsigned> operandIndex =
+        findGenericOperandIndexThroughViews(genericOp, memrefOperand);
     // Also allow scratch allocations.
     if (!operandIndex &&
         !isa_and_nonnull<ScratchAllocateOp>(memrefOperand.getDefiningOp())) {
@@ -918,13 +930,9 @@ void WriteColMaskTileOp::getEffects(
   // when inside a generic.
   if (auto genericOp = getOperation()->getParentOfType<GenericOp>()) {
     Value memrefOperand = getMemref();
-    bool foundInOperands = false;
-    for (Value operand : genericOp.getOperands()) {
-      if (operand == memrefOperand) {
-        foundInOperands = true;
-        break;
-      }
-    }
+    bool foundInOperands =
+        findGenericOperandIndexThroughViews(genericOp, memrefOperand)
+            .has_value();
     // Also allow scratch allocations
     if (!foundInOperands &&
         !isa_and_nonnull<ScratchAllocateOp>(memrefOperand.getDefiningOp())) {
@@ -1586,18 +1594,40 @@ mlir::LogicalResult RemoteLoadOp::bufferize(
         "RemoteLoadOp with CB should not exist during bufferization");
   }
 
-  // Result-only mode: no CB, just the result
+  // Tensor-result mode normally carries a result.  A mixed bridge form with
+  // a memref local destination and tensor remote source is also supported: it
+  // exists so an extension can make local CB reuse explicit before one-shot
+  // bufferization.
   Value result = getResult();
-  if (!result) {
-    return emitOpError("Expected result when CB is not present");
-  }
 
   // Bufferize the memref/tensor operand
-  // NOLINTNEXTLINE(clang-analyzer-core.StackAddressEscape)
-  mlir::FailureOr<Value> memrefBuffer =
-      mlir::bufferization::getBuffer(rewriter, getMemref(), options, state);
-  if (failed(memrefBuffer)) {
-    return memrefBuffer;
+  Value memrefBuffer = getMemref();
+  if (mlir::isa<RankedTensorType>(memrefBuffer.getType())) {
+    // NOLINTNEXTLINE(clang-analyzer-core.StackAddressEscape)
+    mlir::FailureOr<Value> maybeMemrefBuffer =
+        mlir::bufferization::getBuffer(rewriter, memrefBuffer, options, state);
+    if (failed(maybeMemrefBuffer)) {
+      return maybeMemrefBuffer;
+    }
+    memrefBuffer = *maybeMemrefBuffer;
+  }
+
+  if (!result) {
+    Value localBuffer = getLocalBuffer();
+    if (!mlir::isa<MemRefType>(localBuffer.getType())) {
+      return emitOpError(
+          "resultless implicit form requires a memref local buffer");
+    }
+    if (isHighLevelMcast()) {
+      rewriter.create<RemoteLoadOp>(getLoc(), localBuffer, memrefBuffer,
+                                    getIndices(), getMcastDims());
+    } else {
+      rewriter.create<RemoteLoadOp>(getLoc(), localBuffer, memrefBuffer,
+                                    getIndices(), getMcastStartIndex(),
+                                    getMcastShape());
+    }
+    rewriter.eraseOp(*this);
+    return mlir::success();
   }
 
   // Bufferize the localBuffer operand
@@ -1613,10 +1643,10 @@ mlir::LogicalResult RemoteLoadOp::bufferize(
   // multicast form - either high-level (mcastDims) or low-level
   // (mcastStartIndex/mcastShape).
   if (isHighLevelMcast()) {
-    rewriter.create<RemoteLoadOp>(getLoc(), *localBufferBuffer, *memrefBuffer,
+    rewriter.create<RemoteLoadOp>(getLoc(), *localBufferBuffer, memrefBuffer,
                                   getIndices(), getMcastDims());
   } else {
-    rewriter.create<RemoteLoadOp>(getLoc(), *localBufferBuffer, *memrefBuffer,
+    rewriter.create<RemoteLoadOp>(getLoc(), *localBufferBuffer, memrefBuffer,
                                   getIndices(), getMcastStartIndex(),
                                   getMcastShape());
   }
@@ -1687,6 +1717,17 @@ bool RemoteStoreOp::bufferizesToMemoryWrite(
   return operand.get() == getMemref();
 }
 
+bool RemoteStoreOp::isNotConflicting(
+    mlir::OpOperand *, mlir::OpOperand *uWrite,
+    const mlir::bufferization::AnalysisState &) {
+  // remote_store is an explicit memory write and its tensor result is
+  // equivalent to the destination operand. Forcing out-of-place
+  // bufferization would redirect the DMA into an unrelated temporary instead
+  // of the requested remote backing.
+  return uWrite->getOwner() == getOperation() &&
+         uWrite->get() == getMemref();
+}
+
 mlir::bufferization::AliasingValueList
 RemoteStoreOp::getAliasingValues(mlir::OpOperand &operand,
                                  const mlir::bufferization::AnalysisState &) {
@@ -1748,10 +1789,14 @@ mlir::LogicalResult RemoteStoreOp::bufferize(
   }
 
   // Bufferize the memref/tensor operand
-  mlir::FailureOr<Value> memrefBuffer =
-      mlir::bufferization::getBuffer(rewriter, getMemref(), options, state);
-  if (failed(memrefBuffer)) {
-    return memrefBuffer;
+  Value memrefBuffer = getMemref();
+  if (mlir::isa<RankedTensorType>(memrefBuffer.getType())) {
+    mlir::FailureOr<Value> maybeMemrefBuffer =
+        mlir::bufferization::getBuffer(rewriter, memrefBuffer, options, state);
+    if (failed(maybeMemrefBuffer)) {
+      return maybeMemrefBuffer;
+    }
+    memrefBuffer = *maybeMemrefBuffer;
   }
 
   // Bufferize the localBuffer operand (only if it's a tensor)
@@ -1765,26 +1810,26 @@ mlir::LogicalResult RemoteStoreOp::bufferize(
     localBufferBufferized = *localBufferMaybe;
   }
 
-  // Pre-bufferization implicit form must carry a tensor result (yield value).
+  // Tensor destinations carry a tensor result. Memref destinations are
+  // already in destination-passing form and intentionally have no result.
   Value result = getResult();
-  if (!result) {
-    return emitOpError("Expected result in implicit form during bufferization");
-  }
 
   // Create a new RemoteStoreOp in DPS memref form (no result; destination
   // memref is the result). Use the raw build() entry point so we can pass
   // all the variadic operands.
   rewriter.create<RemoteStoreOp>(
-      getLoc(), /*resultTypes=*/TypeRange{}, *memrefBuffer, getIndices(),
+      getLoc(), /*resultTypes=*/TypeRange{}, memrefBuffer, getIndices(),
       localBufferBufferized, /*cb=*/Value{}, getStartDevice(),
       getDeviceMcastShape(), getSemaphore(), getSemaphoreIndices());
 
   // Create a ToTensorOp wrapper to maintain tensor semantics for the old
   // tensor result. The only user is `d2m.yield`, which will erase itself
   // during its own bufferization, so this wrapper is short-lived.
-  auto toTensor = rewriter.create<bufferization::ToTensorOp>(
-      getLoc(), result.getType(), *memrefBuffer);
-  rewriter.replaceAllUsesWith(result, toTensor.getResult());
+  if (result) {
+    auto toTensor = rewriter.create<bufferization::ToTensorOp>(
+        getLoc(), result.getType(), memrefBuffer);
+    rewriter.replaceAllUsesWith(result, toTensor.getResult());
+  }
   rewriter.eraseOp(*this);
 
   return mlir::success();

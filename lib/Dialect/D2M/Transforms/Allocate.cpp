@@ -436,6 +436,15 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
           // First remap the alloc to L1
           remap(rewriter, allocOp, MemorySpace::DeviceL1);
 
+          // One-shot bufferization can introduce a private allocation for an
+          // out-of-place tensor update.  If it is not already a streamed CB,
+          // treat it as compute scratch; all in-generic allocations must be
+          // classified before the memory planner runs.
+          if (!allocOp->hasAttr("d2m.scratch_buffer") &&
+              !allocOp->hasAttr("d2m.synchronized_buffer")) {
+            allocOp->setAttr("d2m.scratch_buffer", rewriter.getUnitAttr());
+          }
+
           // Get the result type of the alloc
           Value allocResult = allocOp.getResult();
           MemRefType allocType = mlir::cast<MemRefType>(allocResult.getType());
@@ -459,10 +468,29 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
 
             // Check if this is a compute operation with results
             if (op->getNumResults() > 0) {
+              const bool isReassociativeReshape =
+                  mlir::isa<memref::CollapseShapeOp, memref::ExpandShapeOp>(op);
               // Re-type only the DPS result that aliases this alloc.
               auto dpsOp = mlir::dyn_cast<DestinationStyleOpInterface>(op);
               llvm::SmallVector<unsigned, 2> resultsToRetype;
-              if (dpsOp && op->getNumResults() == dpsOp.getNumDpsInits()) {
+              if (isReassociativeReshape) {
+                // A reshape aliases the allocation but intentionally changes
+                // rank/shape. Preserve those while propagating the allocation
+                // memory space that was assigned above.
+                rewriter.modifyOpInPlace(op, [&]() {
+                  for (OpResult result : op->getResults()) {
+                    auto resultType =
+                        mlir::dyn_cast<MemRefType>(result.getType());
+                    if (!resultType) {
+                      continue;
+                    }
+                    result.setType(MemRefType::get(
+                        resultType.getShape(), resultType.getElementType(),
+                        resultType.getLayout(), allocType.getMemorySpace()));
+                  }
+                });
+              } else if (dpsOp &&
+                         op->getNumResults() == dpsOp.getNumDpsInits()) {
                 for (OpOperand &init : dpsOp.getDpsInitsMutable()) {
                   if (init.get() == allocResult) {
                     resultsToRetype.push_back(

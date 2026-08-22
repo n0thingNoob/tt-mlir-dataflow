@@ -2290,7 +2290,8 @@ def D2M_RemoteStoreOp : D2M_GenericRegionDatamovementOp<"remote_store",
       "bufferize",
       "getAliasingValues",
       "getBufferType",
-      "hasTensorSemantics"
+      "hasTensorSemantics",
+      "isNotConflicting"
     ]>
   , D2M_SynchronizableOpInterface
   ]> {

@@ -661,7 +661,7 @@ module attributes {ttcore.system_desc = #system_desc} {
     %stream = d2m.view_layout %arg0 remapping = #map4 : memref<2x4x2x4x!ttcore.tile<32x32, f32>, #ttcore.shard<16384x4096, 1>, #dram> -> memref<2x4x2x4x!ttcore.tile<32x32, f32>, #ttcore.view<4>, #dram>
     %cb_buf = memref.alloc() {address = 5120 : i64, alignment = 16 : i64} : memref<2x4x!ttcore.tile<32x32, f32>, #ttcore.cb_layout<16384x4096, 2>, #l1>
     // Compute writes into this scratch CB, local_copy reads from it
-    %compute_scratch_buf = memref.alloc() {address = 9216 : i64, alignment = 16 : i64} : memref<2x4x!ttcore.tile<32x32, f32>, #ttcore.cb_layout<16384x4096, 2>, #l1>
+    %compute_scratch_buf = memref.alloc() {address = 9216 : i64, alignment = 16 : i64, d2m.scratch_buffer} : memref<2x4x!ttcore.tile<32x32, f32>, #ttcore.cb_layout<16384x4096, 2>, #l1>
     // local_copy writes into this scratch CB, second compute reads from it
     %copy_dst_buf = memref.alloc() {address = 13312 : i64, alignment = 16 : i64} : memref<2x4x!ttcore.tile<32x32, f32>, #ttcore.cb_layout<16384x4096, 2>, #l1>
     // output CB for remote_store

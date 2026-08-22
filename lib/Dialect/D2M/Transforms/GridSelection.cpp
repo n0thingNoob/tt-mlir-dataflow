@@ -21,6 +21,7 @@
 #include "ttmlir/Dialect/TTIR/IR/TTIROps.h"
 #include "ttmlir/Utils.h"
 
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -129,6 +130,14 @@ static void verifySingleGenericConsumerThroughViewsAndMasks(Value root) {
       }
       if (auto compositeView = dyn_cast<d2m::CompositeViewOp>(user)) {
         worklist.push_back(compositeView.getResult());
+        continue;
+      }
+      // Extension hooks may introduce an explicit tensor-to-buffer bridge for
+      // generic additional arguments.  It is alias-preserving and therefore
+      // transparent when proving that a to_layout has a single compute
+      // consumer.
+      if (auto toBuffer = dyn_cast<bufferization::ToBufferOp>(user)) {
+        worklist.push_back(toBuffer.getResult());
         continue;
       }
       if (isa<d2m::SpatialOp>(user)) {

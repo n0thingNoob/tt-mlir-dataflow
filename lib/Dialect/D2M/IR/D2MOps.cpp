@@ -17,6 +17,7 @@
 #include "ttmlir/Utils.h"
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -2701,13 +2702,19 @@ static void repairParallelizedRegionTypes(d2m::GenericOp genericOp,
       }
     } else if (auto embeddingOp = mlir::dyn_cast<d2m::EmbeddingOp>(&clonedOp)) {
       embeddingOp.getResult().setType(embeddingOp.getOutput().getType());
+    } else if (mlir::isa<tensor::CollapseShapeOp, tensor::ExpandShapeOp>(
+                   &clonedOp)) {
+      // Reassociative reshape results intentionally differ in rank from their
+      // source/init.  Their cloned result type is already valid when the local
+      // allocation volume is unchanged; treating them as generic DPS ops
+      // would incorrectly overwrite it with the source type.
     } else if (auto dstOp =
                    mlir::dyn_cast<DestinationStyleOpInterface>(&clonedOp)) {
-      unsigned numIns = dstOp.getNumDpsInputs();
-      unsigned numOuts = clonedOp.getNumResults();
-      for (unsigned i = 0; i < numOuts; ++i) {
-        clonedOp.getResult(i).setType(
-            clonedOp.getOperand(numIns + i).getType());
+      OperandRange dpsInits = dstOp.getDpsInits();
+      // Buffer-semantics DPS ops have init operands but no SSA results.
+      // Tensor-semantics results correspond to the leading init operands.
+      for (auto [index, result] : llvm::enumerate(clonedOp.getResults())) {
+        result.setType(dpsInits[index].getType());
       }
     }
     // Keep threading the outer generic through
@@ -3143,13 +3150,79 @@ mlir::LogicalResult d2m::GenericOp::bufferize(
     }
     bufferOutputs.push_back(*maybeValue);
   }
+  mlir::SmallVector<mlir::Value> bufferAdditionalArgs;
+  mlir::SmallVector<std::pair<mlir::Value, mlir::Value>>
+      additionalArgReplacements;
+  mlir::SmallVector<std::pair<memref::CopyOp, memref::AllocOp>>
+      bypassedViewCopies;
+  bufferAdditionalArgs.reserve(getAdditionalArgs().size());
+  for (Value argument : getAdditionalArgs()) {
+    if (!mlir::isa<mlir::RankedTensorType>(argument.getType())) {
+      bufferAdditionalArgs.push_back(argument);
+      continue;
+    }
+    Value buffer;
+    if (auto view = argument.getDefiningOp<d2m::ViewLayoutOp>()) {
+      auto maybeInput =
+          bufferization::getBuffer(rewriter, view.getInput(), options, state);
+      if (failed(maybeInput)) {
+        return maybeInput;
+      }
+      SmallVector<Value> dynamicDims;
+      auto maybeType =
+          view.getBufferType(view.getResult(), options, state, dynamicDims);
+      if (failed(maybeType)) {
+        return failure();
+      }
+      buffer = rewriter
+                   .create<d2m::ViewLayoutOp>(
+                       view.getLoc(), cast<MemRefType>(*maybeType), *maybeInput,
+                       view.getRemapping(), view.getReinterpretLayout())
+                   .getResult();
+    } else {
+      auto maybeValue =
+          bufferization::getBuffer(rewriter, argument, options, state);
+      if (failed(maybeValue)) {
+        return maybeValue;
+      }
+      buffer = *maybeValue;
+      Value analyzedBuffer = buffer;
+      // Tensor additional arguments model explicit captures used inside the
+      // generic regions.  One-shot bufferization may conservatively insert an
+      // out-of-place alloc+copy for a writable view capture.  That copy would
+      // sever the intended alias to the parent device buffer, so retain the
+      // source view as the program argument.
+      if (auto alloc = buffer.getDefiningOp<memref::AllocOp>()) {
+        for (OpOperand &use : alloc.getResult().getUses()) {
+          auto copy = dyn_cast<memref::CopyOp>(use.getOwner());
+          if (!copy || copy.getTarget() != buffer ||
+              !copy.getSource().getDefiningOp<d2m::ViewLayoutOp>()) {
+            continue;
+          }
+          buffer = copy.getSource();
+          bypassedViewCopies.emplace_back(copy, alloc);
+          break;
+        }
+      }
+      if (analyzedBuffer != buffer) {
+        additionalArgReplacements.emplace_back(analyzedBuffer, buffer);
+      }
+    }
+    bufferAdditionalArgs.push_back(buffer);
+    additionalArgReplacements.emplace_back(argument, buffer);
+  }
   auto bufferGeneric = rewriter.create<d2m::GenericOp>(
-      getLoc(), ValueRange(), bufferInputs, bufferOutputs, getAdditionalArgs(),
+      getLoc(), ValueRange(), bufferInputs, bufferOutputs, bufferAdditionalArgs,
       getGrid(), getBlockFactors(), getIndexingMaps(), getIteratorTypes(),
       getThreads(), getFabricConnectionConfigAttr(),
       /*numRegions=*/getNumRegions());
   for (mlir::Region &region : bufferGeneric.getRegions()) {
     region.takeBody(getRegion(region.getRegionNumber()));
+  }
+  for (auto [tensor, buffer] : additionalArgReplacements) {
+    tensor.replaceUsesWithIf(buffer, [&](OpOperand &use) {
+      return bufferGeneric->isProperAncestor(use.getOwner());
+    });
   }
 
   // Bufferize get_cb ops: convert from cb<tensor<...>> to cb<memref<...>>.
@@ -3170,6 +3243,18 @@ mlir::LogicalResult d2m::GenericOp::bufferize(
 
   mlir::bufferization::replaceOpWithBufferizedValues(rewriter, *this,
                                                      bufferOutputs);
+  for (auto [copy, alloc] : bypassedViewCopies) {
+    rewriter.eraseOp(copy);
+    for (Operation *user : llvm::make_early_inc_range(alloc->getUsers())) {
+      auto toTensor = dyn_cast<bufferization::ToTensorOp>(user);
+      if (toTensor && toTensor.getResult().use_empty()) {
+        rewriter.eraseOp(toTensor);
+      }
+    }
+    if (alloc.getResult().use_empty()) {
+      rewriter.eraseOp(alloc);
+    }
+  }
   return success();
 }
 
@@ -3344,6 +3429,15 @@ analyzeLocalBufferAssociation(Value localBuffer,
           hasRemoteUse = true;
           noteOperand(storeOperand, hasConflictingStoreOperands,
                       storeOp.getMemref());
+        }
+        continue;
+      }
+      if (mlir::isa<bufferization::ToBufferOp, bufferization::ToTensorOp,
+                    tensor::CollapseShapeOp, tensor::ExpandShapeOp>(userOp)) {
+        for (Value result : userOp->getResults()) {
+          if (visited.insert(result).second) {
+            worklist.push_back(result);
+          }
         }
         continue;
       }
