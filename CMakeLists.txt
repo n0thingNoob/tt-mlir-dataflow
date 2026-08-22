@@ -216,10 +216,10 @@ if(TTMLIR_ENABLE_ASTRAIA)
   endif()
   add_subdirectory("${ASTRAIA_EXTENSION_SOURCE_DIR}"
                    "${CMAKE_CURRENT_BINARY_DIR}/extensions/astraia")
-  if(NOT TARGET AstraiaTransforms)
+  if(NOT TARGET AstraiaTransforms OR NOT TARGET AstraiaPipelines)
     message(FATAL_ERROR
       "The Astraia checkout did not define the required AstraiaTransforms "
-      "target: ${ASTRAIA_EXTENSION_SOURCE_DIR}")
+      "and AstraiaPipelines targets: ${ASTRAIA_EXTENSION_SOURCE_DIR}")
   endif()
 endif()
 if(MLIR_ENABLE_BINDINGS_PYTHON AND TTMLIR_ENABLE_BINDINGS_PYTHON)

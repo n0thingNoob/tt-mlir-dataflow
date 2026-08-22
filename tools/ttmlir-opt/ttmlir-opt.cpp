@@ -11,6 +11,7 @@
 #include "ttmlir/RegisterAll.h"
 
 #ifdef TTMLIR_ENABLE_ASTRAIA
+#include "astraia/Pipelines/Pipelines.h"
 #include "astraia/Transforms/Passes.h"
 #endif
 
@@ -19,6 +20,7 @@ int main(int argc, char **argv) {
   mlir::tt::registerAllPasses();
 #ifdef TTMLIR_ENABLE_ASTRAIA
   mlir::tt::astraia::registerPasses();
+  mlir::tt::astraia::registerPipelines();
 #endif
 
   mlir::DialectRegistry registry;
