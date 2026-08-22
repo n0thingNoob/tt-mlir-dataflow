@@ -88,7 +88,7 @@ static bool isWriteBarrier(DMAWaitOp waitOp) {
 //   of same CB, push of same CB,
 //     any semaphore op
 //   - write barrier: read or write of same CB (data hazard), pop of
-//     same CB, semaphore_set
+//     same CB, semaphore_set/inc
 static bool canBarrierSinkPast(DMAWaitOp dmaWait, Operation *sinkOver,
                                Value sinkCB) {
   if (mlir::isa<DMAWaitOp>(sinkOver)) {
@@ -114,7 +114,7 @@ static bool canBarrierSinkPast(DMAWaitOp dmaWait, Operation *sinkOver,
     if (auto popOp = mlir::dyn_cast<PopOp>(sinkOver)) {
       return areDifferentValues(popOp.getCb(), sinkCB);
     }
-    if (mlir::isa<SemaphoreSetOp>(sinkOver)) {
+    if (mlir::isa<SemaphoreSetOp, SemaphoreIncOp>(sinkOver)) {
       return false;
     }
   }

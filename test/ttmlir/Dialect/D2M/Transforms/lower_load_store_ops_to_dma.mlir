@@ -5,6 +5,7 @@
 #map = affine_map<(d0, d1) -> (d0, d1)>
 #map4 = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
 #parallel = #ttcore.iterator_type<parallel>
+#sem_layout = #ttcore.metal_layout<logical_shape = 8x8, dim_alignments = 1x1, collapsed_intervals = dense<[[0, 1], [1, 2]]> : tensor<2x2xi64>, l1, sharded>
 module attributes {} {
   // CHECK-LABEL: func.func @test_remote_load_explicit_cb
   // CHECK-NOT: d2m.remote_load
@@ -57,10 +58,13 @@ module attributes {} {
   // CHECK-NOT: d2m.remote_load
   // CHECK-NOT: d2m.remote_store
   func.func @test_remote_store_explicit_cb(%arg0: memref<2x4x2x4x!ttcore.tile<32x32, f32>, #ttcore.shard<16384x4096, 1>, #l1>, %arg1: memref<2x4x2x4x!ttcore.tile<32x32, f32>, #ttcore.shard<16384x4096, 1>, #dram>) {
+    %sem_backing = tensor.empty() : tensor<8x8x1x1xui32, #sem_layout>
+    %sem = d2m.create_global_semaphore(%sem_backing) {value = 0 : ui32} : tensor<8x8x1x1xui32, #sem_layout> -> !d2m.global_semaphore
     %stream = d2m.view_layout %arg1 remapping = #map4 : memref<2x4x2x4x!ttcore.tile<32x32, f32>, #ttcore.shard<16384x4096, 1>, #dram> -> memref<2x4x2x4x!ttcore.tile<32x32, f32>, #ttcore.view<4>, #dram>
     d2m.generic {block_factors = [], grid = #ttcore.grid<2x4>, indexing_maps = [], iterator_types = [], threads = [#d2m.thread<datamovement>, #d2m.thread<compute>]}
         ins(%arg0 : memref<2x4x2x4x!ttcore.tile<32x32, f32>, #ttcore.shard<16384x4096, 1>, #l1>)
-        outs(%stream : memref<2x4x2x4x!ttcore.tile<32x32, f32>, #ttcore.view<4>, #dram>)  {
+        outs(%stream : memref<2x4x2x4x!ttcore.tile<32x32, f32>, #ttcore.view<4>, #dram>)
+        additionalArgs(%sem : !d2m.global_semaphore) {
     ^datamovement0:
       %cb0 = d2m.get_cb(0) : !d2m.cb<memref<2x4x!ttcore.tile<32x32, f32>, #l1>>
       %cb1 = d2m.get_cb(1) : !d2m.cb<memref<2x4x!ttcore.tile<32x32, f32>, #l1>>
@@ -75,8 +79,9 @@ module attributes {} {
           // CHECK: %[[MEMREF:.*]] = d2m.wait %{{.*}}
           // CHECK: %[[TX:.*]] = d2m.dma_write %[[MEMREF]], %{{.*}}[%{{.*}}, %{{.*}}], <0>
           // CHECK-NEXT: d2m.dma_wait %[[TX]]
+          // CHECK-NEXT: d2m.semaphore_inc %{{.*}}, %{{.*}}, core[{{.*}}]
           // CHECK-NEXT: d2m.pop %{{.*}}
-          d2m.remote_store %stream[%0, %1] from %cb1 : memref<2x4x2x4x!ttcore.tile<32x32, f32>, #ttcore.view<4>, #dram> from !d2m.cb<memref<2x4x!ttcore.tile<32x32, f32>, #l1>>
+          d2m.remote_store %stream[%0, %1] from %cb1 semaphore increment %sem[%c1, %c0] : memref<2x4x2x4x!ttcore.tile<32x32, f32>, #ttcore.view<4>, #dram> from !d2m.cb<memref<2x4x!ttcore.tile<32x32, f32>, #l1>>
         } {d2m.blocking_loop = 1}
       } {d2m.blocking_loop = 0}
     }, {

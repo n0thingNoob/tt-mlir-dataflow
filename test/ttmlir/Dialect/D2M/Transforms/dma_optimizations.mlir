@@ -516,4 +516,37 @@ module attributes {} {
     }
     return
   }
+
+  // A semaphore increment publishes the remote write to another core. The
+  // write barrier must remain before the signal and cannot be deferred to the
+  // next iteration by DMA optimization.
+  // CHECK-LABEL: func.func @test_write_barrier_before_signal
+  func.func @test_write_barrier_before_signal(
+      %arg0: memref<2x4x2x4x!ttcore.tile<32x32, f32>, #ttcore.shard<16384x4096, 1>, #dram>,
+      %sem: !d2m.global_semaphore) {
+    %stream = d2m.view_layout %arg0 remapping = #map4 : memref<2x4x2x4x!ttcore.tile<32x32, f32>, #ttcore.shard<16384x4096, 1>, #dram> -> memref<2x4x2x4x!ttcore.tile<32x32, f32>, #ttcore.view<4>, #dram>
+    d2m.generic {block_factors = [], grid = #ttcore.grid<2x4>, indexing_maps = [], iterator_types = [], threads = [#d2m.thread<datamovement>, #d2m.thread<compute>]}
+        ins() outs(%stream : memref<2x4x2x4x!ttcore.tile<32x32, f32>, #ttcore.view<4>, #dram>)
+        additionalArgs(%sem : !d2m.global_semaphore) {
+    ^datamovement0:
+      %cb0 = d2m.get_cb(0) : !d2m.cb<memref<2x4x!ttcore.tile<32x32, f32>, #l1>>
+      %gi = d2m.core_index(0) : index
+      %gj = d2m.core_index(1) : index
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      // CHECK: [[CB:%.+]] = d2m.get_cb(0)
+      // CHECK: [[TX:%.+]] = d2m.dma_write
+      // CHECK-NEXT: d2m.dma_wait [[TX]] : !d2m.mem_tx<write>
+      // CHECK-NEXT: d2m.semaphore_inc
+      // CHECK-NEXT: d2m.pop [[CB]]
+      %local = d2m.wait %cb0 : <memref<2x4x!ttcore.tile<32x32, f32>, #l1>> -> memref<2x4x!ttcore.tile<32x32, f32>, #l1>
+      %tx = d2m.dma_write %local, %stream[%gi, %gj], <0> : (memref<2x4x!ttcore.tile<32x32, f32>, #l1>, memref<2x4x2x4x!ttcore.tile<32x32, f32>, #ttcore.view<4>, #dram>) -> !d2m.mem_tx<write>
+      d2m.dma_wait %tx : !d2m.mem_tx<write>
+      d2m.semaphore_inc %sem, %c1, core[%c0, %c0] : !d2m.global_semaphore
+      d2m.pop %cb0 : <memref<2x4x!ttcore.tile<32x32, f32>, #l1>>
+    }, {
+    ^compute0:
+    }
+    return
+  }
 }

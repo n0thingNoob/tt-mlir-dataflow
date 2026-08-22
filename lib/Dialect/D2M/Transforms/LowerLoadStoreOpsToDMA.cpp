@@ -235,8 +235,10 @@ public:
     Value cb = remoteStore.getCb();
     Value remoteMemref = remoteStore.getMemref();
     SmallVector<Value> gridIndices = remoteStore.getIndices();
-    ValueRange startDevice = remoteStore.getStartDevice();
-    ValueRange deviceMcastShape = remoteStore.getDeviceMcastShape();
+    SmallVector<Value> startDevice = remoteStore.getStartDevice();
+    SmallVector<Value> deviceMcastShape = remoteStore.getDeviceMcastShape();
+    Value semaphore = remoteStore.getSemaphore();
+    SmallVector<Value> semaphoreIndices = remoteStore.getSemaphoreIndices();
 
     // Wait on CB, emit shard-level dma_write, wait, pop
     Value localMemref = rewriter.create<WaitOp>(loc, cb).getResult();
@@ -244,17 +246,18 @@ public:
         rewriter.create<DMAWriteOp>(loc, localMemref, remoteMemref, gridIndices,
                                     startDevice, deviceMcastShape);
 
-    if (remoteStore.getSemaphore()) {
-      auto incr = rewriter.create<arith::ConstantIndexOp>(loc, 1);
-      rewriter.create<SemaphoreIncOp>(loc, remoteStore.getSemaphore(), incr,
-                                      remoteStore.getSemaphoreIndices(),
-                                      startDevice, deviceMcastShape);
-    }
-
     rewriter.eraseOp(remoteStore);
 
     // Wait for DMA to complete.
     rewriter.create<DMAWaitOp>(loc, dmaTx);
+    // A remote consumer must not observe the semaphore until the payload is
+    // globally visible. Signalling before DMAWait can wake the consumer while
+    // the write is still in flight.
+    if (semaphore) {
+      auto incr = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+      rewriter.create<SemaphoreIncOp>(loc, semaphore, incr, semaphoreIndices,
+                                      startDevice, deviceMcastShape);
+    }
     // Pop the circular buffer to signal consumption.
     rewriter.create<PopOp>(loc, cb);
     return success();
