@@ -10,6 +10,8 @@
 #include "ttmlir/Dialect/TTCore/IR/TopologyParser.h"
 #include "ttmlir/Dialect/TTMetal/IR/TTMetalOpsTypes.h"
 
+#include "llvm/ADT/STLFunctionalExtras.h"
+
 namespace mlir::tt::ttmetal {
 // Options for D2M pipelines.
 struct D2MPipelineOptions : public PassPipelineOptions<D2MPipelineOptions> {
@@ -277,6 +279,16 @@ void createD2MToTTNNPipeline(OpPassManager &pm,
 // End-to-end pipeline.
 void createTTIRToTTMetalPipeline(OpPassManager &pm,
                                  const D2MPipelineOptions &options);
+
+// End-to-end pipeline with a caller-provided D2M frontend extension. The
+// extension is added immediately after TTIR-to-D2M conversion and constant
+// scalarization, before view-return materialization and grid selection. This
+// keeps target-independent mapping extensions out of the core pipeline while
+// preserving the canonical lowering order for all existing callers.
+using D2MFrontendExtensionBuilder = llvm::function_ref<void(OpPassManager &pm)>;
+void createTTIRToTTMetalPipeline(OpPassManager &pm,
+                                 const D2MPipelineOptions &options,
+                                 D2MFrontendExtensionBuilder extensionBuilder);
 
 void registerD2MPipelines();
 } // namespace mlir::tt::ttmetal

@@ -71,8 +71,10 @@ void addFunctionOptimizationPasses(OpPassManager &funcPm) {
   funcPm.addPass(mlir::createLoopInvariantCodeMotionPass());
 }
 
-void createD2MFrontendPipeline(OpPassManager &pm,
-                               const D2MPipelineOptions &options) {
+static void
+createD2MFrontendPipelineImpl(OpPassManager &pm,
+                              const D2MPipelineOptions &options,
+                              D2MFrontendExtensionBuilder extensionBuilder) {
   // Create multi-device tensor annotation for graph with mesh.
   pm.addPass(ttir::createTTIRMultiDeviceTensorAnnotation());
   ttcore::TTCoreRegisterDevicePassOptions registerDeviceOptions;
@@ -111,6 +113,7 @@ void createD2MFrontendPipeline(OpPassManager &pm,
   }
   pm.addPass(tt::createTTIRToD2MPass(toD2MOptions));
   pm.addPass(d2m::createD2MScalarizeConstTensors());
+  extensionBuilder(pm);
   d2m::D2MGridSelectionOptions gridOptOptions;
   {
     gridOptOptions.overrideDeviceShape =
@@ -180,6 +183,11 @@ void createD2MFrontendPipeline(OpPassManager &pm,
   // form.
   pm.addPass(d2m::createD2MLowerToExplicitForm());
   pm.addPass(createCanonicalizerPassWithOptions(options));
+}
+
+void createD2MFrontendPipeline(OpPassManager &pm,
+                               const D2MPipelineOptions &options) {
+  createD2MFrontendPipelineImpl(pm, options, [](OpPassManager &) {});
 }
 
 void createD2MBackendPipeline(OpPassManager &pm,
@@ -344,6 +352,12 @@ void createD2MToTTKernelPipeline(OpPassManager &pm,
 
 void createTTIRToTTMetalPipeline(OpPassManager &pm,
                                  const D2MPipelineOptions &options) {
+  createTTIRToTTMetalPipeline(pm, options, [](OpPassManager &) {});
+}
+
+void createTTIRToTTMetalPipeline(OpPassManager &pm,
+                                 const D2MPipelineOptions &options,
+                                 D2MFrontendExtensionBuilder extensionBuilder) {
   // Mark all public functions without a type assigned to them as Device Forward
   // functions before any other. This provides a consistent mechanism for
   // identifying Device Forward functions downstream.
@@ -359,7 +373,7 @@ void createTTIRToTTMetalPipeline(OpPassManager &pm,
       pm.nest<ttcore::DeviceModuleOp>().nest<mlir::ModuleOp>();
 
   // Run D2M pipelines on IR in DeviceModule.
-  createD2MFrontendPipeline(devicePm, options);
+  createD2MFrontendPipelineImpl(devicePm, options, extensionBuilder);
   createD2MBackendPipeline(devicePm, options);
   // Stop before EmitC: ConvertD2MToTTMetalPass inspects TTKernel ops (e.g.
   // TypecastTileOp) to configure hardware unpack modes, so the dispatch-level
@@ -405,7 +419,9 @@ void createTTIRToTTMetalPipeline(OpPassManager &pm,
 void registerD2MPipelines() {
   mlir::PassPipelineRegistration<tt::ttmetal::D2MPipelineOptions>(
       "ttir-to-ttmetal-pipeline", "Pipeline lowering ttir to ttmetal.",
-      tt::ttmetal::createTTIRToTTMetalPipeline);
+      [](OpPassManager &pm, const tt::ttmetal::D2MPipelineOptions &options) {
+        tt::ttmetal::createTTIRToTTMetalPipeline(pm, options);
+      });
   mlir::PassPipelineRegistration<tt::ttmetal::D2MPipelineOptions>(
       "d2m-fe-pipeline", "D2M frontend: TTIR to D2M explicit form.",
       tt::ttmetal::createD2MFrontendPipeline);
