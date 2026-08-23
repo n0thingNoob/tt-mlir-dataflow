@@ -80,7 +80,9 @@ static unsigned getDMACBPort(GenericOp generic, Operation *op) {
 // collapse_shape/subview to a CB additional-arg of `generic`. Returns the CB
 // value together with the operand that directly references it (so the caller
 // can rewrite that operand to a wait/reserve result). Scratch and
-// reduction-scaler buffers are not CBs.
+// reduction-scaler buffers are not CBs. Compute-local scratch buffers are
+// traced here as well; after access classification we retain only scratch that
+// is both produced and consumed by distinct compute spans.
 static std::optional<std::pair<Value, OpOperand *>>
 traceCBUse(OpOperand &startUse, GenericOp generic,
            const llvm::SetVector<Value> &dmaVisibleCBs) {
@@ -90,10 +92,6 @@ traceCBUse(OpOperand &startUse, GenericOp generic,
     if (mlir::isa<MemRefType>(value.getType()) &&
         llvm::is_contained(generic.getAdditionalArgs(), value)) {
       Operation *definingOp = value.getDefiningOp();
-      if (definingOp && definingOp->getAttr("d2m.scratch_buffer") &&
-          !dmaVisibleCBs.contains(value)) {
-        return std::nullopt;
-      }
       if (utils::isReductionScalerBuffer(definingOp)) {
         return std::nullopt;
       }
@@ -122,6 +120,13 @@ static bool isComputeLocalBuffer(Value cb,
   return definingOp && ((definingOp->getAttr("d2m.scratch_buffer") &&
                          !dmaVisibleCBs.contains(cb)) ||
                         utils::isReductionScalerBuffer(definingOp));
+}
+
+static bool isComputeLocalScratch(Value cb,
+                                  const llvm::SetVector<Value> &dmaVisibleCBs) {
+  Operation *definingOp = cb.getDefiningOp();
+  return definingOp && definingOp->getAttr("d2m.scratch_buffer") &&
+         !dmaVisibleCBs.contains(cb);
 }
 
 // collapse_shape / subview compute an address into a CB; they do not wait
@@ -223,6 +228,55 @@ static Block *computeScopeBlock(const CBSync &sync, unsigned depth,
   return nullptr;
 }
 
+// Compute-local CBs can intentionally keep one tile live across multiple
+// sibling compute roots. Their synchronization scope is the nearest block
+// containing every access, rather than the DMA transfer depth used for
+// externally produced/consumed CBs.
+static Block *commonComputeScopeBlock(const CBSync &sync, Block *computeBlock) {
+  SmallVector<Operation *> accesses(sync.anchors.begin(), sync.anchors.end());
+  for (OpOperand *use : sync.uses) {
+    accesses.push_back(use->getOwner());
+  }
+  if (accesses.empty()) {
+    return nullptr;
+  }
+
+  auto contains = [](Block *block, Operation *op) {
+    return op->getBlock() == block ||
+           block->getParent()->isAncestor(op->getParentRegion());
+  };
+  Block *candidate = accesses.front()->getBlock();
+  while (candidate) {
+    if (llvm::all_of(accesses,
+                     [&](Operation *op) { return contains(candidate, op); })) {
+      return candidate;
+    }
+    if (candidate == computeBlock) {
+      break;
+    }
+    Operation *parentOp = candidate->getParentOp();
+    candidate = parentOp ? parentOp->getBlock() : nullptr;
+  }
+  return nullptr;
+}
+
+static unsigned accessLoopDepth(const CBSync &sync) {
+  std::optional<unsigned> depth;
+  auto update = [&](Operation *op) {
+    unsigned candidate = forDepth(op);
+    depth = depth ? std::min(*depth, candidate) : candidate;
+  };
+  for (Operation *anchor : sync.anchors) {
+    update(anchor);
+  }
+  if (!depth) {
+    for (OpOperand *use : sync.uses) {
+      update(use->getOwner());
+    }
+  }
+  return depth.value_or(0);
+}
+
 // Insert the compute-side CB synchronization ops for a single (already split)
 // compute block. Builds the ordered list of compute units (anchors) that
 // consume/produce each CB from two sources -- interface compute ops
@@ -239,6 +293,33 @@ static LogicalResult insertCBOpsForCompute(
     const llvm::SetVector<Value> &dmaVisibleCBs,
     const llvm::DenseMap<unsigned, unsigned> &cbTransferDepth) {
   auto generic = cast<GenericOp>(computeBlock->getParentOp());
+
+  // Stable lexical order for distinguishing an output's initialization read
+  // from a later compute-to-compute handoff through the same CB.
+  DenseMap<Operation *, unsigned> order;
+  unsigned nextOrder = 0;
+  computeBlock->walk([&](Operation *op) { order[op] = nextOrder++; });
+  auto byProgramOrder = [&](Operation *a, Operation *b) {
+    return order[a] < order[b];
+  };
+  auto dropOutputInitializationReads = [&](auto &consumed, auto &produced) {
+    for (auto &[cb, producedAccesses] : produced) {
+      auto consumedIt = consumed.find(cb);
+      if (consumedIt == consumed.end()) {
+        continue;
+      }
+      unsigned firstWrite = order[producedAccesses.front().first];
+      for (const auto &access : producedAccesses) {
+        firstWrite = std::min(firstWrite, order[access.first]);
+      }
+      llvm::erase_if(consumedIt->second, [&](const auto &access) {
+        return order[access.first] < firstWrite;
+      });
+      if (consumedIt->second.empty()) {
+        consumed.erase(consumedIt);
+      }
+    }
+  };
 
   llvm::MapVector<Value, CBSync> consumers, producers;
   auto add = [](llvm::MapVector<Value, CBSync> &map, Value cb,
@@ -284,10 +365,10 @@ static LogicalResult insertCBOpsForCompute(
         }
       }
     });
-    // Output reuse: a CB written by the span is not also treated as an input.
-    for (auto &[cb, accesses] : spanProduced) {
-      spanConsumed.erase(cb);
-    }
+    // Reads before the first write are output initialization/reuse and do not
+    // consume a CB tile. Reads after a write are a real handoff to a later
+    // compute root and need their own wait/pop.
+    dropOutputInitializationReads(spanConsumed, spanProduced);
     for (auto &[cb, accesses] : spanConsumed) {
       for (auto &[access, use] : accesses) {
         add(consumers, cb, access, use);
@@ -330,10 +411,7 @@ static LogicalResult insertCBOpsForCompute(
         }
       }
     });
-    // Output reuse: a CB written here is not also treated as an input.
-    for (auto &[cb, accesses] : blockProduced) {
-      blockConsumed.erase(cb);
-    }
+    dropOutputInitializationReads(blockConsumed, blockProduced);
     for (auto &[cb, accesses] : blockConsumed) {
       for (auto &[access, use] : accesses) {
         add(consumers, cb, access, use);
@@ -407,16 +485,33 @@ static LogicalResult insertCBOpsForCompute(
     }
   }
 
-  // Program-order index for sorting anchors (which may be discovered out of
-  // order across the two sources above).
-  DenseMap<Operation *, unsigned> order;
-  {
-    unsigned idx = 0;
-    computeBlock->walk([&](Operation *op) { order[op] = idx++; });
+  // A compute-local scratch allocation normally needs no CB bookkeeping.
+  // When one compute root writes it and a later root reads it, however, the
+  // pack and unpack engines communicate through that allocation exactly like
+  // a CB even though no datamovement op is involved. Keep only that
+  // producer-consumer case; one-sided scratch remains ordinary local memory.
+  llvm::DenseSet<Value> computeLocalHandoffs;
+  llvm::SetVector<Value> computeLocalScratch;
+  for (const auto &entry : consumers) {
+    Value cb = entry.first;
+    if (isComputeLocalScratch(cb, dmaVisibleCBs)) {
+      computeLocalScratch.insert(cb);
+    }
   }
-  auto byProgramOrder = [&](Operation *a, Operation *b) {
-    return order[a] < order[b];
-  };
+  for (const auto &entry : producers) {
+    Value cb = entry.first;
+    if (isComputeLocalScratch(cb, dmaVisibleCBs)) {
+      computeLocalScratch.insert(cb);
+    }
+  }
+  for (Value cb : computeLocalScratch) {
+    if (consumers.count(cb) && producers.count(cb)) {
+      computeLocalHandoffs.insert(cb);
+      continue;
+    }
+    consumers.erase(cb);
+    producers.erase(cb);
+  }
 
   // The wait/reserve must dominate both the compute reads/writes (inside the
   // anchor) and the CB-view ops being rewritten to its result (e.g. a top-level
@@ -477,9 +572,13 @@ static LogicalResult insertCBOpsForCompute(
     llvm::sort(sync.anchors, byProgramOrder);
 
     unsigned cbOperandIdx = generic.getOperandIndex(cb);
-    unsigned depth =
-        cbTransferDepth.lookup(cbOperandIdx); // 0 if aliased/no marker
-    Block *anchorBlock = computeScopeBlock(sync, depth, computeBlock);
+    unsigned depth = cbTransferDepth.lookup(cbOperandIdx);
+    if (computeLocalHandoffs.contains(cb)) {
+      depth = accessLoopDepth(sync);
+    }
+    Block *anchorBlock = computeLocalHandoffs.contains(cb)
+                             ? commonComputeScopeBlock(sync, computeBlock)
+                             : computeScopeBlock(sync, depth, computeBlock);
     if (!anchorBlock) {
       return generic.emitOpError()
              << "CB has consumers across distinct loop nests; cross-nest "
@@ -536,9 +635,13 @@ static LogicalResult insertCBOpsForCompute(
   for (auto &[cb, sync] : producers) {
     llvm::sort(sync.anchors, byProgramOrder);
     unsigned cbOperandIdx = generic.getOperandIndex(cb);
-    unsigned depth =
-        cbTransferDepth.lookup(cbOperandIdx); // 0 if aliased/no marker
-    Block *anchorBlock = computeScopeBlock(sync, depth, computeBlock);
+    unsigned depth = cbTransferDepth.lookup(cbOperandIdx);
+    if (computeLocalHandoffs.contains(cb)) {
+      depth = accessLoopDepth(sync);
+    }
+    Block *anchorBlock = computeLocalHandoffs.contains(cb)
+                             ? commonComputeScopeBlock(sync, computeBlock)
+                             : computeScopeBlock(sync, depth, computeBlock);
     if (!anchorBlock) {
       return generic.emitOpError()
              << "CB has producers across distinct loop nests; cross-nest "
@@ -560,8 +663,30 @@ static LogicalResult insertCBOpsForCompute(
       rewriter.create<PopOp>(last->getLoc(), cbHandle);
     }
 
+    auto afterReserve = [&](Operation *op) {
+      Operation *inBlock = reserveOp->getBlock()->findAncestorOpInBlock(*op);
+      return inBlock && reserveOp->isBeforeInBlock(inBlock);
+    };
+
     for (OpOperand *use : sync.uses) {
       Operation *owner = use->getOwner();
+      if (isCBViewOp(owner) && !afterReserve(owner)) {
+        // A view can be shared by an output-initialization load before the
+        // reserve and the actual producer store after it. Keep the original
+        // view for the initialization operand and clone a reserved-slot view
+        // for producer-side uses; moving the shared view would violate
+        // dominance of the earlier load.
+        rewriter.setInsertionPointAfter(reserveOp);
+        Operation *clone = rewriter.clone(*owner);
+        clone->setOperand(use->getOperandNumber(), reserveOp.getResult());
+        for (OpOperand &viewUse :
+             llvm::make_early_inc_range(owner->getResult(0).getUses())) {
+          if (viewUse.getOwner() != clone && afterReserve(viewUse.getOwner())) {
+            viewUse.set(clone->getResult(0));
+          }
+        }
+        continue;
+      }
       if (owner->getBlock() != anchorBlock &&
           !anchorBlock->getParent()->isAncestor(owner->getParentRegion())) {
         owner->moveAfter(

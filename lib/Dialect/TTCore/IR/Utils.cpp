@@ -211,6 +211,15 @@ static MemRefType getMemRefType(Type type, bool isView,
                            hostLayout);
   }
 
+  // A tensor carrying a CB layout already describes a core-local circular
+  // buffer. Preserve that physical layout through tensor bufferization rather
+  // than treating it as a device-sharded MetalLayout tensor.
+  if (auto cbLayout = mlir::dyn_cast<CBLayoutAttr>(tensorType.getEncoding())) {
+    return MemRefType::get(tensorType.getShape(), tensorType.getElementType(),
+                           cbLayout,
+                           MemorySpaceAttr::get(ctx, MemorySpace::DeviceL1));
+  }
+
   auto layout = mlir::cast<MetalLayoutAttr>(tensorType.getEncoding());
 
   SmallVector<int64_t> fullMemrefShape(tensorType.getShape());

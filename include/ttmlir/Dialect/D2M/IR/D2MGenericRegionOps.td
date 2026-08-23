@@ -2567,7 +2567,10 @@ def D2M_SemaphoreIncOp : D2M_SemaphoreUpdateOp<"semaphore_inc"> {}
 def D2M_SemaphoreWaitOp : D2M_GenericRegionOp<"semaphore_wait", [MemoryEffects<[MemRead, MemWrite]>]> {
     let summary = "D2M Semaphore Set Op.";
     let description = [{
-      Wait for the semaphore value to reach the specified value. Optionally supply a reset value as a shorthand syntax.
+      Wait for the semaphore value to reach the specified value. With
+      `minimum`, the wait succeeds when the semaphore is greater than or equal
+      to that value, which is appropriate for monotonically increasing
+      producer counters. Optionally supply a reset value as a shorthand syntax.
 
       ```mlir
       d2m.semaphore_wait %sem1, %c1 reset %c0
@@ -2577,15 +2580,15 @@ def D2M_SemaphoreWaitOp : D2M_GenericRegionOp<"semaphore_wait", [MemoryEffects<[
       ```
     }];
 
-    let arguments = (ins AnyTypeOf<[D2M_LocalSemaphore, D2M_GlobalSemaphore]>:$semaphore, Index:$value, Optional<Index>:$resetValue);
+    let arguments = (ins AnyTypeOf<[D2M_LocalSemaphore, D2M_GlobalSemaphore]>:$semaphore, Index:$value, Optional<Index>:$resetValue, OptionalAttr<UnitAttr>:$minimum);
 
-    let assemblyFormat = [{ $semaphore `,` $value (`reset` $resetValue^)? attr-dict `:` type($semaphore) }];
+    let assemblyFormat = [{ $semaphore `,` $value (`minimum` $minimum^)? (`reset` $resetValue^)? attr-dict `:` type($semaphore) }];
 
     let builders =
     [
       OpBuilder<(ins "Value":$semaphore, "Value":$value),
       [{
-        build($_builder, $_state, semaphore, value, nullptr);
+        build($_builder, $_state, semaphore, value, nullptr, nullptr);
       }]>,
     ];
 }

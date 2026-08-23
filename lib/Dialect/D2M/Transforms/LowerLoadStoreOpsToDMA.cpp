@@ -123,7 +123,8 @@ public:
           // Wait for all receivers to be ready (mcastVolume - 1, excluding
           // sender).
           builder.create<SemaphoreWaitOp>(loc, receiversReadySemaphore,
-                                          numReceiversVal, zero);
+                                          numReceiversVal, zero,
+                                          /*minimum=*/nullptr);
 
           // Perform shard-level multicast DMA write: from local CB to local CB
           // with multicast parameters. The multicast parameters specify that
@@ -148,7 +149,7 @@ public:
           builder.create<SemaphoreIncOp>(loc, receiversReadySemaphore, one,
                                          mcastStartIndex);
           builder.create<SemaphoreWaitOp>(loc, senderFinishedSemaphore, one,
-                                          zero);
+                                          zero, /*minimum=*/nullptr);
 
           // Note: CB already reserved before the if/else, so receiver has
           // proper access to the multicast data.

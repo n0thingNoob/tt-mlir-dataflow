@@ -81,6 +81,19 @@ module {
     return
   }
 
+  // A monotonically increasing counter must not deadlock if the producer
+  // advances beyond the consumer's next target before it begins waiting.
+  func.func private @wait_minimum() attributes {d2m.thread = #d2m.thread<datamovement>} {
+    %sem0 = d2m.get_arg(0) : !d2m.local_semaphore
+    %c2 = arith.constant 2 : index
+    d2m.semaphore_wait %sem0, %c2 minimum : !d2m.local_semaphore
+    // CHECK-LABEL: func.func private @wait_minimum
+    // CHECK: %[[PTR:[0-9]+]] = ttkernel.reinterpret_cast
+    // CHECK: %[[VALUE:[0-9]+]] = arith.index_cast %c2 : index to i32
+    // CHECK: ttkernel.experimental.semaphore_wait_min(%[[PTR]], %[[VALUE]])
+    return
+  }
+
   // semaphore_wait with reset
   func.func private @wait_with_reset() attributes {d2m.thread = #d2m.thread<datamovement>} {
     %sem0 = d2m.get_arg(0) : !d2m.local_semaphore

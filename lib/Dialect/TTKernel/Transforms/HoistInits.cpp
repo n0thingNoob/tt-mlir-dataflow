@@ -64,9 +64,60 @@ public:
         }
       }
     });
+
     return success();
   }
 };
+
+static void orderHardwareStartupBeforeSpecializedInits(func::FuncOp func) {
+  // compute_kernel_hw_startup establishes the baseline unpack/pack/SFPU
+  // configuration and must precede every specialized init. Moving several
+  // init ops before the same outer loop otherwise leaves their order dependent
+  // on walk/move order, which can place startup after init_sfpu and silently
+  // reset it in fused kernels.
+  Block &entry = func.getBody().front();
+  ComputeKernelHWStartupOp startup;
+  for (Operation &entryOp : entry) {
+    if (auto candidate = dyn_cast<ComputeKernelHWStartupOp>(entryOp)) {
+      startup = candidate;
+    }
+  }
+  if (!startup) {
+    return;
+  }
+
+  Operation *latestOperandDef = nullptr;
+  for (Value operand : startup->getOperands()) {
+    Operation *def = operand.getDefiningOp();
+    if (!def || def->getBlock() != &entry) {
+      continue;
+    }
+    if (!latestOperandDef || latestOperandDef->isBeforeInBlock(def)) {
+      latestOperandDef = def;
+    }
+  }
+  if (latestOperandDef && startup->getPrevNode() != latestOperandDef) {
+    startup->moveAfter(latestOperandDef);
+  }
+
+  // Preserve the original order of direct entry-block init operations while
+  // moving any specialized init that preceded startup to immediately after
+  // it. All of their operands already dominate startup at this point.
+  SmallVector<Operation *> precedingInits;
+  for (Operation &entryOp : entry) {
+    if (&entryOp == startup.getOperation()) {
+      break;
+    }
+    if (entryOp.hasTrait<ttkernel::TTKernelInitOpTrait>()) {
+      precedingInits.push_back(&entryOp);
+    }
+  }
+  Operation *anchor = startup.getOperation();
+  for (Operation *init : precedingInits) {
+    init->moveAfter(anchor);
+    anchor = init;
+  }
+}
 
 } // namespace
 
@@ -81,6 +132,7 @@ public:
     RewritePatternSet patterns(&getContext());
     patterns.add<TTKernelFunctionRewriter>(&getContext());
     walkAndApplyPatterns(getOperation(), std::move(patterns));
+    orderHardwareStartupBeforeSpecializedInits(getOperation());
   }
 };
 } // namespace

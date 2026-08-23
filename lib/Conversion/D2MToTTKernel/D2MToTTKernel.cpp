@@ -260,11 +260,19 @@ static Value getCB(ConversionPatternRewriter &rewriter, Value cb) {
   }
 
   if (auto subViewOp = cb.getDefiningOp<memref::SubViewOp>()) {
-    return rewriter.getRemappedValue(subViewOp.getSource());
+    return getCB(rewriter, subViewOp.getSource());
+  }
+
+  if (auto collapseOp = cb.getDefiningOp<memref::CollapseShapeOp>()) {
+    return getCB(rewriter, collapseOp.getSrc());
+  }
+
+  if (auto expandOp = cb.getDefiningOp<memref::ExpandShapeOp>()) {
+    return getCB(rewriter, expandOp.getSrc());
   }
 
   if (auto castOp = cb.getDefiningOp<memref::CastOp>()) {
-    return rewriter.getRemappedValue(castOp.getSource());
+    return getCB(rewriter, castOp.getSource());
   }
 
   if (cb.getDefiningOp<d2m::GetArgOp>()) {
@@ -499,6 +507,38 @@ static Value getInCB(ConversionPatternRewriter &rewriter, Operation *op) {
 
 static Value getOutCB(ConversionPatternRewriter &rewriter, Operation *op) {
   return getRemappedFirstL1Cb(rewriter, op, /*forInput=*/false);
+}
+
+// Find the output CB owned by the current allocator root.  Reduction
+// accumulators have already been rewritten to DST by the time this conversion
+// runs, so following operand C no longer reaches the L1 buffer.  The root's L1
+// store remains the stable association for both affine- and explicit-SCF
+// compute roots.
+static Value getRootOutCB(ConversionPatternRewriter &rewriter, Operation *op) {
+  Operation *root = op;
+  while (root && !root->hasAttr("d2m.linalg_root")) {
+    root = root->getParentOp();
+  }
+  if (!root) {
+    return getOutCB(rewriter, op);
+  }
+
+  Value cb;
+  root->walk([&](Operation *nested) {
+    Value memref;
+    if (auto store = mlir::dyn_cast<memref::StoreOp>(nested)) {
+      memref = store.getMemRef();
+    } else if (auto store = mlir::dyn_cast<affine::AffineStoreOp>(nested)) {
+      memref = store.getMemRef();
+    }
+    if (memref &&
+        ttcore::getMemorySpace(memref) == ttcore::MemorySpace::DeviceL1) {
+      cb = memref;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return cb ? getCB(rewriter, cb) : getOutCB(rewriter, op);
 }
 
 // Check if an operand comes from DST.
@@ -745,6 +785,84 @@ public:
   LogicalResult
   matchAndRewrite(memref::LoadOp op, memref::LoadOpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const final {
+    // A load feeding an L1-to-DST store is lowered together with that store to
+    // copy_tile atomically.  Deferring either side to the generic conversion
+    // patterns is order-dependent: rewriting the load first turns its tile
+    // into an index, while rewriting the affine store first can leave the L1
+    // load illegal.
+    Operation *dstStore = nullptr;
+    if (ttcore::getMemorySpace(op.getMemRef()) !=
+        ttcore::MemorySpace::RegisterDst) {
+      for (Operation *user : op->getUsers()) {
+        Value memref;
+        if (auto store = mlir::dyn_cast<memref::StoreOp>(user)) {
+          memref = store.getMemRef();
+        } else if (auto store = mlir::dyn_cast<affine::AffineStoreOp>(user)) {
+          memref = store.getMemRef();
+        }
+        if (memref && ttcore::getMemorySpace(memref) ==
+                          ttcore::MemorySpace::RegisterDst) {
+          dstStore = user;
+          break;
+        }
+      }
+    }
+
+    if (dstStore) {
+      // This rewrite consumes the load and its destination store as one unit.
+      // Leave multi-use loads to the ordinary store-side conversion.
+      if (!op->hasOneUse()) {
+        return failure();
+      }
+
+      Value cb = rewriter.getRemappedValue(op.getMemRef());
+      Value cbIndex =
+          computeLinearIndex(op.getLoc(), op.getMemRefType().getShape(),
+                             adaptor.getIndices(), rewriter);
+
+      // The destination index is allowed to be computed between the load and
+      // store. Insert the copy at the store so every index operand dominates
+      // it (for example, `%dst = arith.addi ...` immediately before a store).
+      rewriter.setInsertionPoint(dstStore);
+      Value dstIndex;
+      if (auto store = mlir::dyn_cast<memref::StoreOp>(dstStore)) {
+        dstIndex =
+            computeLinearIndex(store.getLoc(), store.getMemRefType().getShape(),
+                               store.getIndices(), rewriter);
+      } else {
+        auto affineStore = mlir::cast<affine::AffineStoreOp>(dstStore);
+        assert(affineStore.getAffineMap().getNumResults() == 1 &&
+               "DST store must have one linear index");
+        dstIndex = rewriter.create<affine::AffineApplyOp>(
+            affineStore.getLoc(), affineStore.getAffineMap(),
+            affineStore.getMapOperands());
+      }
+
+      auto func = op->getParentOfType<func::FuncOp>();
+      bool hasStartup = false;
+      func.walk([&](ttkernel::ComputeKernelHWStartupOp) {
+        hasStartup = true;
+        return WalkResult::interrupt();
+      });
+      if (!hasStartup) {
+        Value inCB = getInCB(rewriter, op);
+        Value outCB = getOutCB(rewriter, op);
+        rewriter.setInsertionPointToStart(rewriter.getInsertionBlock());
+        setInsertionPointAfterOperands(rewriter, {inCB, outCB},
+                                       /*allowHoisting=*/true);
+        rewriter.create<ttkernel::ComputeKernelHWStartupOp>(op.getLoc(), inCB,
+                                                            nullptr, outCB);
+        rewriter.setInsertionPoint(dstStore);
+      }
+
+      rewriter.create<ttkernel::ReconfigDataFormatSrcAOp>(op.getLoc(), cb);
+      rewriter.create<ttkernel::CopyTileInitOp>(op.getLoc(), cb);
+      rewriter.create<ttkernel::CopyTileOp>(op.getLoc(), cb, cbIndex, dstIndex);
+      rewriter.eraseOp(dstStore);
+      rewriter.eraseOp(op);
+      return success();
+    }
+
     // For DST loads, the indices give us the DST slot.
     // For multi-index accesses (e.g., memref<4x1x1x...>), compute linear index.
     Value linearIdx =
@@ -1167,11 +1285,22 @@ public:
       auto insertionPoint = rewriter.getInsertionPoint();
       auto cbA = getCB(rewriter, op.getA());
       auto cbB = getCB(rewriter, op.getB());
-      auto outCB = getOutCB(rewriter, op);
-      setInsertionPointAfterOperands(rewriter, {cbA, cbB, outCB},
-                                     /*allowHoisting*/ true);
-      rewriter.create<ttkernel::ComputeKernelHWStartupOp>(op->getLoc(), cbA,
-                                                          cbB, outCB);
+      // The reduction accumulator is tied to this op's destination CB. Using
+      // the first L1 store in the whole kernel is ambiguous for staged
+      // compute kernels with an earlier scratch handoff.
+      auto outCB = getRootOutCB(rewriter, op);
+      auto func = op->template getParentOfType<func::FuncOp>();
+      bool hasStartup = false;
+      func.walk([&](ttkernel::ComputeKernelHWStartupOp) {
+        hasStartup = true;
+        return WalkResult::interrupt();
+      });
+      if (!hasStartup) {
+        setInsertionPointAfterOperands(rewriter, {cbA, cbB, outCB},
+                                       /*allowHoisting*/ true);
+        rewriter.create<ttkernel::ComputeKernelHWStartupOp>(op->getLoc(), cbA,
+                                                            cbB, outCB);
+      }
       rewriter.setInsertionPoint(insertionPoint->getBlock(), insertionPoint);
       rewriter.create<ttkernel::ReduceInitOp>(op->getLoc(), cbA, cbB, outCB,
                                               reduce_type, kernel_reduce_dim);
@@ -3995,8 +4124,15 @@ public:
         op.getLoc(), ttkernel::L1AddrPtrType::get(rewriter.getContext(), 32),
         semaphoreAddr);
 
-    rewriter.replaceOpWithNewOp<ttkernel::SemaphoreWaitOp>(op, semaphorePtr,
-                                                           op.getValue());
+    if (op.getMinimumAttr()) {
+      Value valueI32 = rewriter.create<arith::IndexCastOp>(
+          op.getLoc(), rewriter.getI32Type(), op.getValue());
+      rewriter.replaceOpWithNewOp<ttkernel::SemaphoreWaitMinOp>(
+          op, semaphorePtr, valueI32);
+    } else {
+      rewriter.replaceOpWithNewOp<ttkernel::SemaphoreWaitOp>(op, semaphorePtr,
+                                                             op.getValue());
+    }
     if (op.getResetValue()) {
       rewriter.create<ttkernel::NocSemaphoreSetOp>(op.getLoc(), semaphorePtr,
                                                    op.getResetValue());

@@ -3499,11 +3499,28 @@ Value d2m::GenericOp::findAssocOperand(mlir::tensor::EmptyOp emptyOp) {
     return Value();
   }
 
-  // Only the single-output case has an unambiguous fallback.
-  Value fallback = (genericOp.getOutputs().size() == 1)
-                       ? genericOp.getOutputs()[0]
-                       : Value();
-  return analyzeLocalBufferAssociation(emptyOp.getResult(), fallback).operand;
+  LocalBufferAssociation association =
+      analyzeLocalBufferAssociation(emptyOp.getResult());
+  if (association.operand || association.hasRemoteUse) {
+    return association.operand;
+  }
+
+  // An unassociated tensor.empty nested in a compute loop is local working
+  // storage. It must retain its explicitly chosen type when the enclosing
+  // generic is re-parallelized; associating it with the sole generic output
+  // would reblock the empty without also rewriting SCF iter-argument types.
+  for (Operation *parent = emptyOp->getParentOp();
+       parent && parent != genericOp.getOperation();
+       parent = parent->getParentOp()) {
+    if (mlir::isa<scf::ForOp>(parent) &&
+        !parent->hasAttr("d2m.blocking_loop")) {
+      return Value();
+    }
+  }
+
+  // Only the single-output case has an unambiguous top-level fallback.
+  return genericOp.getOutputs().size() == 1 ? genericOp.getOutputs()[0]
+                                            : Value();
 }
 
 Value d2m::GenericOp::getOperandAlloc(Region &region, unsigned operandIndex) {

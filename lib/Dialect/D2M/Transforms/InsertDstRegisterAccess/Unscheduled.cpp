@@ -117,9 +117,11 @@ collectDstAccesses(GenericOp gOp, Region &region,
       if (computeOp.isScalarOperand(operandIdx)) {
         continue;
       }
-      auto potentialLoad = computeOp->getOperand(operandIdx)
-                               .getDefiningOp<affine::AffineLoadOp>();
-      if (potentialLoad && notDstMemspace(potentialLoad)) {
+      Value operand = computeOp->getOperand(operandIdx);
+      if ((operand.getDefiningOp<affine::AffineLoadOp>() &&
+           notDstMemspace(operand.getDefiningOp<affine::AffineLoadOp>())) ||
+          (operand.getDefiningOp<memref::LoadOp>() &&
+           notDstMemspace(operand.getDefiningOp<memref::LoadOp>()))) {
         ++totalCBLoads;
       }
     }
@@ -146,19 +148,32 @@ collectDstAccesses(GenericOp gOp, Region &region,
         continue;
       }
 
-      auto potentialLoad = computeOp->getOperand(operandIdx)
-                               .getDefiningOp<affine::AffineLoadOp>();
-      if (potentialLoad && notDstMemspace(potentialLoad)) {
+      Value operand = computeOp->getOperand(operandIdx);
+      auto recordLoad = [&](auto load) {
         int dstSlice = static_cast<int>(
             dstAllocator.allocateInputStrided(inputSliceStride));
         if (numLoads == 0) {
           firstInputDstSlice = dstSlice;
         }
         ++numLoads;
-        collectDstLoadWithAccumAnalysis(
-            potentialLoad, operandIdx, carriedOutputRegions,
-            accumOperandIndices, copyInfos, dstSlice, outermostInnerComputeLoop,
-            noAccumGuardForLoads);
+        collectDstLoadWithAccumAnalysis(load, operandIdx, carriedOutputRegions,
+                                        accumOperandIndices, copyInfos,
+                                        dstSlice, outermostInnerComputeLoop,
+                                        noAccumGuardForLoads);
+      };
+      if (auto affineLoad = operand.getDefiningOp<affine::AffineLoadOp>();
+          affineLoad && notDstMemspace(affineLoad)) {
+        recordLoad(affineLoad);
+      } else if (auto memrefLoad = operand.getDefiningOp<memref::LoadOp>();
+                 memrefLoad && notDstMemspace(memrefLoad) &&
+                 !(isTileReductionOp(computeOp) &&
+                   llvm::is_contained(accumOperandIndices, operandIdx))) {
+        // Explicit SCF roots use memref.load for both true DST inputs and a
+        // destination-style reduction accumulator.  The latter only names the
+        // output slot and must not copy an uninitialized tensor.empty scratch
+        // tile into DST.  Affine roots retain their existing accumulation
+        // handling above.
+        recordLoad(memrefLoad);
       }
     }
 
