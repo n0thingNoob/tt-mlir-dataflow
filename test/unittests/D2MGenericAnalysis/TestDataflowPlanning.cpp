@@ -6,6 +6,8 @@
 
 #include <gtest/gtest.h>
 
+#include <limits>
+
 namespace mlir::tt::d2m {
 namespace {
 
@@ -92,6 +94,43 @@ TEST(DataflowPlanningTest, LeavesCyclesUnknownWithoutKernelEstimate) {
   EXPECT_FALSE(cost.latencyCycles.has_value());
   EXPECT_FALSE(cost.initiationIntervalCycles.has_value());
   EXPECT_FLOAT_EQ(cost.confidence, 0.0F);
+}
+
+TEST(DataflowPlanningTest, SaturatesSpatialCoreCount) {
+  DataflowCandidateGraph graph({}, nullptr, /*scopeOrdinal=*/0, {}, {});
+  llvm::SmallVector<DataflowPlannedKernel, 0> kernels;
+  kernels.push_back(
+      {makeVariant(/*member=*/0,
+                   {std::numeric_limits<int64_t>::max(),
+                    std::numeric_limits<int64_t>::max()},
+                   {}, /*computeCycles=*/1, /*dataMovementCycles=*/1,
+                   /*confidence=*/1.0F),
+       {}});
+  kernels.push_back({makeVariant(/*member=*/1, {2, 2}, {}, /*computeCycles=*/1,
+                                 /*dataMovementCycles=*/1, /*confidence=*/1.0F),
+                     {}});
+  DataflowMappingPlan plan({}, nullptr, /*scopeOrdinal=*/0,
+                           DataflowPlanStrategy::Spatial, std::move(kernels),
+                           {});
+
+  DataflowPlanCost cost = AnalyticalDataflowCostModel().evaluate(graph, plan);
+
+  EXPECT_EQ(cost.occupiedCores, std::numeric_limits<uint32_t>::max());
+}
+
+TEST(DataflowPlanningTest, TreatsInvalidGridAsUsingNoCores) {
+  DataflowCandidateGraph graph({}, nullptr, /*scopeOrdinal=*/0, {}, {});
+  llvm::SmallVector<DataflowPlannedKernel, 0> kernels;
+  kernels.push_back({makeVariant(/*member=*/0, {-1, 2}, {}, /*computeCycles=*/1,
+                                 /*dataMovementCycles=*/1, /*confidence=*/1.0F),
+                     {}});
+  DataflowMappingPlan plan({}, nullptr, /*scopeOrdinal=*/0,
+                           DataflowPlanStrategy::Temporal, std::move(kernels),
+                           {});
+
+  DataflowPlanCost cost = AnalyticalDataflowCostModel().evaluate(graph, plan);
+
+  EXPECT_EQ(cost.occupiedCores, 0u);
 }
 
 TEST(DataflowPlanningTest, RejectsUnknownCandidateReference) {

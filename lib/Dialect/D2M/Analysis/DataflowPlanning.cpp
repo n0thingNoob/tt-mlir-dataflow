@@ -309,12 +309,24 @@ getKernelInitiationInterval(const DataflowKernelVariant &variant) {
 }
 
 static uint32_t getCoreCount(llvm::ArrayRef<int64_t> gridShape) {
+  constexpr uint64_t maxCoreCount = std::numeric_limits<uint32_t>::max();
   uint64_t count = 1;
   for (int64_t dim : gridShape) {
-    count *= static_cast<uint64_t>(dim);
+    if (dim <= 0) {
+      return 0;
+    }
+    uint64_t unsignedDim = static_cast<uint64_t>(dim);
+    if (count > maxCoreCount / unsignedDim) {
+      return static_cast<uint32_t>(maxCoreCount);
+    }
+    count *= unsignedDim;
   }
-  return static_cast<uint32_t>(
-      std::min<uint64_t>(count, std::numeric_limits<uint32_t>::max()));
+  return static_cast<uint32_t>(count);
+}
+
+static uint32_t saturatingAdd(uint32_t lhs, uint32_t rhs) {
+  constexpr uint32_t max = std::numeric_limits<uint32_t>::max();
+  return rhs > max - lhs ? max : lhs + rhs;
 }
 
 DataflowPlanCost
@@ -337,7 +349,7 @@ AnalyticalDataflowCostModel::evaluate(const DataflowCandidateGraph &,
 
     uint32_t coreCount = getCoreCount(variant.getGridShape());
     if (plan.getStrategy() == DataflowPlanStrategy::Spatial) {
-      result.occupiedCores += coreCount;
+      result.occupiedCores = saturatingAdd(result.occupiedCores, coreCount);
     } else {
       result.occupiedCores = std::max(result.occupiedCores, coreCount);
     }
