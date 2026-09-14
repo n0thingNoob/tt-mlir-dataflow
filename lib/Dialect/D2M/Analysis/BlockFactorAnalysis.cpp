@@ -14,6 +14,7 @@
 #include "llvm/ADT/DenseMap.h"
 
 #include <functional>
+#include <limits>
 
 namespace mlir::tt::d2m {
 
@@ -671,6 +672,79 @@ static SmallVector<int64_t> chooseReblockedFactors(
 // BlockFactorAnalysis public interface.
 //===----------------------------------------------------------------------===//
 
+LogicalResult BlockFactorAnalysis::validateExplicitFactors(
+    GenericOp genericOp, ArrayRef<int64_t> factors, uint32_t numBuffers,
+    std::string &reason) {
+  reason.clear();
+  auto reject = [&](StringRef message) {
+    reason = message.str();
+    return failure();
+  };
+  if (!genericOp.isAffineBlockedForm() || genericOp.isDMAOnlyForm() ||
+      genericOp.getOutputs().size() != 1) {
+    return reject("expected a single-output affine-blocked compute generic");
+  }
+  const auto original = genericOp.getBlockFactorsValue();
+  if (factors.size() != original.size()) {
+    return reject("expected one planned block factor per iteration dimension");
+  }
+  if (numBuffers == 0) {
+    return reject("num-stream-buffers must be positive");
+  }
+  for (auto [factor, oldFactor] : llvm::zip(factors, original)) {
+    if (factor <= 0 || oldFactor <= 0 || factor % oldFactor != 0) {
+      return reject(
+          "planned factors must be positive multiples of current factors");
+    }
+  }
+  for (Value operand : genericOp.getInputsAndOutputs()) {
+    auto type = dyn_cast<MemRefType>(operand.getType());
+    if (!type || !type.hasStaticShape() ||
+        !isa<ttcore::TileType>(type.getElementType()) ||
+        !ttcore::getDeviceLayout(type)) {
+      return reject("expected static tiled memrefs with device layouts");
+    }
+  }
+  auto maps = genericOp.getIndexingMapsValue();
+  for (AffineMap map : maps) {
+    if (!map.isProjectedPermutation(/*allowZeroInResults=*/true)) {
+      return reject("expected projected-permutation indexing maps");
+    }
+  }
+  if (factors == ArrayRef<int64_t>(original)) {
+    return success();
+  }
+  auto [grid, shard] = getGridAndShardExtents(genericOp);
+  SmallVector<int64_t> scales;
+  SmallVector<std::size_t> dims;
+  uint64_t volume = 1;
+  for (auto [dim, factor] : llvm::enumerate(factors)) {
+    int64_t scale = factor / original[dim];
+    if (shard[dim] <= 0 || shard[dim] % scale != 0) {
+      return reject("planned factors must evenly divide the remaining shard");
+    }
+    if (grid[dim] <= 0 ||
+        grid[dim] > std::numeric_limits<int64_t>::max() / scale ||
+        volume > std::numeric_limits<uint64_t>::max() / scale) {
+      return reject("planned blocking extent overflows");
+    }
+    volume *= scale;
+    scales.push_back(scale);
+    if (scale > 1) {
+      dims.push_back(dim);
+    }
+  }
+  auto device = ttcore::lookupDevice(genericOp);
+  auto l1 = ttcore::MemorySpaceAttr::get(genericOp.getContext(),
+                                         ttcore::MemorySpace::DeviceL1);
+  if (!evaluateCandidate(genericOp, dims, maps, grid, shard, shard, original,
+                         scales, device, l1, numBuffers)) {
+    return reject("unsupported reblocking: layouts must repartition evenly and "
+                  "affected buffers must retain at least four tiles");
+  }
+  return success();
+}
+
 BlockFactorAnalysis::BlockFactorAnalysis(Operation *op, const Options &opts) {
   auto *ctx = op->getContext();
   auto l1Attr =
@@ -678,6 +752,10 @@ BlockFactorAnalysis::BlockFactorAnalysis(Operation *op, const Options &opts) {
 
   // Walk over all generic ops and compute the reblocked factors.
   op->walk([&](GenericOp genericOp) {
+    if (opts.useExplicitBlockFactors &&
+        genericOp->hasAttr(explicitFactorsAttrName)) {
+      return;
+    }
     if (genericOp.isExplicitDatamovementForm()) {
       return;
     }

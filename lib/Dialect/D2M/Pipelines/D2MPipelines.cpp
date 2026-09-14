@@ -160,6 +160,8 @@ void createD2MFrontendPipeline(OpPassManager &pm,
   d2m::D2MReblockGenericsOptions reblockGenericsOptions;
   {
     reblockGenericsOptions.numStreamBuffers = options.numStreamBuffers;
+    reblockGenericsOptions.useExplicitBlockFactors =
+        options.useExplicitBlockFactors;
     reblockGenericsOptions.testBufferSizePolicy = options.testBufferSizePolicy;
   }
   pm.addPass(d2m::createD2MReblockGenerics(reblockGenericsOptions));
@@ -173,6 +175,7 @@ void createD2MFrontendPipeline(OpPassManager &pm,
   d2m::D2MAllocateOptions allocateOptions;
   {
     allocateOptions.numStreamBuffers = options.numStreamBuffers;
+    allocateOptions.emitResourceReport = options.emitResourceReport;
     allocateOptions.allowL1OutputSpilling = options.allowL1OutputSpilling;
     allocateOptions.streamInsertPolicy = options.streamInsertPolicy;
     allocateOptions.availableL1AddrRange.assign(

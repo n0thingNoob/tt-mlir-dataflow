@@ -23,6 +23,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/TypeSwitch.h"
 
 #include <algorithm>
@@ -245,6 +246,7 @@ struct FuncAnalysisData {
   llvm::MapVector<mlir::Value, MemrefValueContext> memrefs;
   llvm::MapVector<d2m::GenericOp, GenericOpContext> generics;
   PlannerProblems problems; // Only using L1 and DRAM slots.
+  NamedAttrList resourceReport;
 
   const Planner::Problem &problem(MemorySpace memspace) const {
     return problems[ordinal(memspace)];
@@ -297,6 +299,12 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
 
     ModuleOp moduleOp = getOperation();
 
+    if (emitResourceReport) {
+      moduleOp.walk([](func::FuncOp funcOp) {
+        funcOp->removeAttr("d2m.allocation_report");
+      });
+    }
+
     memSpaces = [this, moduleOp]() {
       ttcore::SystemDescAttr systemDesc =
           ttcore::getCurrentScopeSystemDesc(moduleOp);
@@ -347,6 +355,27 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
     // scratch buffers).
 
     FuncAnalysisData analysis;
+    Builder builder(funcOp.getContext());
+    if (emitResourceReport) {
+      analysis.resourceReport.set("version", builder.getI64IntegerAttr(1));
+      analysis.resourceReport.set("status", builder.getStringAttr("failed"));
+      for (auto space : {MemorySpace::DeviceL1, MemorySpace::DeviceDRAM}) {
+        const auto &info = memSpaces[ordinal(space)];
+        analysis.resourceReport.set(
+            space == MemorySpace::DeviceL1 ? "l1_capacity_bytes"
+                                           : "dram_capacity_bytes",
+            builder.getI64IntegerAttr(info.maxAddress - info.baseAddress));
+      }
+    }
+    // A failed pass may have partially rewritten IR. Report failure on every
+    // exit; callers must evaluate candidates on clones and discard failed IR.
+    auto reportOnExit = llvm::make_scope_exit([&] {
+      if (emitResourceReport) {
+        funcOp->setAttr(
+            "d2m.allocation_report",
+            analysis.resourceReport.getDictionary(funcOp.getContext()));
+      }
+    });
 
     if (failed(validateGenericOpForms(funcOp))) {
       return failure();
@@ -397,6 +426,9 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
       return failure();
     }
 
+    if (emitResourceReport) {
+      analysis.resourceReport.set("status", builder.getStringAttr("success"));
+    }
     return success();
   }
 
@@ -1039,6 +1071,16 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
           Planner::spillAllocate(problem, memUsageLimit);
       TT_ALLOC_DEBUG("L1 solution stats: {}", stats);
 
+      if (emitResourceReport) {
+        Builder builder(funcOp.getContext());
+        analysis.resourceReport.set("l1_usage_bytes",
+                                    builder.getI64IntegerAttr(stats.memUsage));
+        if (stats.memUsage > memUsageLimit) {
+          analysis.resourceReport.set(
+              "status", builder.getStringAttr("l1_capacity_exceeded"));
+        }
+      }
+
       if (stats.memUsage > memUsageLimit) {
         return funcOp.emitOpError()
                << "required L1 memory usage " << stats.memUsage
@@ -1058,6 +1100,12 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
       auto &problem = analysis.problem(MemorySpace::DeviceDRAM);
 
       const auto &memInfo = memSpaces[ordinal(MemorySpace::DeviceDRAM)];
+
+      if (emitResourceReport) {
+        Builder builder(funcOp.getContext());
+        analysis.resourceReport.set("dram_usage_bytes",
+                                    builder.getI64IntegerAttr(0));
+      }
 
       for (auto &[memref, memrefCtx] : analysis.memrefs) {
         if (!isDeviceMemorySpace(memrefCtx.type, MemorySpace::System)) {
@@ -1091,6 +1139,15 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
         [[maybe_unused]] const auto stats = Planner::allocate(problem);
 
         const auto memUsageLimit = memInfo.maxAddress - memInfo.baseAddress;
+        if (emitResourceReport) {
+          Builder builder(funcOp.getContext());
+          analysis.resourceReport.set(
+              "dram_usage_bytes", builder.getI64IntegerAttr(stats.memUsage));
+          if (stats.memUsage > memUsageLimit) {
+            analysis.resourceReport.set(
+                "status", builder.getStringAttr("dram_capacity_exceeded"));
+          }
+        }
         if (stats.memUsage > memUsageLimit) {
           return funcOp.emitOpError()
                  << "required DRAM memory usage " << stats.memUsage
@@ -1106,6 +1163,37 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
       }
     }
 
+    if (emitResourceReport) {
+      Builder builder(funcOp.getContext());
+      SmallVector<Attribute> placements;
+      int64_t movedToDram = 0;
+      for (auto &[memref, ctx] : analysis.memrefs) {
+        if (!ctx.remappedMemSpace) {
+          continue;
+        }
+        auto space = *ctx.remappedMemSpace;
+        bool inL1 = space == MemorySpace::DeviceL1;
+        bool originallyL1 =
+            ttcore::getMemorySpace(ctx.type) == MemorySpace::DeviceL1;
+        movedToDram += originallyL1 && !inL1;
+        NamedAttrList entry;
+        entry.set("id", builder.getI64IntegerAttr(placements.size()));
+        entry.set("memory_space", builder.getStringAttr(inL1 ? "l1" : "dram"));
+        entry.set("original_memory_space",
+                  builder.getStringAttr(originallyL1 ? "l1" : "dram"));
+        entry.set("has_request", builder.getBoolAttr(ctx.reqIndex >= 0));
+        if (ctx.reqIndex >= 0) {
+          const auto &request = analysis.problem(space).request(ctx.reqIndex);
+          entry.set("size_bytes", builder.getI64IntegerAttr(request.size));
+          entry.set("offset_bytes", builder.getI64IntegerAttr(request.offset));
+        }
+        placements.push_back(entry.getDictionary(funcOp.getContext()));
+      }
+      analysis.resourceReport.set("placements",
+                                  builder.getArrayAttr(placements));
+      analysis.resourceReport.set("l1_to_dram_count",
+                                  builder.getI64IntegerAttr(movedToDram));
+    }
     return success();
   }
 

@@ -51,6 +51,7 @@ class D2MReblockGenerics final
     BlockFactorAnalysis::Options bfOpts;
     bfOpts.policy = *parsedBufferSizePolicy;
     bfOpts.numBuffers = numStreamBuffers;
+    bfOpts.useExplicitBlockFactors = useExplicitBlockFactors;
 
     if (moduleOp
             ->walk([&](func::FuncOp funcOp) -> WalkResult {
@@ -70,29 +71,62 @@ class D2MReblockGenerics final
   LogicalResult reblockGenerics(func::FuncOp funcOp,
                                 const BlockFactorAnalysis::Options &bfOpts) {
     IRRewriter rewriter(funcOp->getContext());
-    BlockFactorAnalysis blockFactorAnalysis(funcOp, bfOpts);
 
     SmallVector<GenericOp> genericOps;
-    funcOp.getBody().front().walk(
-        [&](GenericOp genericOp) { genericOps.push_back(genericOp); });
+    auto collect = [&](GenericOp genericOp) {
+      genericOps.push_back(genericOp);
+    };
+    if (useExplicitBlockFactors) {
+      funcOp.walk(collect);
+    } else {
+      funcOp.getBody().front().walk(collect);
+    }
 
+    // Validate all requests before rebuilding any generic in this function.
+    llvm::DenseMap<Operation *, SmallVector<int64_t>> plannedFactors;
+    if (useExplicitBlockFactors) {
+      for (GenericOp genericOp : genericOps) {
+        Attribute attr =
+            genericOp->getAttr(BlockFactorAnalysis::explicitFactorsAttrName);
+        if (!attr) {
+          continue;
+        }
+        auto factors = dyn_cast<DenseI64ArrayAttr>(attr);
+        if (!factors) {
+          return genericOp.emitOpError()
+                 << "d2m.planned_block_factors must be an array<i64>";
+        }
+        std::string reason;
+        if (failed(BlockFactorAnalysis::validateExplicitFactors(
+                genericOp, factors.asArrayRef(), bfOpts.numBuffers, reason))) {
+          return genericOp.emitOpError()
+                 << "invalid d2m.planned_block_factors: " << reason;
+        }
+        plannedFactors[genericOp] = llvm::to_vector(factors.asArrayRef());
+      }
+    }
+
+    BlockFactorAnalysis blockFactorAnalysis(funcOp, bfOpts);
     for (GenericOp oldGenericOp : genericOps) {
       const BlockFactorAnalysis::Result *bfResult =
           blockFactorAnalysis.lookup(oldGenericOp);
-      if (!bfResult) {
+      auto planned = plannedFactors.find(oldGenericOp);
+      if (!bfResult && planned == plannedFactors.end()) {
         continue;
       }
+      ArrayRef<int64_t> factors = planned != plannedFactors.end()
+                                      ? planned->second
+                                      : bfResult->reblockedFactors;
 
       SmallVector<int64_t> oldBlockFactors =
           oldGenericOp.getBlockFactorsValue();
-      if (oldBlockFactors == bfResult->reblockedFactors) {
+      if (ArrayRef<int64_t>(oldBlockFactors) == factors) {
         continue;
       }
 
       rewriter.setInsertionPoint(oldGenericOp);
       FailureOr<ParallelizedGeneric> reblocked =
-          oldGenericOp.withParallelization(rewriter, std::nullopt,
-                                           bfResult->reblockedFactors,
+          oldGenericOp.withParallelization(rewriter, std::nullopt, factors,
                                            /*generateReturnView=*/true);
       if (failed(reblocked)) {
         oldGenericOp.emitOpError()

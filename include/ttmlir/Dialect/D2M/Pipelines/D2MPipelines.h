@@ -150,6 +150,16 @@ struct D2MPipelineOptions : public PassPipelineOptions<D2MPipelineOptions> {
                      "(>=1). Default is 2."),
       llvm::cl::init(2)};
 
+  Option<bool> useExplicitBlockFactors{
+      *this, "use-explicit-block-factors",
+      llvm::cl::desc("Honor per-generic d2m.planned_block_factors."),
+      llvm::cl::init(false)};
+
+  Option<bool> emitResourceReport{
+      *this, "emit-resource-report",
+      llvm::cl::desc("Emit per-function D2M allocation resource reports."),
+      llvm::cl::init(false)};
+
   // Force all non-bound allocator variables to spill into DRAM.
   Option<bool> forceSpillToDramIfLegal{
       *this, "force-spill-to-dram-if-legal",

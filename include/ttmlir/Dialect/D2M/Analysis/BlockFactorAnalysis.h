@@ -9,6 +9,9 @@
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
+
+#include <string>
 
 namespace mlir::tt::d2m {
 
@@ -18,11 +21,15 @@ namespace mlir::tt::d2m {
 /// explicit-datamovement form), this analysis computes reblocked block
 /// factors according to the configured buffer size policy.
 struct BlockFactorAnalysis {
+  static constexpr llvm::StringLiteral explicitFactorsAttrName =
+      "d2m.planned_block_factors";
+
   enum class BufferSizePolicy { Auto, AutoMN, Bounded, Min, Max };
 
   struct Options {
     BufferSizePolicy policy = BufferSizePolicy::Auto;
     uint32_t numBuffers = 2;
+    bool useExplicitBlockFactors = false;
   };
 
   struct Result {
@@ -32,6 +39,14 @@ struct BlockFactorAnalysis {
   BlockFactorAnalysis(Operation *op, const Options &opts);
 
   const Result *lookup(GenericOp genericOp) const;
+
+  /// Validate a refinement of the current blocking without mutating IR.
+  /// This deliberately supports only static, tiled affine-blocked generics
+  /// accepted by the existing candidate evaluator, not all legal D2M programs.
+  static LogicalResult validateExplicitFactors(GenericOp genericOp,
+                                               ArrayRef<int64_t> factors,
+                                               uint32_t numBuffers,
+                                               std::string &reason);
 
 private:
   llvm::DenseMap<Operation *, Result> results;

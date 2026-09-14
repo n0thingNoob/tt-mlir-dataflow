@@ -601,6 +601,9 @@ def D2MReblockGenerics : Pass<"d2m-reblock-generics", "::mlir::ModuleOp"> {
     "::mlir::memref::MemRefDialect"
   ];
   let options = D2MNumStreamBuffersOption # [
+    Option<"useExplicitBlockFactors", "use-explicit-block-factors",
+          "bool", /*default=*/"false",
+          "Honor d2m.planned_block_factors on each generic; reject unsupported plans instead of falling back.">,
     Option<"testBufferSizePolicy",
           "test-buffer-size-policy",
           "std::string", /*default=*/"\"auto\"",
@@ -672,6 +675,9 @@ def D2MAllocate: Pass<"d2m-allocate", "::mlir::ModuleOp"> {
   }];
   let dependentDialects = ["::mlir::tt::ttcore::TTCoreDialect", "::mlir::memref::MemRefDialect"];
   let options = D2MNumStreamBuffersOption # [
+    Option<"emitResourceReport", "emit-resource-report",
+          "bool", /*default=*/"false",
+          "Attach a versioned d2m.allocation_report dictionary to each processed function.">,
     Option<"allowL1OutputSpilling",
           "allow-l1-output-spilling",
           "bool", /*default=*/"false",
