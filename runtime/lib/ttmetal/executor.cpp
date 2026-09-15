@@ -28,6 +28,7 @@
 #include "types_generated.h"
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <unordered_map>
 
@@ -38,6 +39,25 @@ namespace tt_metal = ::tt::tt_metal;
 namespace distributed = ::tt::tt_metal::distributed;
 
 namespace {
+template <typename DeviceT>
+tt_metal::GlobalSemaphore
+createGlobalSemaphore(DeviceT *device, const tt_metal::CoreRangeSet &cores,
+                      std::optional<uint32_t> initialValue, uint64_t address) {
+  // Prefer the mesh-reference API, retaining support for older external Metal
+  // checkouts that only provide the device-pointer API.
+  if constexpr (requires {
+                  tt_metal::experimental::CreateGlobalSemaphore(
+                      *device, cores, initialValue, tt_metal::BufferType::L1,
+                      address);
+                }) {
+    return tt_metal::experimental::CreateGlobalSemaphore(
+        *device, cores, initialValue, tt_metal::BufferType::L1, address);
+  } else {
+    return tt_metal::experimental::CreateGlobalSemaphore(
+        device, cores, initialValue, tt_metal::BufferType::L1, address);
+  }
+}
+
 class MCQExecutor {
 public:
   MCQExecutor(
@@ -324,9 +344,9 @@ void MCQExecutor::execute(
                  global_semaphores.end(),
              "Global semaphore with id ", command->ref()->global_id(),
              " already exists.");
-  auto global_semaphore = tt::tt_metal::experimental::CreateGlobalSemaphore(
-      *meshDevice, common::toCoreRangeSet(command->core_range_set()),
-      command->initial_value(), tt_metal::BufferType::L1,
+  auto global_semaphore = createGlobalSemaphore(
+      meshDevice, common::toCoreRangeSet(command->core_range_set()),
+      command->initial_value(),
       deviceAddressValidator(command->ref()->address(),
                              target::BufferType::L1));
   LOG_ASSERT(global_semaphore.address() == command->ref()->address());

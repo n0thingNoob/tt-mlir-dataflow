@@ -39,7 +39,6 @@ target_link_libraries(TTMLIRRuntime
     TTRuntimeContext
     TTRuntimeDebug
     TTRuntimePerf
-    TTRuntimeWorkarounds
     TTRuntimeDylibs
     TTRuntimeFabricConfig
     TTRuntimeMeshFabricConfig
@@ -55,6 +54,11 @@ target_link_libraries(TTMLIRRuntime
 )
 
 target_link_libraries(TTMLIRRuntime PUBLIC coverage_config)
+if (DEVICE_RUNTIME_ENABLED)
+  # Python uses WorkaroundEnv even when no enabled backend references it.
+  target_link_libraries(TTMLIRRuntime PRIVATE
+    "$<LINK_LIBRARY:WHOLE_ARCHIVE,TTRuntimeWorkarounds>")
+endif()
 if (TTMLIR_ENABLE_TTNN_JIT)
   # ttnn-jit wheel requires custom rpaths when installed into a tt-metal dev venv
   set_target_properties(TTMLIRRuntime PROPERTIES

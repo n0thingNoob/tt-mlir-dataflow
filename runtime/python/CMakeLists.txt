@@ -86,7 +86,7 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   )
 endif()
 
-if (TTMLIR_ENABLE_RUNTIME)
+if (TTMLIR_ENABLE_RUNTIME AND TT_RUNTIME_ENABLE_TTNN)
   add_library(_mlir_runtime_utils OBJECT runtime/utils.cpp)
   target_include_directories(_mlir_runtime_utils
     PRIVATE
@@ -102,7 +102,9 @@ if (TTMLIR_ENABLE_RUNTIME)
   )
   target_sources(_ttmlir_runtime PRIVATE $<TARGET_OBJECTS:_mlir_runtime_utils>)
   set_property(TARGET _mlir_runtime_utils PROPERTY CXX_STANDARD 20)
+endif()
 
+if (TTMLIR_ENABLE_RUNTIME)
   if (TTMLIR_PYTHON_PACKAGES_DIR)
     install(FILES $<TARGET_FILE:_ttmlir_runtime>
       DESTINATION ${TTMLIR_PYTHON_PACKAGES_DIR}
