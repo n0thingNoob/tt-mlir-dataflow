@@ -73,8 +73,12 @@ struct D2MPipelineOptions : public PassPipelineOptions<D2MPipelineOptions> {
 
   Option<bool> enableDataflowPlanning{
       *this, "enable-dataflow-planning",
-      llvm::cl::desc(
-          "Enable TTMetal D2M dataflow planning before grid selection."),
+      llvm::cl::desc("Enable TTMetal D2M graph and blocking planning stages."),
+      llvm::cl::init(false)};
+
+  Option<bool> dumpDataflowPlan{
+      *this, "dump-dataflow-plan",
+      llvm::cl::desc("Print decisions from enabled dataflow planning stages."),
       llvm::cl::init(false)};
 
   ListOption<int64_t> matmulInterchange{

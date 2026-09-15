@@ -1082,6 +1082,21 @@ def D2MDataflowPlanning : Pass<"d2m-dataflow-planning", "::mlir::ModuleOp"> {
   ];
 }
 
+def D2MDataflowBlockingPlanning : Pass<"d2m-dataflow-blocking-planning", "::mlir::ModuleOp"> {
+  let summary = "Inspect blocking candidates without overriding reblocking policy";
+  let description = [{
+    Runs after outer-loop generation and masking decomposition, before
+    ReblockGenerics. The initial policy is passthrough: observe current factors
+    without writing explicit requests or suppressing the default heuristic.
+    Candidate ordinals are local to this stage, not graph-stage identities.
+  }];
+  let dependentDialects = ["::mlir::tt::d2m::D2MDialect"];
+  let options = [
+    Option<"dumpPlan", "dump-plan", "bool", /*default=*/"false",
+        "Print the blocking-stage passthrough decisions.">,
+  ];
+}
+
 def D2MGenerateOuterLoops : Pass<"d2m-generate-outer-loops", "::mlir::ModuleOp"> {
   let summary = "Generate outer loops.";
   let description = [{

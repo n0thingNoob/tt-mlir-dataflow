@@ -117,7 +117,9 @@ void createD2MFrontendPipeline(OpPassManager &pm,
       llvm::report_fatal_error(
           "D2M dataflow planning currently supports only the TTMetal path");
     }
-    pm.addPass(d2m::createD2MDataflowPlanning());
+    d2m::D2MDataflowPlanningOptions planningOptions;
+    planningOptions.dumpPlan = options.dumpDataflowPlan;
+    pm.addPass(d2m::createD2MDataflowPlanning(planningOptions));
   }
   d2m::D2MGridSelectionOptions gridOptOptions;
   {
@@ -156,6 +158,12 @@ void createD2MFrontendPipeline(OpPassManager &pm,
   d2m::D2MDecomposeMaskingOptions decomposeMaskingOptions;
   { decomposeMaskingOptions.numStreamBuffers = options.numStreamBuffers; }
   pm.addPass(d2m::createD2MDecomposeMasking(decomposeMaskingOptions));
+
+  if (options.enableDataflowPlanning) {
+    d2m::D2MDataflowBlockingPlanningOptions blockingOptions;
+    blockingOptions.dumpPlan = options.dumpDataflowPlan;
+    pm.addPass(d2m::createD2MDataflowBlockingPlanning(blockingOptions));
+  }
 
   d2m::D2MReblockGenericsOptions reblockGenericsOptions;
   {
