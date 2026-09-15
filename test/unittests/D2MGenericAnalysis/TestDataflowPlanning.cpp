@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#include "ttmlir/Dialect/D2M/Analysis/DataflowAllocationFeedback.h"
 #include "ttmlir/Dialect/D2M/Planning/DataflowCostModel.h"
 
 #include "mlir/IR/Builders.h"
@@ -11,6 +12,50 @@
 
 namespace mlir::tt::d2m {
 namespace {
+
+TEST(DataflowPlanningTest, ReadsAllocationFeedback) {
+  MLIRContext context;
+  Builder builder(&context);
+  NamedAttrList report;
+  report.set("version", builder.getI64IntegerAttr(1));
+  report.set("status", builder.getStringAttr("success"));
+  report.set("l1_capacity_bytes", builder.getI64IntegerAttr(1024));
+  report.set("dram_capacity_bytes", builder.getI64IntegerAttr(8192));
+  report.set("l1_usage_bytes", builder.getI64IntegerAttr(512));
+  report.set("dram_usage_bytes", builder.getI64IntegerAttr(2048));
+  report.set("l1_to_dram_count", builder.getI64IntegerAttr(1));
+  std::string reason;
+  auto read = [&] {
+    return readDataflowAllocationFeedback(report.getDictionary(&context),
+                                          reason);
+  };
+  auto feedback = read();
+  ASSERT_TRUE(succeeded(feedback));
+  EXPECT_EQ(feedback->l1UsageBytes, 512u);
+  EXPECT_EQ(feedback->dramUsageBytes, 2048u);
+  EXPECT_EQ(feedback->l1ToDramCount, 1u);
+  EXPECT_TRUE(reason.empty());
+
+  report.erase("dram_usage_bytes");
+  EXPECT_TRUE(failed(read()));
+  report.set("status", builder.getStringAttr("l1_capacity_exceeded"));
+  feedback = read();
+  ASSERT_TRUE(succeeded(feedback));
+  EXPECT_FALSE(feedback->dramUsageBytes.has_value());
+
+  report.set("l1_usage_bytes", builder.getI64IntegerAttr(-1));
+  EXPECT_TRUE(failed(read()));
+  report.set("l1_usage_bytes", builder.getI64IntegerAttr(2048));
+  report.set("dram_usage_bytes", builder.getI64IntegerAttr(0));
+  report.set("status", builder.getStringAttr("success"));
+  EXPECT_TRUE(failed(read()));
+  EXPECT_EQ(reason, "successful allocation report exceeds capacity");
+  report.set("version", builder.getI64IntegerAttr(2));
+  EXPECT_TRUE(failed(read()));
+  EXPECT_EQ(reason, "expected allocation report version 1");
+  EXPECT_TRUE(failed(readDataflowAllocationFeedback({}, reason)));
+  EXPECT_EQ(reason, "missing d2m.allocation_report");
+}
 
 DataflowProgramVariant
 makeVariant(GenericOp member, llvm::SmallVector<int64_t> grid,

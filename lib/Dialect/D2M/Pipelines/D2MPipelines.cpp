@@ -183,7 +183,8 @@ void createD2MFrontendPipeline(OpPassManager &pm,
   d2m::D2MAllocateOptions allocateOptions;
   {
     allocateOptions.numStreamBuffers = options.numStreamBuffers;
-    allocateOptions.emitResourceReport = options.emitResourceReport;
+    allocateOptions.emitResourceReport =
+        options.emitResourceReport || options.enableDataflowPlanning;
     allocateOptions.allowL1OutputSpilling = options.allowL1OutputSpilling;
     allocateOptions.streamInsertPolicy = options.streamInsertPolicy;
     allocateOptions.availableL1AddrRange.assign(
@@ -193,6 +194,12 @@ void createD2MFrontendPipeline(OpPassManager &pm,
     allocateOptions.testAssumeL1Capacity = options.testAssumel1Capacity;
   }
   pm.addPass(d2m::createD2MAllocate(allocateOptions));
+  if (options.enableDataflowPlanning) {
+    d2m::D2MDataflowAllocationFeedbackOptions feedbackOptions;
+    feedbackOptions.dumpPlan = options.dumpDataflowPlan;
+    feedbackOptions.keepReport = options.emitResourceReport;
+    pm.addPass(d2m::createD2MDataflowAllocationFeedback(feedbackOptions));
+  }
   pm.addPass(d2m::createD2MLowerMulticastLoads());
 
   // After LowerToExplicitForm, all generic op are in Explicit Datamovement

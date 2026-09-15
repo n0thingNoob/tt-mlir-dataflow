@@ -3,6 +3,7 @@ add_subdirectory(Allocation)
 add_mlir_dialect_library(MLIRD2MAnalysis
   BlockFactorAnalysis.cpp
   DataflowGraph.cpp
+  DataflowAllocationFeedback.cpp
   GenericOpBufferAnalysis.cpp
   CBProducerConsumer.cpp
   GenericInterchangeAnalysis.cpp

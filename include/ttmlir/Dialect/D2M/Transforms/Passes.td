@@ -1097,6 +1097,23 @@ def D2MDataflowBlockingPlanning : Pass<"d2m-dataflow-blocking-planning", "::mlir
   ];
 }
 
+def D2MDataflowAllocationFeedback : Pass<"d2m-dataflow-allocation-feedback", "::mlir::ModuleOp"> {
+  let summary = "Read allocation feedback for the dataflow planner";
+  let description = [{
+    Runs after Allocate. Checks the report schema and allocation status without
+    changing placement or ranking candidates. By default, consumes the report
+    so temporary planning metadata does not reach later compilation stages.
+    A failed Allocate stops the pipeline before this pass; candidate drivers
+    can read its partial report with readDataflowAllocationFeedback instead.
+  }];
+  let options = [
+    Option<"dumpPlan", "dump-plan", "bool", /*default=*/"false",
+        "Print the allocation feedback summary.">,
+    Option<"keepReport", "keep-report", "bool", /*default=*/"false",
+        "Keep the allocation report on the function after reading it.">,
+  ];
+}
+
 def D2MGenerateOuterLoops : Pass<"d2m-generate-outer-loops", "::mlir::ModuleOp"> {
   let summary = "Generate outer loops.";
   let description = [{
