@@ -38,3 +38,39 @@ checks allocation failure stops before feedback consumption.
 
 This is TTIR-to-binary coverage, not hardware execution or live PyTorch capture.
 There is no candidate search or performance claim in this version.
+
+## Opt-in hardware check
+
+Use a matched compiler, ttrt Python environment, and Metal checkout. Configure
+`PYTHONPATH` and `LD_LIBRARY_PATH` for that runtime before running the command.
+The helper does not install packages or reset devices.
+It requires an exact PCI BDF and refuses a device reported busy by `fuser`.
+
+```sh
+python test/ttmlir/Dialect/D2M/Transforms/Inputs/run_dataflow_passthrough_hardware.py \
+  --compiler build/bin/ttmlir-opt --translate build/bin/ttmlir-translate \
+  --metal-home "$TT_METAL_HOME" --device "$DEVICE_BDF" \
+  --output /tmp/d2m-planner-check --runs 3
+```
+
+Choose a new output directory for each invocation. The helper queries a live
+descriptor, recompiles both modes, compares final IR, and executes each mode
+three times against the same BF16 PyTorch reference. Every result must satisfy
+PCC >= 0.999 and allclose (rtol 0.02, atol 0.005); outputs must also be identical
+between modes and repetitions. Each subprocess has a timeout. A timeout fails
+the test and requires investigation before another run, not an automatic reset.
+
+Artifacts include commands' logs, descriptor, IR, binaries, per-run correctness
+results, and a manifest recording device identity, source revisions, local
+changes, library hashes, and relevant environment settings. Query and execution
+must use the same runtime libraries, and compiler/runtime build revisions must
+match before execution. This checks a checked-in TTIR graph through
+device execution, not live PyTorch capture. No timings are collected.
+
+The same check is registered with lit and skipped by default. In the matched
+runtime environment, enable it explicitly with `TTMLIR_TEST_DATAFLOW_HARDWARE=1`
+and `DEVICE_BDF` set, then run:
+
+```sh
+llvm-lit -sv build/test/ttmlir/Dialect/D2M/hardware/dataflow_passthrough.mlir
+```
