@@ -124,7 +124,9 @@ struct LivenessClosure {
   LiveRange live;
 };
 
-using LivenessClosureGraph = llvm::DenseMap<Operation *, LivenessClosure>;
+// Preserve IR order when assigning solver variables; pointer hash order varies
+// between compiler processes and can change allocation tie-breaking.
+using LivenessClosureGraph = llvm::MapVector<Operation *, LivenessClosure>;
 
 template <typename T>
 using SpaceSpecific = std::array<T, ordinal(PlannerSpace::end)>;
