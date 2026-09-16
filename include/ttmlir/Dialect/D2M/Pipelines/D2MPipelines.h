@@ -266,6 +266,12 @@ struct D2MPipelineOptions : public PassPipelineOptions<D2MPipelineOptions> {
 void createTTIRBufferizationPipeline(OpPassManager &pm,
                                      const D2MPipelineOptions &options);
 
+// Frontend stage boundaries shared by normal compilation and isolated attempts.
+void createD2MFrontendPreparationPipeline(OpPassManager &pm,
+                                          const D2MPipelineOptions &options);
+void createD2MAllocationPipeline(OpPassManager &pm,
+                                 const D2MPipelineOptions &options);
+
 // Core D2M pipelines.
 void createD2MFrontendPipeline(OpPassManager &pm,
                                const D2MPipelineOptions &options);

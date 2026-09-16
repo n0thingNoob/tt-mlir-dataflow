@@ -3,6 +3,7 @@ set(TESTSUITE D2MGenericAnalysisTests)
 add_mlir_unittest(${TESTSUITE}
     TestDataflowPlanning.cpp
     TestDataflowContracts.cpp
+    TestDataflowExecution.cpp
     TestD2MGenericAnalysis.cpp
 )
 
@@ -13,6 +14,8 @@ target_include_directories(${TESTSUITE}
 
 target_link_libraries(${TESTSUITE}
   PRIVATE
+    TTMLIRCompilerStatic
+    MLIRD2MPipelines
     TTMLIRTestUtils
     MLIRD2MPlanning
     MLIRD2MAnalysis
@@ -27,3 +30,6 @@ target_link_libraries(${TESTSUITE}
     MLIRLinalgDialect
     coverage_config
 )
+
+target_compile_definitions(${TESTSUITE} PRIVATE
+    TTMLIR_D2M_TEST_DIR="${PROJECT_SOURCE_DIR}/test/ttmlir/Dialect/D2M")

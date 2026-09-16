@@ -72,8 +72,8 @@ void addFunctionOptimizationPasses(OpPassManager &funcPm) {
   funcPm.addPass(mlir::createLoopInvariantCodeMotionPass());
 }
 
-void createD2MFrontendPipeline(OpPassManager &pm,
-                               const D2MPipelineOptions &options) {
+void createD2MFrontendPreparationPipeline(OpPassManager &pm,
+                                          const D2MPipelineOptions &options) {
   // Create multi-device tensor annotation for graph with mesh.
   pm.addPass(ttir::createTTIRMultiDeviceTensorAnnotation());
   ttcore::TTCoreRegisterDevicePassOptions registerDeviceOptions;
@@ -158,7 +158,10 @@ void createD2MFrontendPipeline(OpPassManager &pm,
   d2m::D2MDecomposeMaskingOptions decomposeMaskingOptions;
   { decomposeMaskingOptions.numStreamBuffers = options.numStreamBuffers; }
   pm.addPass(d2m::createD2MDecomposeMasking(decomposeMaskingOptions));
+}
 
+void createD2MAllocationPipeline(OpPassManager &pm,
+                                 const D2MPipelineOptions &options) {
   if (options.enableDataflowPlanning) {
     d2m::D2MDataflowBlockingPlanningOptions blockingOptions;
     blockingOptions.dumpPlan = options.dumpDataflowPlan;
@@ -206,6 +209,12 @@ void createD2MFrontendPipeline(OpPassManager &pm,
   // form.
   pm.addPass(d2m::createD2MLowerToExplicitForm());
   pm.addPass(createCanonicalizerPassWithOptions(options));
+}
+
+void createD2MFrontendPipeline(OpPassManager &pm,
+                               const D2MPipelineOptions &options) {
+  createD2MFrontendPreparationPipeline(pm, options);
+  createD2MAllocationPipeline(pm, options);
 }
 
 void createD2MBackendPipeline(OpPassManager &pm,
