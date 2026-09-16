@@ -2,7 +2,9 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-#if defined(TTMLIR_ENABLE_RUNTIME_TESTS) && TTMLIR_ENABLE_RUNTIME_TESTS == 1
+#if defined(TTMLIR_ENABLE_RUNTIME_TESTS) &&                                    \
+    TTMLIR_ENABLE_RUNTIME_TESTS == 1 && defined(TT_RUNTIME_ENABLE_TTNN) &&     \
+    TT_RUNTIME_ENABLE_TTNN == 1
 #define RUNTIME_TEST_ENABLED
 #endif
 
