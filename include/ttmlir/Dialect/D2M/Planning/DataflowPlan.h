@@ -20,11 +20,11 @@ namespace mlir::tt::d2m {
 
 /// Aggregate resource estimate for an entire program, not one device kernel.
 struct ProgramResourceEstimate {
-  uint64_t l1BytesPerCore = 0;
-  uint64_t dramBytes = 0;
-  uint64_t nocBytes = 0;
-  uint32_t cbCount = 0;
-  uint32_t dstTiles = 0;
+  std::optional<uint64_t> l1BytesPerCore;
+  std::optional<uint64_t> dramBytes;
+  std::optional<uint64_t> nocBytes;
+  std::optional<uint32_t> cbCount;
+  std::optional<uint32_t> dstTiles;
 };
 
 /// Program-level estimate encompassing its compute and data-movement kernels.

@@ -14,11 +14,11 @@ namespace mlir::tt::d2m {
 struct DataflowPlanCost {
   std::optional<uint64_t> latencyCycles;
   std::optional<uint64_t> initiationIntervalCycles;
-  uint64_t dramBytes = 0;
-  uint64_t nocBytes = 0;
-  uint64_t peakL1BytesPerCore = 0;
+  std::optional<uint64_t> dramBytes;
+  std::optional<uint64_t> nocBytes;
+  std::optional<uint64_t> peakL1BytesPerCore;
   uint32_t occupiedCores = 0;
-  uint32_t spillCount = 0;
+  std::optional<uint32_t> spillCount;
   uint32_t programCount = 0;
   float confidence = 0.0F;
 };

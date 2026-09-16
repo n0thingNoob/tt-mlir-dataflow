@@ -56,6 +56,9 @@ AnalyticalDataflowCostModel::evaluate(const DataflowGraph &,
   DataflowPlanCost result;
   result.programCount = static_cast<uint32_t>(plan.getPrograms().size());
   result.confidence = 1.0F;
+  result.dramBytes = 0;
+  result.nocBytes = 0;
+  result.peakL1BytesPerCore = 0;
 
   bool allCyclesKnown = true;
   uint64_t cycleSum = 0;
@@ -63,10 +66,23 @@ AnalyticalDataflowCostModel::evaluate(const DataflowGraph &,
   for (const DataflowPlannedProgram &program : plan.getPrograms()) {
     const DataflowProgramVariant &variant = program.variant;
     const ProgramResourceEstimate &resources = variant.getResources();
-    result.dramBytes += resources.dramBytes;
-    result.nocBytes += resources.nocBytes;
-    result.peakL1BytesPerCore =
-        std::max(result.peakL1BytesPerCore, resources.l1BytesPerCore);
+    auto addKnown = [](std::optional<uint64_t> &sum,
+                       std::optional<uint64_t> value) {
+      if (!sum || !value ||
+          *value > std::numeric_limits<uint64_t>::max() - *sum) {
+        sum.reset();
+      } else {
+        *sum += *value;
+      }
+    };
+    addKnown(result.dramBytes, resources.dramBytes);
+    addKnown(result.nocBytes, resources.nocBytes);
+    if (result.peakL1BytesPerCore && resources.l1BytesPerCore) {
+      result.peakL1BytesPerCore =
+          std::max(*result.peakL1BytesPerCore, *resources.l1BytesPerCore);
+    } else {
+      result.peakL1BytesPerCore.reset();
+    }
 
     uint32_t coreCount = getCoreCount(variant.getGridShape());
     if (plan.getStrategy() == DataflowPlanStrategy::Spatial) {

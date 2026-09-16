@@ -141,6 +141,20 @@ TEST(DataflowPlanningTest, LeavesCyclesUnknownWithoutProgramEstimate) {
   EXPECT_FLOAT_EQ(cost.confidence, 0.0F);
 }
 
+TEST(DataflowPlanningTest, UnknownResourcesDoNotBecomeZero) {
+  DataflowGraph graph({}, nullptr, 0, {}, {});
+  llvm::SmallVector<DataflowPlannedProgram, 0> programs;
+  programs.push_back(
+      {DataflowProgramVariant(0, {GenericOp{}}, {1, 1}, {}), {}});
+  DataflowMappingPlan plan({}, nullptr, 0, DataflowPlanStrategy::Temporal,
+                           std::move(programs), {});
+  auto cost = AnalyticalDataflowCostModel().evaluate(graph, plan);
+  EXPECT_FALSE(cost.dramBytes.has_value());
+  EXPECT_FALSE(cost.nocBytes.has_value());
+  EXPECT_FALSE(cost.peakL1BytesPerCore.has_value());
+  EXPECT_FALSE(cost.spillCount.has_value());
+}
+
 TEST(DataflowPlanningTest, SaturatesSpatialCoreCount) {
   DataflowGraph graph({}, nullptr, /*scopeOrdinal=*/0, {}, {});
   llvm::SmallVector<DataflowPlannedProgram, 0> programs;
