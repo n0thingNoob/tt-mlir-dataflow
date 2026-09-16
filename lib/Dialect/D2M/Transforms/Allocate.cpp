@@ -1830,7 +1830,7 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
       }
 
       info[ordinal(MemorySpace::DeviceDRAM)] = MemorySpaceInfo(
-          chipDesc.getDramUnreservedBase(), chipDesc.getDramChannelSize(),
+          chipDesc.getDramUnreservedBase(), chipDesc.getDramUnreservedEnd(),
           chipDesc.getNocDRAMAddressAlignBytes());
     }
     return info;
