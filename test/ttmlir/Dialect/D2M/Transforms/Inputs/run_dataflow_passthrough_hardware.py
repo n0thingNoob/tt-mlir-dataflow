@@ -14,7 +14,6 @@ import subprocess
 import sys
 import sysconfig
 
-
 SEED = 20260915
 SHAPE = (64, 64)
 FIXTURE = Path(__file__).resolve().parents[1] / "dataflow_passthrough_e2e.mlir"
@@ -26,19 +25,38 @@ def digest(path):
 
 
 def load_runtime(metal_home):
-    # Some runtime builds do not link libpython directly.
+    # Select roots before package initialization loads any extension or DSO.
+    root_keys = ("TT_METAL_RUNTIME_ROOT", "TT_METAL_RUNTIME_ROOT_EXTERNAL")
+    roots = {key: os.environ.get(key) for key in root_keys}
+    requested_root = (
+        roots["TT_METAL_RUNTIME_ROOT_EXTERNAL"] or roots["TT_METAL_RUNTIME_ROOT"]
+    )
+    if not requested_root:
+        raise RuntimeError("Set TT_METAL_RUNTIME_ROOT to the matched installed runtime")
+    os.environ["TT_METAL_HOME"] = str(metal_home)
     library = Path(sysconfig.get_config_var("LIBDIR")) / sysconfig.get_config_var(
         "LDLIBRARY"
     )
     ctypes.CDLL(str(library), mode=ctypes.RTLD_GLOBAL)
     from ttrt.runtime import _ttmlir_runtime as runtime
 
-    for key in (
-        "TT_METAL_HOME",
-        "TT_METAL_RUNTIME_ROOT",
-        "TT_METAL_RUNTIME_ROOT_EXTERNAL",
+    # ttrt package initialization may rewrite these variables for its bundled
+    # wheel. Restore the caller's roots, not the source checkout, and reject
+    # a DSO loaded from another installation rather than pretending to switch it.
+    for key, value in roots.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+    os.environ["TT_METAL_HOME"] = str(metal_home)
+    metal_libraries = [
+        path for path in loaded_libraries() if "libtt_metal" in Path(path).name
+    ]
+    if not metal_libraries or any(
+        not Path(path).resolve().is_relative_to(Path(requested_root).resolve())
+        for path in metal_libraries
     ):
-        os.environ[key] = str(metal_home)
+        raise RuntimeError("Loaded Metal library is outside the requested runtime root")
     runtime.runtime.set_metal_home(str(metal_home))
     runtime.runtime.set_current_device_runtime(runtime.runtime.DeviceRuntime.TTMetal)
     return runtime
@@ -126,9 +144,12 @@ def execute(args):
             converted.append(runtime.runtime.to_layout(host, device, layout, True))
         for _ in range(args.runs):
             result = runtime.runtime.submit(device, binary.fbb, 0, converted)[0]
-            host = runtime.runtime.to_host(result, untilize=True, blocking=True)[0]
-            output = torch.empty(SHAPE, dtype=torch.bfloat16)
-            runtime.runtime.memcpy(output.data_ptr(), host)
+            try:
+                host = runtime.runtime.to_host(result, untilize=True, blocking=True)[0]
+                output = torch.empty(SHAPE, dtype=torch.bfloat16)
+                runtime.runtime.memcpy(output.data_ptr(), host)
+            finally:
+                runtime.runtime.deallocate_tensor(result, force=True)
             actual, expected = output.float(), reference.float()
             pcc = torch.corrcoef(torch.stack([actual.flatten(), expected.flatten()]))[
                 0, 1
@@ -230,6 +251,8 @@ def main():
                 "LD_LIBRARY_PATH",
                 "TT_VISIBLE_DEVICES",
                 "TT_METAL_LOCAL_ONLY",
+                "TT_METAL_RUNTIME_ROOT",
+                "TT_METAL_RUNTIME_ROOT_EXTERNAL",
             )
         },
         "passed": False,
