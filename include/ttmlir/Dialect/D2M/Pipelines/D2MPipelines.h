@@ -269,6 +269,12 @@ void createTTIRBufferizationPipeline(OpPassManager &pm,
 // Frontend stage boundaries shared by normal compilation and isolated attempts.
 void createD2MFrontendPreparationPipeline(OpPassManager &pm,
                                           const D2MPipelineOptions &options);
+// Exposed boundaries allow contract checks immediately after reblocking.
+void createD2MReblockingPipeline(OpPassManager &pm,
+                                 const D2MPipelineOptions &options);
+void createD2MMemoryAllocationPipeline(OpPassManager &pm,
+                                       const D2MPipelineOptions &options);
+
 void createD2MAllocationPipeline(OpPassManager &pm,
                                  const D2MPipelineOptions &options);
 

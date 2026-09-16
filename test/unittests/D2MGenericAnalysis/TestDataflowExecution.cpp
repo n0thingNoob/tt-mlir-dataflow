@@ -137,4 +137,104 @@ TEST_F(DataflowExecutionTest, RejectsUnknownStartingStage) {
   EXPECT_TRUE(result.reports.empty());
 }
 
+TEST_F(DataflowExecutionTest, AppliesExplicitBlockingAndPreservesBaseline) {
+  auto input = fixture("allocate/reblock_explicit_plan.mlir");
+  ASSERT_TRUE(input);
+  PassManager prepare(&context);
+  prepare.addPass(ttcore::createTTCoreRegisterDevicePass());
+  ASSERT_TRUE(succeeded(prepare.run(*input)));
+  OwningOpRef<ModuleOp> original = cast<ModuleOp>(input->clone());
+  DataflowRequirements requirements;
+  requirements.blocking.push_back({"planned_matmul", 0, {1, 1, 4}});
+  ttmetal::D2MPipelineOptions options;
+  options.testAssumel1Capacity = 8388608;
+  auto result = runDataflowAttempt(*input, DataflowStage::Blocking, options,
+                                   requirements);
+  ASSERT_EQ(result.status, DataflowAttemptStatus::Accepted) << result.reason;
+  ASSERT_TRUE(result.artifact);
+  EXPECT_TRUE(equivalent(*input, *original));
+  // The post-reblock check verified the realized factors; private IDs must not
+  // leak into the accepted artifact.
+  result.artifact->walk([&](Operation *op) {
+    EXPECT_FALSE(op->hasAttr("d2m.execution_requirement"));
+  });
+  requirements.blocking[0].factors = {1, 1, 3};
+  auto conflict = runDataflowAttempt(*input, DataflowStage::Blocking, options,
+                                     requirements);
+  EXPECT_EQ(conflict.status, DataflowAttemptStatus::Unsupported);
+  EXPECT_NE(conflict.reason.find("conflicts"), std::string::npos);
+  EXPECT_FALSE(conflict.artifact);
+  EXPECT_TRUE(equivalent(*input, *original));
+}
+
+TEST_F(DataflowExecutionTest, RejectsUnsupportedBlockingWithoutMutatingInput) {
+  auto input = fixture("allocate/reblock_explicit_plan.mlir");
+  ASSERT_TRUE(input);
+  PassManager prepare(&context);
+  prepare.addPass(ttcore::createTTCoreRegisterDevicePass());
+  ASSERT_TRUE(succeeded(prepare.run(*input)));
+  input->walk([](GenericOp generic) {
+    generic->removeAttr("d2m.planned_block_factors");
+  });
+  OwningOpRef<ModuleOp> original = cast<ModuleOp>(input->clone());
+  DataflowRequirements requirements;
+  requirements.blocking.push_back({"planned_matmul", 0, {1, 1, 3}});
+  ttmetal::D2MPipelineOptions options;
+  auto invalid = runDataflowAttempt(*input, DataflowStage::Blocking, options,
+                                    requirements);
+  EXPECT_EQ(invalid.status, DataflowAttemptStatus::Unsupported);
+  EXPECT_NE(invalid.reason.find("divide"), std::string::npos);
+  requirements.blocking[0].factors = {1, 1, 4};
+  requirements.blocking.push_back(requirements.blocking[0]);
+  auto duplicate = runDataflowAttempt(*input, DataflowStage::Blocking, options,
+                                      requirements);
+  EXPECT_EQ(duplicate.status, DataflowAttemptStatus::Unsupported);
+  EXPECT_NE(duplicate.reason.find("duplicate"), std::string::npos);
+  EXPECT_TRUE(equivalent(*input, *original));
+}
+
+TEST_F(DataflowExecutionTest,
+       ReportsSuccessfulSpillAndHonorsOutputSpillPolicy) {
+  auto input = fixture("allocate/allocate_intermediate_outputs.mlir");
+  ASSERT_TRUE(input);
+  PassManager prepare(&context);
+  prepare.addPass(ttcore::createTTCoreRegisterDevicePass());
+  ASSERT_TRUE(succeeded(prepare.run(*input)));
+  OwningOpRef<ModuleOp> original = cast<ModuleOp>(input->clone());
+  ttmetal::D2MPipelineOptions options;
+  options.testBufferSizePolicy = "max";
+  options.forceSpillToDramIfLegal = true;
+  DataflowRequirements allow;
+  allow.allowIntermediateOutputSpilling = true;
+  auto spilled =
+      runDataflowAttempt(*input, DataflowStage::Blocking, options, allow);
+  ASSERT_EQ(spilled.status, DataflowAttemptStatus::Accepted) << spilled.reason;
+  ASSERT_FALSE(spilled.reports[0].functions.empty());
+  auto &feedback = spilled.reports[0].functions[0].allocation;
+  ASSERT_TRUE(feedback.intermediateOutputSpillCount);
+  EXPECT_GT(*feedback.intermediateOutputSpillCount, 0u);
+  DataflowRequirements forbid;
+  forbid.allowIntermediateOutputSpilling = false;
+  forbid.blocking.push_back({"intermediate_chain", 0, {1, 1}});
+  forbid.blocking.push_back({"intermediate_chain", 1, {1, 1}});
+  auto kept =
+      runDataflowAttempt(*input, DataflowStage::Blocking, options, forbid);
+  ASSERT_EQ(kept.status, DataflowAttemptStatus::Accepted) << kept.reason;
+  ASSERT_FALSE(kept.reports[0].functions.empty());
+  EXPECT_EQ(
+      kept.reports[0].functions[0].allocation.intermediateOutputSpillCount,
+      std::optional<uint64_t>(0));
+  EXPECT_TRUE(equivalent(*input, *original));
+}
+
+TEST_F(DataflowExecutionTest, RejectsPreparedInputWithoutDescriptor) {
+  auto input = fixture("allocate/reblock_explicit_plan.mlir");
+  ASSERT_TRUE(input);
+  ttmetal::D2MPipelineOptions options;
+  auto result = runDataflowAttempt(*input, DataflowStage::Blocking, options);
+  EXPECT_EQ(result.status, DataflowAttemptStatus::Unsupported);
+  EXPECT_NE(result.reason.find("system descriptor"), std::string::npos);
+  EXPECT_TRUE(result.reports.empty());
+}
+
 } // namespace mlir::tt::d2m

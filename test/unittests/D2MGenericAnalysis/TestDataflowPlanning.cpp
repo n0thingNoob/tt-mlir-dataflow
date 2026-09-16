@@ -34,6 +34,13 @@ TEST(DataflowPlanningTest, ReadsAllocationFeedback) {
   EXPECT_EQ(feedback->l1UsageBytes, 512u);
   EXPECT_EQ(feedback->dramUsageBytes, 2048u);
   EXPECT_EQ(feedback->l1ToDramCount, 1u);
+  EXPECT_FALSE(feedback->intermediateOutputSpillCount);
+  report.set("intermediate_output_spill_count", builder.getI64IntegerAttr(-1));
+  EXPECT_TRUE(failed(read()));
+  report.set("intermediate_output_spill_count", builder.getI64IntegerAttr(0));
+  feedback = read();
+  ASSERT_TRUE(succeeded(feedback));
+  EXPECT_EQ(feedback->intermediateOutputSpillCount, std::optional<uint64_t>(0));
   EXPECT_TRUE(reason.empty());
 
   report.erase("dram_usage_bytes");

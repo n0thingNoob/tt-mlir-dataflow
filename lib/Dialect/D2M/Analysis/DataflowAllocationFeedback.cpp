@@ -46,7 +46,9 @@ readDataflowAllocationFeedback(DictionaryAttr report, std::string &reason) {
       failed(read("dram_capacity_bytes", true, dramCapacity)) ||
       failed(read("l1_usage_bytes", succeeded, feedback.l1UsageBytes)) ||
       failed(read("dram_usage_bytes", succeeded, feedback.dramUsageBytes)) ||
-      failed(read("l1_to_dram_count", succeeded, feedback.l1ToDramCount))) {
+      failed(read("l1_to_dram_count", succeeded, feedback.l1ToDramCount)) ||
+      failed(read("intermediate_output_spill_count", false,
+                  feedback.intermediateOutputSpillCount))) {
     return failure();
   }
   feedback.l1CapacityBytes = *l1Capacity;

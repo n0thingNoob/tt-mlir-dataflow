@@ -160,7 +160,7 @@ void createD2MFrontendPreparationPipeline(OpPassManager &pm,
   pm.addPass(d2m::createD2MDecomposeMasking(decomposeMaskingOptions));
 }
 
-void createD2MAllocationPipeline(OpPassManager &pm,
+void createD2MReblockingPipeline(OpPassManager &pm,
                                  const D2MPipelineOptions &options) {
   if (options.enableDataflowPlanning) {
     d2m::D2MDataflowBlockingPlanningOptions blockingOptions;
@@ -177,7 +177,10 @@ void createD2MAllocationPipeline(OpPassManager &pm,
   }
   pm.addPass(d2m::createD2MReblockGenerics(reblockGenericsOptions));
   pm.addPass(d2m::createD2MMaterializeViewReturns());
+}
 
+void createD2MMemoryAllocationPipeline(OpPassManager &pm,
+                                       const D2MPipelineOptions &options) {
   // Run right before allocate to mark synchronized buffers
   d2m::D2MMarkSynchronizedBuffersOptions markSyncBuffersOptions;
   { markSyncBuffersOptions.numStreamBuffers = options.numStreamBuffers; }
@@ -209,6 +212,12 @@ void createD2MAllocationPipeline(OpPassManager &pm,
   // form.
   pm.addPass(d2m::createD2MLowerToExplicitForm());
   pm.addPass(createCanonicalizerPassWithOptions(options));
+}
+
+void createD2MAllocationPipeline(OpPassManager &pm,
+                                 const D2MPipelineOptions &options) {
+  createD2MReblockingPipeline(pm, options);
+  createD2MMemoryAllocationPipeline(pm, options);
 }
 
 void createD2MFrontendPipeline(OpPassManager &pm,

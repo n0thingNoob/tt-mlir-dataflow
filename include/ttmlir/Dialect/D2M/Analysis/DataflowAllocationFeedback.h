@@ -17,6 +17,8 @@ struct DataflowAllocationFeedback {
   std::optional<uint64_t> l1UsageBytes;
   std::optional<uint64_t> dramUsageBytes;
   std::optional<uint64_t> l1ToDramCount;
+  // Absent in older reports; includes only L1 intermediate generic outputs.
+  std::optional<uint64_t> intermediateOutputSpillCount;
 };
 
 /// Read allocator feedback without treating missing estimates as zero.

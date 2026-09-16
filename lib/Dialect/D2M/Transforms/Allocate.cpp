@@ -1169,6 +1169,7 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
       Builder builder(funcOp.getContext());
       SmallVector<Attribute> placements;
       int64_t movedToDram = 0;
+      int64_t intermediateOutputSpills = 0;
       for (auto &[memref, ctx] : analysis.memrefs) {
         if (!ctx.remappedMemSpace) {
           continue;
@@ -1178,6 +1179,9 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
         bool originallyL1 =
             ttcore::getMemorySpace(ctx.type) == MemorySpace::DeviceL1;
         movedToDram += originallyL1 && !inL1;
+        intermediateOutputSpills += originallyL1 && !inL1 &&
+                                    ctx.usedForOutput &&
+                                    ctx.genericUsers.size() > 1;
         NamedAttrList entry;
         entry.set("id", builder.getI64IntegerAttr(placements.size()));
         entry.set("memory_space", builder.getStringAttr(inL1 ? "l1" : "dram"));
@@ -1195,6 +1199,9 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
                                   builder.getArrayAttr(placements));
       analysis.resourceReport.set("l1_to_dram_count",
                                   builder.getI64IntegerAttr(movedToDram));
+      analysis.resourceReport.set(
+          "intermediate_output_spill_count",
+          builder.getI64IntegerAttr(intermediateOutputSpills));
     }
     return success();
   }
