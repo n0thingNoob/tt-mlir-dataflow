@@ -13,6 +13,7 @@ target_include_directories(${TESTSUITE}
 target_link_libraries(${TESTSUITE}
   PRIVATE
     TTMLIRTestUtils
+    MLIRD2MPlanning
     MLIRD2MAnalysis
     MLIRD2MDialect
     MLIRD2MUtils

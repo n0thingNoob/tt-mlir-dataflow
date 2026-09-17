@@ -4,7 +4,7 @@
 
 #include "ttmlir/Dialect/D2M/Transforms/Passes.h"
 
-#include "ttmlir/Dialect/D2M/Analysis/DataflowPlanning.h"
+#include "ttmlir/Dialect/D2M/Planning/DataflowCostModel.h"
 
 #include "llvm/Support/raw_ostream.h"
 
@@ -24,8 +24,7 @@ public:
     AnalyticalDataflowCostModel costModel;
     TemporalDataflowPlanMaterializer materializer;
 
-    for (const DataflowCandidateGraph &graph :
-         buildDataflowCandidateGraphs(getOperation())) {
+    for (const DataflowGraph &graph : buildDataflowGraphs(getOperation())) {
       DataflowMappingPlan plan = buildTemporalFallbackPlan(graph);
       DataflowFeasibilityResult feasibility =
           feasibilityModel.evaluate(graph, plan);

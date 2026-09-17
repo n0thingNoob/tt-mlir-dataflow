@@ -2,18 +2,12 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-#ifndef TTMLIR_DIALECT_D2M_ANALYSIS_DATAFLOWPLANNING_H
-#define TTMLIR_DIALECT_D2M_ANALYSIS_DATAFLOWPLANNING_H
+#ifndef TTMLIR_DIALECT_D2M_PLANNING_DATAFLOWPLAN_H
+#define TTMLIR_DIALECT_D2M_PLANNING_DATAFLOWPLAN_H
 
-#include "ttmlir/Dialect/D2M/IR/D2MOps.h"
-
-#include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/IR/BuiltinOps.h"
 #include "mlir/Support/LogicalResult.h"
-#include "llvm/ADT/ArrayRef.h"
-#include "llvm/ADT/SmallVector.h"
+#include "ttmlir/Dialect/D2M/Analysis/DataflowGraph.h"
 #include "llvm/ADT/StringRef.h"
-
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -24,40 +18,8 @@ class raw_ostream;
 
 namespace mlir::tt::d2m {
 
-using DataflowCandidateId = unsigned;
-
-struct DataflowCandidateEdge {
-  DataflowCandidateId producer;
-  DataflowCandidateId consumer;
-};
-
-/// A stable, read-only view of the top-level d2m.generic operations in one
-/// function block. Candidate IDs are indices into operations.
-class DataflowCandidateGraph {
-public:
-  DataflowCandidateGraph(func::FuncOp function, Block *block,
-                         unsigned scopeOrdinal,
-                         llvm::SmallVector<GenericOp> operations,
-                         llvm::SmallVector<DataflowCandidateEdge> edges);
-
-  func::FuncOp getFunction() const { return function; }
-  Block *getBlock() const { return block; }
-  unsigned getScopeOrdinal() const { return scopeOrdinal; }
-  llvm::ArrayRef<GenericOp> getOperations() const { return operations; }
-  llvm::ArrayRef<DataflowCandidateEdge> getEdges() const { return edges; }
-
-private:
-  func::FuncOp function;
-  Block *block;
-  unsigned scopeOrdinal;
-  llvm::SmallVector<GenericOp> operations;
-  llvm::SmallVector<DataflowCandidateEdge> edges;
-};
-
-llvm::SmallVector<DataflowCandidateGraph>
-buildDataflowCandidateGraphs(ModuleOp module);
-
-struct KernelResourceEstimate {
+/// Aggregate resource estimate for an entire program, not one device kernel.
+struct ProgramResourceEstimate {
   uint64_t l1BytesPerCore = 0;
   uint64_t dramBytes = 0;
   uint64_t nocBytes = 0;
@@ -65,43 +27,44 @@ struct KernelResourceEstimate {
   uint32_t dstTiles = 0;
 };
 
-struct KernelCostEstimate {
+/// Program-level estimate encompassing its compute and data-movement kernels.
+struct ProgramCostEstimate {
   std::optional<uint64_t> computeCycles;
   std::optional<uint64_t> dataMovementCycles;
   std::optional<uint64_t> initiationIntervalCycles;
   float confidence = 0.0F;
 };
 
-/// One possible implementation of one or more candidate computations. A
+/// One possible implementation of one or more node computations. A
 /// multi-member variant represents fusion. Future staged variants may appear
 /// more than once in a plan after the feasibility model learns their contract.
-class DataflowKernelVariant {
+class DataflowProgramVariant {
 public:
-  DataflowKernelVariant(unsigned variantId,
-                        llvm::SmallVector<DataflowCandidateId> members,
-                        llvm::SmallVector<int64_t> gridShape,
-                        llvm::SmallVector<int64_t> blockFactors,
-                        KernelResourceEstimate resources = {},
-                        KernelCostEstimate cost = {});
+  DataflowProgramVariant(unsigned variantId,
+                         llvm::SmallVector<GenericOp> members,
+                         llvm::SmallVector<int64_t> gridShape,
+                         llvm::SmallVector<int64_t> blockFactors,
+                         ProgramResourceEstimate resources = {},
+                         ProgramCostEstimate cost = {});
 
   unsigned getVariantId() const { return variantId; }
-  llvm::ArrayRef<DataflowCandidateId> getMembers() const { return members; }
+  llvm::ArrayRef<GenericOp> getMembers() const { return members; }
   llvm::ArrayRef<int64_t> getGridShape() const { return gridShape; }
   llvm::ArrayRef<int64_t> getBlockFactors() const { return blockFactors; }
-  const KernelResourceEstimate &getResources() const { return resources; }
-  const KernelCostEstimate &getCost() const { return cost; }
+  const ProgramResourceEstimate &getResources() const { return resources; }
+  const ProgramCostEstimate &getCost() const { return cost; }
 
 private:
   unsigned variantId;
-  llvm::SmallVector<DataflowCandidateId> members;
+  llvm::SmallVector<GenericOp> members;
   llvm::SmallVector<int64_t> gridShape;
   llvm::SmallVector<int64_t> blockFactors;
-  KernelResourceEstimate resources;
-  KernelCostEstimate cost;
+  ProgramResourceEstimate resources;
+  ProgramCostEstimate cost;
 };
 
-struct DataflowPlannedKernel {
-  DataflowKernelVariant variant;
+struct DataflowPlannedProgram {
+  DataflowProgramVariant variant;
   llvm::SmallVector<int64_t> coreOffset;
 };
 
@@ -114,9 +77,10 @@ enum class DataflowConnectionKind {
 
 llvm::StringRef stringifyDataflowConnectionKind(DataflowConnectionKind kind);
 
+/// Indices address program slots in this immutable plan, never source IR nodes.
 struct DataflowPlannedConnection {
-  unsigned producerKernel;
-  unsigned consumerKernel;
+  unsigned producerProgram;
+  unsigned consumerProgram;
   DataflowConnectionKind kind = DataflowConnectionKind::Materialized;
   uint32_t bufferDepth = 1;
 };
@@ -135,14 +99,16 @@ class DataflowMappingPlan {
 public:
   DataflowMappingPlan(func::FuncOp function, Block *block,
                       unsigned scopeOrdinal, DataflowPlanStrategy strategy,
-                      llvm::SmallVector<DataflowPlannedKernel, 0> kernels,
+                      llvm::SmallVector<DataflowPlannedProgram, 0> programs,
                       llvm::SmallVector<DataflowPlannedConnection> connections);
 
   func::FuncOp getFunction() const { return function; }
   Block *getBlock() const { return block; }
   unsigned getScopeOrdinal() const { return scopeOrdinal; }
   DataflowPlanStrategy getStrategy() const { return strategy; }
-  llvm::ArrayRef<DataflowPlannedKernel> getKernels() const { return kernels; }
+  llvm::ArrayRef<DataflowPlannedProgram> getPrograms() const {
+    return programs;
+  }
   llvm::ArrayRef<DataflowPlannedConnection> getConnections() const {
     return connections;
   }
@@ -152,7 +118,7 @@ private:
   Block *block;
   unsigned scopeOrdinal;
   DataflowPlanStrategy strategy;
-  llvm::SmallVector<DataflowPlannedKernel, 0> kernels;
+  llvm::SmallVector<DataflowPlannedProgram, 0> programs;
   llvm::SmallVector<DataflowPlannedConnection> connections;
 };
 
@@ -181,7 +147,7 @@ public:
   virtual ~DataflowFeasibilityModel() = default;
 
   virtual DataflowFeasibilityResult
-  evaluate(const DataflowCandidateGraph &graph,
+  evaluate(const DataflowGraph &graph,
            const DataflowMappingPlan &plan) const = 0;
 };
 
@@ -191,44 +157,15 @@ class StructuralDataflowFeasibilityModel final
     : public DataflowFeasibilityModel {
 public:
   DataflowFeasibilityResult
-  evaluate(const DataflowCandidateGraph &graph,
+  evaluate(const DataflowGraph &graph,
            const DataflowMappingPlan &plan) const override;
 };
 
-struct DataflowPlanCost {
-  std::optional<uint64_t> latencyCycles;
-  std::optional<uint64_t> initiationIntervalCycles;
-  uint64_t dramBytes = 0;
-  uint64_t nocBytes = 0;
-  uint64_t peakL1BytesPerCore = 0;
-  uint32_t occupiedCores = 0;
-  uint32_t spillCount = 0;
-  uint32_t programCount = 0;
-  float confidence = 0.0F;
-};
+struct DataflowPlanCost;
 
-class DataflowCostModel {
-public:
-  virtual ~DataflowCostModel() = default;
+DataflowMappingPlan buildTemporalFallbackPlan(const DataflowGraph &graph);
 
-  virtual DataflowPlanCost evaluate(const DataflowCandidateGraph &graph,
-                                    const DataflowMappingPlan &plan) const = 0;
-};
-
-/// Aggregates optional per-kernel estimates without inventing unavailable
-/// cycle data. Temporal latency and spatial initiation interval are reported
-/// only when every participating kernel has a cycle estimate.
-class AnalyticalDataflowCostModel final : public DataflowCostModel {
-public:
-  DataflowPlanCost evaluate(const DataflowCandidateGraph &graph,
-                            const DataflowMappingPlan &plan) const override;
-};
-
-DataflowMappingPlan
-buildTemporalFallbackPlan(const DataflowCandidateGraph &graph);
-
-void printDataflowPlan(llvm::raw_ostream &os,
-                       const DataflowCandidateGraph &graph,
+void printDataflowPlan(llvm::raw_ostream &os, const DataflowGraph &graph,
                        const DataflowMappingPlan &plan,
                        const DataflowPlanCost &cost);
 
@@ -236,7 +173,7 @@ class DataflowPlanMaterializer {
 public:
   virtual ~DataflowPlanMaterializer() = default;
 
-  virtual LogicalResult materialize(const DataflowCandidateGraph &graph,
+  virtual LogicalResult materialize(const DataflowGraph &graph,
                                     const DataflowMappingPlan &plan) const = 0;
 };
 
@@ -245,10 +182,10 @@ public:
 /// implementations without changing the planning pass boundary.
 class TemporalDataflowPlanMaterializer final : public DataflowPlanMaterializer {
 public:
-  LogicalResult materialize(const DataflowCandidateGraph &graph,
+  LogicalResult materialize(const DataflowGraph &graph,
                             const DataflowMappingPlan &plan) const override;
 };
 
 } // namespace mlir::tt::d2m
 
-#endif // TTMLIR_DIALECT_D2M_ANALYSIS_DATAFLOWPLANNING_H
+#endif

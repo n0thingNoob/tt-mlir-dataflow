@@ -48,6 +48,7 @@ set(ttmlir_export_targets
   MLIRD2MDialect
   MLIRD2MAllocation
   MLIRD2MAnalysis
+  MLIRD2MPlanning
   MLIRD2MTransforms
   MLIRD2MUtils
   MLIRLinalgSynchronizableOpInterfaceImpl

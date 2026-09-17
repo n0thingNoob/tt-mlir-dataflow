@@ -2,8 +2,9 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-#include "ttmlir/Dialect/D2M/Analysis/DataflowPlanning.h"
+#include "ttmlir/Dialect/D2M/Planning/DataflowCostModel.h"
 
+#include "mlir/IR/Builders.h"
 #include <gtest/gtest.h>
 
 #include <limits>
@@ -11,37 +12,37 @@
 namespace mlir::tt::d2m {
 namespace {
 
-DataflowKernelVariant
-makeVariant(DataflowCandidateId member, llvm::SmallVector<int64_t> grid,
-            KernelResourceEstimate resources, uint64_t computeCycles,
+DataflowProgramVariant
+makeVariant(GenericOp member, llvm::SmallVector<int64_t> grid,
+            ProgramResourceEstimate resources, uint64_t computeCycles,
             uint64_t dataMovementCycles, float confidence) {
-  KernelCostEstimate cost;
+  ProgramCostEstimate cost;
   cost.computeCycles = computeCycles;
   cost.dataMovementCycles = dataMovementCycles;
   cost.confidence = confidence;
-  return DataflowKernelVariant(/*variantId=*/0, {member}, std::move(grid), {},
-                               resources, cost);
+  return DataflowProgramVariant(/*variantId=*/0, {member}, std::move(grid), {},
+                                resources, cost);
 }
 
 TEST(DataflowPlanningTest, AggregatesTemporalPlanCost) {
-  DataflowCandidateGraph graph({}, nullptr, /*scopeOrdinal=*/0, {}, {});
-  llvm::SmallVector<DataflowPlannedKernel, 0> kernels;
-  kernels.push_back(
-      {makeVariant(/*member=*/0, {1, 2},
+  DataflowGraph graph({}, nullptr, /*scopeOrdinal=*/0, {}, {});
+  llvm::SmallVector<DataflowPlannedProgram, 0> programs;
+  programs.push_back(
+      {makeVariant(/*member=*/{}, {1, 2},
                    {/*l1BytesPerCore=*/100, /*dramBytes=*/10,
                     /*nocBytes=*/20, /*cbCount=*/2, /*dstTiles=*/1},
                    /*computeCycles=*/100, /*dataMovementCycles=*/50,
                    /*confidence=*/0.8F),
        {}});
-  kernels.push_back(
-      {makeVariant(/*member=*/1, {2, 2},
+  programs.push_back(
+      {makeVariant(/*member=*/{}, {2, 2},
                    {/*l1BytesPerCore=*/200, /*dramBytes=*/30,
                     /*nocBytes=*/40, /*cbCount=*/3, /*dstTiles=*/2},
                    /*computeCycles=*/60, /*dataMovementCycles=*/80,
                    /*confidence=*/0.6F),
        {}});
   DataflowMappingPlan plan({}, nullptr, /*scopeOrdinal=*/0,
-                           DataflowPlanStrategy::Temporal, std::move(kernels),
+                           DataflowPlanStrategy::Temporal, std::move(programs),
                            {});
 
   DataflowPlanCost cost = AnalyticalDataflowCostModel().evaluate(graph, plan);
@@ -57,18 +58,18 @@ TEST(DataflowPlanningTest, AggregatesTemporalPlanCost) {
 }
 
 TEST(DataflowPlanningTest, AggregatesSpatialPlanInitiationInterval) {
-  DataflowCandidateGraph graph({}, nullptr, /*scopeOrdinal=*/0, {}, {});
-  llvm::SmallVector<DataflowPlannedKernel, 0> kernels;
-  kernels.push_back(
-      {makeVariant(/*member=*/0, {1, 2}, {}, /*computeCycles=*/100,
+  DataflowGraph graph({}, nullptr, /*scopeOrdinal=*/0, {}, {});
+  llvm::SmallVector<DataflowPlannedProgram, 0> programs;
+  programs.push_back(
+      {makeVariant(/*member=*/{}, {1, 2}, {}, /*computeCycles=*/100,
                    /*dataMovementCycles=*/50, /*confidence=*/0.8F),
        {0, 0}});
-  kernels.push_back(
-      {makeVariant(/*member=*/1, {2, 2}, {}, /*computeCycles=*/60,
+  programs.push_back(
+      {makeVariant(/*member=*/{}, {2, 2}, {}, /*computeCycles=*/60,
                    /*dataMovementCycles=*/80, /*confidence=*/0.6F),
        {1, 0}});
   DataflowMappingPlan plan({}, nullptr, /*scopeOrdinal=*/0,
-                           DataflowPlanStrategy::Spatial, std::move(kernels),
+                           DataflowPlanStrategy::Spatial, std::move(programs),
                            {});
 
   DataflowPlanCost cost = AnalyticalDataflowCostModel().evaluate(graph, plan);
@@ -79,14 +80,13 @@ TEST(DataflowPlanningTest, AggregatesSpatialPlanInitiationInterval) {
   EXPECT_FLOAT_EQ(cost.confidence, 0.6F);
 }
 
-TEST(DataflowPlanningTest, LeavesCyclesUnknownWithoutKernelEstimate) {
-  DataflowCandidateGraph graph({}, nullptr, /*scopeOrdinal=*/0, {}, {});
-  llvm::SmallVector<DataflowPlannedKernel, 0> kernels;
-  kernels.push_back(
-      {DataflowKernelVariant(/*variantId=*/0, {/*members=*/0}, {1, 1}, {}),
-       {}});
+TEST(DataflowPlanningTest, LeavesCyclesUnknownWithoutProgramEstimate) {
+  DataflowGraph graph({}, nullptr, /*scopeOrdinal=*/0, {}, {});
+  llvm::SmallVector<DataflowPlannedProgram, 0> programs;
+  programs.push_back(
+      {DataflowProgramVariant(/*variantId=*/0, {GenericOp{}}, {1, 1}, {}), {}});
   DataflowMappingPlan plan({}, nullptr, /*scopeOrdinal=*/0,
-                           DataflowPlanStrategy::Temporal, std::move(kernels),
+                           DataflowPlanStrategy::Temporal, std::move(programs),
                            {});
 
   DataflowPlanCost cost = AnalyticalDataflowCostModel().evaluate(graph, plan);
@@ -97,20 +97,21 @@ TEST(DataflowPlanningTest, LeavesCyclesUnknownWithoutKernelEstimate) {
 }
 
 TEST(DataflowPlanningTest, SaturatesSpatialCoreCount) {
-  DataflowCandidateGraph graph({}, nullptr, /*scopeOrdinal=*/0, {}, {});
-  llvm::SmallVector<DataflowPlannedKernel, 0> kernels;
-  kernels.push_back(
-      {makeVariant(/*member=*/0,
+  DataflowGraph graph({}, nullptr, /*scopeOrdinal=*/0, {}, {});
+  llvm::SmallVector<DataflowPlannedProgram, 0> programs;
+  programs.push_back(
+      {makeVariant(/*member=*/{},
                    {std::numeric_limits<int64_t>::max(),
                     std::numeric_limits<int64_t>::max()},
                    {}, /*computeCycles=*/1, /*dataMovementCycles=*/1,
                    /*confidence=*/1.0F),
        {}});
-  kernels.push_back({makeVariant(/*member=*/1, {2, 2}, {}, /*computeCycles=*/1,
-                                 /*dataMovementCycles=*/1, /*confidence=*/1.0F),
-                     {}});
+  programs.push_back(
+      {makeVariant(/*member=*/{}, {2, 2}, {}, /*computeCycles=*/1,
+                   /*dataMovementCycles=*/1, /*confidence=*/1.0F),
+       {}});
   DataflowMappingPlan plan({}, nullptr, /*scopeOrdinal=*/0,
-                           DataflowPlanStrategy::Spatial, std::move(kernels),
+                           DataflowPlanStrategy::Spatial, std::move(programs),
                            {});
 
   DataflowPlanCost cost = AnalyticalDataflowCostModel().evaluate(graph, plan);
@@ -119,13 +120,14 @@ TEST(DataflowPlanningTest, SaturatesSpatialCoreCount) {
 }
 
 TEST(DataflowPlanningTest, TreatsInvalidGridAsUsingNoCores) {
-  DataflowCandidateGraph graph({}, nullptr, /*scopeOrdinal=*/0, {}, {});
-  llvm::SmallVector<DataflowPlannedKernel, 0> kernels;
-  kernels.push_back({makeVariant(/*member=*/0, {-1, 2}, {}, /*computeCycles=*/1,
-                                 /*dataMovementCycles=*/1, /*confidence=*/1.0F),
-                     {}});
+  DataflowGraph graph({}, nullptr, /*scopeOrdinal=*/0, {}, {});
+  llvm::SmallVector<DataflowPlannedProgram, 0> programs;
+  programs.push_back(
+      {makeVariant(/*member=*/{}, {-1, 2}, {}, /*computeCycles=*/1,
+                   /*dataMovementCycles=*/1, /*confidence=*/1.0F),
+       {}});
   DataflowMappingPlan plan({}, nullptr, /*scopeOrdinal=*/0,
-                           DataflowPlanStrategy::Temporal, std::move(kernels),
+                           DataflowPlanStrategy::Temporal, std::move(programs),
                            {});
 
   DataflowPlanCost cost = AnalyticalDataflowCostModel().evaluate(graph, plan);
@@ -133,14 +135,13 @@ TEST(DataflowPlanningTest, TreatsInvalidGridAsUsingNoCores) {
   EXPECT_EQ(cost.occupiedCores, 0u);
 }
 
-TEST(DataflowPlanningTest, RejectsUnknownCandidateReference) {
-  DataflowCandidateGraph graph({}, nullptr, /*scopeOrdinal=*/0, {}, {});
-  llvm::SmallVector<DataflowPlannedKernel, 0> kernels;
-  kernels.push_back(
-      {DataflowKernelVariant(/*variantId=*/0, {/*members=*/0}, {1, 1}, {}),
-       {}});
+TEST(DataflowPlanningTest, RejectsUnknownNodeReference) {
+  DataflowGraph graph({}, nullptr, /*scopeOrdinal=*/0, {}, {});
+  llvm::SmallVector<DataflowPlannedProgram, 0> programs;
+  programs.push_back(
+      {DataflowProgramVariant(/*variantId=*/0, {GenericOp{}}, {1, 1}, {}), {}});
   DataflowMappingPlan plan({}, nullptr, /*scopeOrdinal=*/0,
-                           DataflowPlanStrategy::Temporal, std::move(kernels),
+                           DataflowPlanStrategy::Temporal, std::move(programs),
                            {});
 
   DataflowFeasibilityResult result =
@@ -150,8 +151,8 @@ TEST(DataflowPlanningTest, RejectsUnknownCandidateReference) {
   EXPECT_EQ(result.rejectionKind, DataflowRejectionKind::InvalidVariant);
 }
 
-TEST(DataflowPlanningTest, RejectsInvalidCandidateDependency) {
-  DataflowCandidateGraph graph({}, nullptr, /*scopeOrdinal=*/0, {}, {{0, 1}});
+TEST(DataflowPlanningTest, RejectsInvalidNodeDependency) {
+  DataflowGraph graph({}, nullptr, /*scopeOrdinal=*/0, {}, {{}});
   DataflowMappingPlan plan({}, nullptr, /*scopeOrdinal=*/0,
                            DataflowPlanStrategy::Temporal, {}, {});
 
@@ -162,26 +163,84 @@ TEST(DataflowPlanningTest, RejectsInvalidCandidateDependency) {
   EXPECT_EQ(result.rejectionKind, DataflowRejectionKind::InvalidGraph);
 }
 
+// Minimal registered ops exercise graph identity without unrelated lowering.
+struct GraphFixture {
+  MLIRContext context;
+  OwningOpRef<ModuleOp> module;
+  func::FuncOp function;
+  GraphFixture() {
+    context.loadDialect<D2MDialect, func::FuncDialect>();
+    module = ModuleOp::create(UnknownLoc::get(&context));
+    function = func::FuncOp::create(module->getLoc(), "graph",
+                                    FunctionType::get(&context, {}, {}));
+    module->push_back(function);
+    function.addEntryBlock();
+  }
+  GenericOp generic(ValueRange inputs = {}) {
+    Builder builder(&context);
+    OperationState state(module->getLoc(), GenericOp::getOperationName());
+    state.addOperands(inputs);
+    state.addTypes({builder.getI32Type(), builder.getI32Type()});
+    state.addAttribute("operandSegmentSizes",
+                       builder.getDenseI32ArrayAttr(
+                           {static_cast<int32_t>(inputs.size()), 0, 0}));
+    auto op = cast<GenericOp>(Operation::create(state));
+    function.getBody().front().push_back(op);
+    return op;
+  }
+};
+
+TEST(DataflowPlanningTest, KeepsExactResultsAndRepeatedConsumerInputs) {
+  GraphFixture fixture;
+  auto producer = fixture.generic();
+  auto consumer = fixture.generic(
+      {producer.getResult(1), producer.getResult(0), producer.getResult(1)});
+  auto graphs = buildDataflowGraphs(*fixture.module);
+  ASSERT_EQ(graphs.size(), 1u);
+  auto edges = graphs[0].getEdges();
+  ASSERT_EQ(edges.size(), 3u);
+  for (unsigned i = 0; i < edges.size(); ++i) {
+    EXPECT_EQ(edges[i].producer, producer);
+    EXPECT_EQ(edges[i].consumer, consumer);
+    EXPECT_EQ(edges[i].consumerInput, i);
+    EXPECT_EQ(edges[i].consumerValue, consumer.getInputs()[i]);
+    EXPECT_EQ(edges[i].producerValue, consumer.getInputs()[i]);
+  }
+}
+
+TEST(DataflowPlanningTest, TracksDependenciesThroughInterveningOperations) {
+  GraphFixture fixture;
+  auto producer = fixture.generic();
+  OperationState state(fixture.module->getLoc(),
+                       "builtin.unrealized_conversion_cast");
+  state.addOperands(producer.getResult(1));
+  state.addTypes(producer.getResult(1).getType());
+  Operation *view = Operation::create(state);
+  fixture.function.getBody().front().push_back(view);
+  auto consumer = fixture.generic(view->getResult(0));
+  auto graphs = buildDataflowGraphs(*fixture.module);
+  ASSERT_EQ(graphs.size(), 1u);
+  ASSERT_EQ(graphs[0].getEdges().size(), 1u);
+  const auto &edge = graphs[0].getEdges()[0];
+  EXPECT_EQ(edge.producerValue, producer.getResult(1));
+  EXPECT_EQ(edge.consumerValue, view->getResult(0));
+  EXPECT_EQ(edge.consumer, consumer);
+}
+
 TEST(DataflowPlanningTest, RejectsReorderedTemporalDependency) {
-  llvm::SmallVector<GenericOp> operations(2);
-  DataflowCandidateGraph graph({}, nullptr, /*scopeOrdinal=*/0,
-                               std::move(operations), {{0, 1}});
-  llvm::SmallVector<DataflowPlannedKernel, 0> kernels;
-  kernels.push_back(
-      {DataflowKernelVariant(/*variantId=*/0, {/*members=*/1}, {1, 1}, {}),
-       {}});
-  kernels.push_back(
-      {DataflowKernelVariant(/*variantId=*/0, {/*members=*/0}, {1, 1}, {}),
-       {}});
-  DataflowMappingPlan plan(
-      {}, nullptr, /*scopeOrdinal=*/0, DataflowPlanStrategy::Temporal,
-      std::move(kernels),
-      {{/*producerKernel=*/1, /*consumerKernel=*/0,
-        DataflowConnectionKind::Materialized, /*bufferDepth=*/1}});
-
-  DataflowFeasibilityResult result =
-      StructuralDataflowFeasibilityModel().evaluate(graph, plan);
-
+  GraphFixture fixture;
+  auto producer = fixture.generic();
+  auto consumer = fixture.generic(producer.getResult(0));
+  auto graphs = buildDataflowGraphs(*fixture.module);
+  ASSERT_EQ(graphs.size(), 1u);
+  const auto &graph = graphs[0];
+  llvm::SmallVector<DataflowPlannedProgram, 0> programs;
+  programs.push_back({DataflowProgramVariant(0, {consumer}, {1, 1}, {}), {}});
+  programs.push_back({DataflowProgramVariant(0, {producer}, {1, 1}, {}), {}});
+  DataflowMappingPlan plan(graph.getFunction(), graph.getBlock(), 0,
+                           DataflowPlanStrategy::Temporal, std::move(programs),
+                           {{1, 0, DataflowConnectionKind::Materialized, 1}});
+  auto result = StructuralDataflowFeasibilityModel().evaluate(graph, plan);
   EXPECT_FALSE(result.feasible);
   EXPECT_EQ(result.rejectionKind, DataflowRejectionKind::InvalidGraph);
 }

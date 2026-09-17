@@ -1,7 +1,7 @@
 add_mlir_dialect_library(MLIRD2MTransforms
         Allocate.cpp
         BuildTopkChain.cpp
-        DataflowPlanning.cpp
+        DataflowPlanningPass.cpp
         DMAOptimizations.cpp
         DecomposeArange.cpp
         DecomposeMasking.cpp
@@ -55,6 +55,7 @@ add_mlir_dialect_library(MLIRD2MTransforms
         MLIRTTCoreOpsIncGen
 
         LINK_LIBS PUBLIC
+        MLIRD2MPlanning
         MLIRArithDialect
         MLIRD2MAnalysis
         MLIRD2MUtils
