@@ -4,7 +4,7 @@ config.llvm_tools_dir = lit_config.substitute("@LLVM_TOOLS_DIR@")
 config.lit_tools_dir = "@LLVM_LIT_TOOLS_DIR@"
 config.mlir_obj_dir = "@MLIR_BINARY_DIR@"
 config.enable_bindings_python = @MLIR_ENABLE_BINDINGS_PYTHON@ and @TTMLIR_ENABLE_BINDINGS_PYTHON@
-config.enable_device_runtime = "@DEVICE_RUNTIME_ENABLED@" == "ON"
+config.enable_device_runtime = @TTMLIR_TEST_DEVICE_RUNTIME@
 config.runtime_python_dir = "@TTMLIR_BINARY_DIR@/runtime/python"
 config.ttmlir_obj_root = "@TTMLIR_BINARY_DIR@"
 config.ttmlir_source_dir = "@TTMLIR_SOURCE_DIR@"

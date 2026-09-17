@@ -47,7 +47,7 @@ target_link_libraries(TTMLIRRuntime
     # Since the symbols from libA aren't used in libB, linker will just ignore them. By using --whole-archive,
     # we tell linker to link all the symbols anyway. We need this as symbols from libA might be used by whoever
     # imports libB.
-    "$<LINK_LIBRARY:WHOLE_ARCHIVE,TTRuntimeTTNNTestLib>"
+    "$<$<AND:$<BOOL:${TTMLIR_ENABLE_RUNTIME_TESTS}>,$<BOOL:${TT_RUNTIME_ENABLE_TTNN}>>:$<LINK_LIBRARY:WHOLE_ARCHIVE,TTRuntimeTTNNTestLib>>"
     TTRuntimeTTMLOps
     ${METAL_LIBS}
     flatbuffers
