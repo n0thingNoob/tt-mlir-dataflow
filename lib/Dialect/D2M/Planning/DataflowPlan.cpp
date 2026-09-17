@@ -160,8 +160,9 @@ DataflowFeasibilityResult StructuralDataflowFeasibilityModel::evaluate(
         !nodeToProgram.contains(edge.producer) ||
         !nodeToProgram.contains(edge.consumer) || !edge.producerValue ||
         edge.producerValue.getDefiningOp() != edge.producer ||
-        edge.consumerInput >= edge.consumer.getInputs().size() ||
-        edge.consumer.getInputs()[edge.consumerInput] != edge.consumerValue) {
+        edge.consumerOperand >= edge.consumer.getOperands().size() ||
+        edge.consumer.getOperands()[edge.consumerOperand] !=
+            edge.consumerValue) {
       return DataflowFeasibilityResult::reject(
           DataflowRejectionKind::InvalidGraph,
           "node graph contains an invalid dependency");

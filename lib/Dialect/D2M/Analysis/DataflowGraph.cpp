@@ -56,7 +56,7 @@ buildNodeEdges(llvm::ArrayRef<GenericOp> operations) {
   }
   llvm::SmallVector<DataflowEdge> edges;
   for (GenericOp consumer : operations) {
-    for (auto [inputIndex, input] : llvm::enumerate(consumer.getInputs())) {
+    for (auto [inputIndex, input] : llvm::enumerate(consumer.getOperands())) {
       llvm::DenseSet<Value> visited;
       llvm::SmallVector<OpResult> producers;
       collectDefiningResults(input, order, visited, producers);

@@ -16,10 +16,10 @@ namespace mlir::tt::d2m {
 struct DataflowEdge {
   GenericOp producer;
   GenericOp consumer;
-  // Producer result and exact consumer input, including intervening view ops.
+  // Producer result and exact consumer operand, including intervening view ops.
   Value producerValue;
   Value consumerValue;
-  unsigned consumerInput = 0;
+  unsigned consumerOperand = 0;
 };
 
 /// A read-only graph of program-level d2m.generic operations in one block.
@@ -46,7 +46,7 @@ private:
 };
 
 /// Discover one graph per block, excluding generics nested in spatial/generic
-/// regions. Edges describe SSA inputs before bufferization, not memory alias
+/// regions. Edges describe SSA operands before bufferization, not memory alias
 /// dependences or control-flow dependences across blocks.
 llvm::SmallVector<DataflowGraph> buildDataflowGraphs(ModuleOp module);
 

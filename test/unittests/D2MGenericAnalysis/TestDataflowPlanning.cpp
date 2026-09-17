@@ -176,14 +176,19 @@ struct GraphFixture {
     module->push_back(function);
     function.addEntryBlock();
   }
-  GenericOp generic(ValueRange inputs = {}) {
+  GenericOp generic(ValueRange inputs = {}, ValueRange outputs = {},
+                    ValueRange additional = {}) {
     Builder builder(&context);
     OperationState state(module->getLoc(), GenericOp::getOperationName());
     state.addOperands(inputs);
+    state.addOperands(outputs);
+    state.addOperands(additional);
     state.addTypes({builder.getI32Type(), builder.getI32Type()});
     state.addAttribute("operandSegmentSizes",
                        builder.getDenseI32ArrayAttr(
-                           {static_cast<int32_t>(inputs.size()), 0, 0}));
+                           {static_cast<int32_t>(inputs.size()),
+                            static_cast<int32_t>(outputs.size()),
+                            static_cast<int32_t>(additional.size())}));
     auto op = cast<GenericOp>(Operation::create(state));
     function.getBody().front().push_back(op);
     return op;
@@ -202,9 +207,26 @@ TEST(DataflowPlanningTest, KeepsExactResultsAndRepeatedConsumerInputs) {
   for (unsigned i = 0; i < edges.size(); ++i) {
     EXPECT_EQ(edges[i].producer, producer);
     EXPECT_EQ(edges[i].consumer, consumer);
-    EXPECT_EQ(edges[i].consumerInput, i);
-    EXPECT_EQ(edges[i].consumerValue, consumer.getInputs()[i]);
-    EXPECT_EQ(edges[i].producerValue, consumer.getInputs()[i]);
+    EXPECT_EQ(edges[i].consumerOperand, i);
+    EXPECT_EQ(edges[i].consumerValue, consumer.getOperands()[i]);
+    EXPECT_EQ(edges[i].producerValue, consumer.getOperands()[i]);
+  }
+}
+
+TEST(DataflowPlanningTest, TracksOutputInitializersAndAdditionalOperands) {
+  GraphFixture fixture;
+  auto producer = fixture.generic();
+  auto consumer =
+      fixture.generic({}, producer.getResult(0), producer.getResult(1));
+  auto graphs = buildDataflowGraphs(*fixture.module);
+  ASSERT_EQ(graphs.size(), 1u);
+  ASSERT_EQ(graphs[0].getEdges().size(), 2u);
+  for (unsigned i = 0; i < 2; ++i) {
+    const auto &edge = graphs[0].getEdges()[i];
+    EXPECT_EQ(edge.producer, producer);
+    EXPECT_EQ(edge.consumer, consumer);
+    EXPECT_EQ(edge.consumerOperand, i);
+    EXPECT_EQ(edge.producerValue, producer.getResult(i));
   }
 }
 
