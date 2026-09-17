@@ -43,6 +43,43 @@ class RuntimeEnvironmentTest(unittest.TestCase):
             self.assertNotIn("TT_METAL_RUNTIME_ROOT_EXTERNAL", os.environ)
             api.set_metal_home.assert_called_once_with("/source")
 
+    def test_split_install_layout_checks_library_prefix(self):
+        for library, accepted in (
+            ("/install/lib/libtt_metal.so", True),
+            ("/other/lib/libtt_metal.so", False),
+            ("/install/unrelated/libtt_metal.so", False),
+        ):
+            with self.subTest(library=library):
+                api = Mock()
+                fake = SimpleNamespace(_ttmlir_runtime=SimpleNamespace(runtime=api))
+                with (
+                    patch.dict(
+                        os.environ,
+                        {"TT_METAL_RUNTIME_ROOT": "/install/libexec/tt-metalium"},
+                        clear=True,
+                    ),
+                    patch.dict(
+                        "sys.modules", {"ttrt": SimpleNamespace(), "ttrt.runtime": fake}
+                    ),
+                    patch.object(runner.ctypes, "CDLL"),
+                    patch.object(
+                        runner, "loaded_libraries", return_value={library: "hash"}
+                    ),
+                ):
+                    if accepted:
+                        runner.load_runtime(Path("/source"))
+                        self.assertEqual(
+                            os.environ["TT_METAL_RUNTIME_ROOT"],
+                            "/install/libexec/tt-metalium",
+                        )
+                        api.set_metal_home.assert_called_once_with("/source")
+                    else:
+                        with self.assertRaisesRegex(
+                            RuntimeError, "outside the requested"
+                        ):
+                            runner.load_runtime(Path("/source"))
+                        api.set_metal_home.assert_not_called()
+
     def test_missing_root_does_not_load_runtime(self):
         with patch.dict(os.environ, {}, clear=True), patch.object(
             runner.ctypes, "CDLL"

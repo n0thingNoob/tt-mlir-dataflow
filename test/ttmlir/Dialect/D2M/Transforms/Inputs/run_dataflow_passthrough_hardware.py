@@ -52,8 +52,14 @@ def load_runtime(metal_home):
     metal_libraries = [
         path for path in loaded_libraries() if "libtt_metal" in Path(path).name
     ]
+    resource_root = Path(requested_root).resolve()
+    library_roots = [resource_root]
+    # Metal's installed layout separates JIT resources under libexec from
+    # shared libraries under the same installation prefix's lib directory.
+    if resource_root.name == "tt-metalium" and resource_root.parent.name == "libexec":
+        library_roots.append(resource_root.parent.parent / "lib")
     if not metal_libraries or any(
-        not Path(path).resolve().is_relative_to(Path(requested_root).resolve())
+        not any(Path(path).resolve().is_relative_to(root) for root in library_roots)
         for path in metal_libraries
     ):
         raise RuntimeError("Loaded Metal library is outside the requested runtime root")
