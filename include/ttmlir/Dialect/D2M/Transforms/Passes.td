@@ -7,6 +7,27 @@
 
 include "mlir/Pass/PassBase.td"
 
+def D2MSpatialPlanning : Pass<"d2m-spatial-planning", "::mlir::ModuleOp"> {
+  let summary = "Plan inter-generic spatial execution (framework only).";
+  let description = [{
+    Runs immediately after TTIRToD2M, before per-generic optimization. Builds
+    a block-local SSA dependency DAG of top-level tensor d2m.generic ops,
+    following dependencies through intervening operations such as views.
+    Existing spatial regions and nested control flow are left untouched.
+
+    Group selection, core-range assignment and candidate evaluation are TODOs.
+    No candidate is selected yet, so the pass preserves the input IR. Future
+    selected plans will be materialized using the existing d2m.spatial op;
+    grid selection, fusion, blocking, allocation and lowering remain the
+    responsibility of the existing D2M passes.
+  }];
+  let dependentDialects = ["::mlir::tt::d2m::D2MDialect"];
+  let statistics = [
+    Statistic<"numGenericNodes", "generic-nodes", "Generic DAG nodes">,
+    Statistic<"numDependencyEdges", "dependency-edges", "Generic DAG SSA edges">
+  ];
+}
+
 // Insert scratch buffers to d2m.generic ops (post-bufferization)
 def D2MInsertScratchBuffers : Pass<"d2m-insert-scratch-buffers", "::mlir::ModuleOp"> {
   let summary = "Insert scratch buffers inside fused d2m.generic ops.";

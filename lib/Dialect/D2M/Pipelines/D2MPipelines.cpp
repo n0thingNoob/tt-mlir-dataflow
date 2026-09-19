@@ -110,6 +110,9 @@ void createD2MFrontendPipeline(OpPassManager &pm,
     toD2MOptions.enableMulticastInference = options.enableMulticastInference;
   }
   pm.addPass(tt::createTTIRToD2MPass(toD2MOptions));
+  if (options.executionStrategy == D2MExecutionStrategy::Spatial) {
+    pm.addPass(d2m::createD2MSpatialPlanning());
+  }
   pm.addPass(d2m::createD2MScalarizeConstTensors());
   d2m::D2MGridSelectionOptions gridOptOptions;
   {

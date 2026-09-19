@@ -11,8 +11,22 @@
 #include "ttmlir/Dialect/TTMetal/IR/TTMetalOpsTypes.h"
 
 namespace mlir::tt::ttmetal {
+// Keep execution policy separate from per-generic optimization options. A
+// future Auto strategy can select a policy without changing the lowering API.
+enum class D2MExecutionStrategy { Temporal, Spatial };
+
 // Options for D2M pipelines.
 struct D2MPipelineOptions : public PassPipelineOptions<D2MPipelineOptions> {
+  Option<D2MExecutionStrategy> executionStrategy{
+      *this, "execution-strategy",
+      llvm::cl::desc("Select inter-generic execution planning"),
+      llvm::cl::values(
+          clEnumValN(D2MExecutionStrategy::Temporal, "temporal",
+                     "Use the existing D2M pipeline"),
+          clEnumValN(D2MExecutionStrategy::Spatial, "spatial",
+                     "Enable spatial planning (currently preserves the IR)")),
+      llvm::cl::init(D2MExecutionStrategy::Temporal)};
+
   ListOption<int64_t> meshShape{
       *this, "mesh-shape", llvm::cl::desc("Set the multi-device mesh shape.")};
 
