@@ -41,7 +41,9 @@ jobs:
     secrets: inherit
   release-build:
     needs: [ prepare-run, build-image ]
-    if: needs.prepare-run.outputs.skip_build != 'true'
+    # Forks can opt in after provisioning the build and test runners.
+    # Dependent runtime and simulator tests also require the release artifacts.
+    if: needs.prepare-run.outputs.skip_build != 'true' && (github.repository == 'tenstorrent/tt-mlir' || vars.ENABLE_EXTENDED_CI == 'true')
     uses: ./.github/workflows/call-build-release.yml
     secrets: inherit
     with:

@@ -103,11 +103,13 @@ jobs:
         job_summary: false
 
     - name: Prepare code coverage report
+      env:
+        COVERAGE_SOURCE_ROOT: ${{ steps.strings.outputs.work-dir }}
       run: |
         lcov --directory ${{ steps.strings.outputs.build-output-dir }} --capture --output-file coverage.info --gcov-tool ${{ steps.strings.outputs.work-dir }}/.github/gcov_for_clang.sh --ignore-errors inconsistent,corrupt
         lcov --add-tracefile baseline.info --add-tracefile coverage.info --output-file coverage.total --ignore-errors inconsistent,corrupt
-        lcov --extract coverage.total '**/tt-mlir/*' --output-file coverage.info --ignore-errors inconsistent,corrupt
-        sed -i 's|SF:/__w/tt-mlir/tt-mlir/|SF:|' coverage.info
+        lcov --extract coverage.total "$COVERAGE_SOURCE_ROOT/*" --output-file coverage.info --ignore-errors inconsistent,corrupt
+        sed -i "s|SF:$COVERAGE_SOURCE_ROOT/|SF:|" coverage.info
         lcov --list coverage.info --ignore-errors inconsistent,corrupt
 
     - name: Upload coverage reports to Codecov
