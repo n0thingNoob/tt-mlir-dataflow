@@ -68,24 +68,30 @@ static GenericDAG buildGenericDAG(Block &block) {
   return dag;
 }
 
-struct SpatialGroup {
+// A candidate group of generics, before physical core ranges are assigned.
+struct GenericGroup {
   SmallVector<unsigned> nodes;
-  // One physical core range per generic, matching nodes in order.
+};
+
+// A group with a physical core range assigned to each member.
+struct PlacedGenericGroup {
+  GenericGroup group;
+  // One physical core range per generic, matching group.nodes in order.
   SmallVector<ttcore::CoreRangeAttr> coreRanges;
 };
 
 struct SpatialPlan {
-  SmallVector<SpatialGroup> groups;
+  SmallVector<PlacedGenericGroup> groups;
 };
 
-static SmallVector<SpatialGroup> selectGroups(const GenericDAG &) {
+static SmallVector<GenericGroup> selectGroups(const GenericDAG &) {
   // TODO (spatial-planning): Select legal inter-generic groups. Account for
   // dependency paths and side-effect/control-flow boundaries before moving ops.
   return {};
 }
 
 static std::optional<SpatialPlan> assignCoreRanges(const GenericDAG &,
-                                                   ArrayRef<SpatialGroup>) {
+                                                   ArrayRef<GenericGroup>) {
   // TODO (spatial-planning): Assign disjoint, device-bounded physical core
   // ranges. Leave per-generic grids and block factors to the existing passes.
   return std::nullopt;
