@@ -178,9 +178,10 @@ static void addCandidate(SmallVectorImpl<RegionCandidate> &candidates,
                          RegionCandidateContext context = {}) {
   llvm::sort(members);
   members.erase(std::unique(members.begin(), members.end()), members.end());
-  auto found = llvm::find_if(candidates, [&](const RegionCandidate &candidate) {
-    return candidate.members == members;
-  });
+  auto *found =
+      llvm::find_if(candidates, [&](const RegionCandidate &candidate) {
+        return candidate.members == members;
+      });
   if (found == candidates.end()) {
     candidates.emplace_back();
     found = std::prev(candidates.end());
@@ -238,7 +239,7 @@ static void groupIndependent(const SpatialGenericDAG &dag,
     // Only members must share an interval. The context is outside the
     // candidate: e.g. two consumers after a barrier may share a producer
     // before it without placing that producer in their region.
-    auto group = llvm::find_if(groups, [&](const auto &existing) {
+    auto *group = llvm::find_if(groups, [&](const auto &existing) {
       return sameInterval(dag, id, existing.front()) &&
              llvm::all_of(existing, [&](unsigned member) {
                return dag.independent(id, member);

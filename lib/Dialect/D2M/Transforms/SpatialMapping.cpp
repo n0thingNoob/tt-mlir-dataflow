@@ -162,7 +162,7 @@ static std::string checkPipelineCandidate(
     cbCount += g.getInputs().size() + g.getOutputs().size();
     bytes += type.getNumElements() * 2048 * (g.getInputs().size() + 1) + 65536;
     for (Value operand : g->getOperands()) {
-      auto edge =
+      const auto *edge =
           llvm::find_if(dag.dependencies, [&](const SpatialDependency &d) {
             return d.consumer == id && d.target == operand && d.producer &&
                    llvm::is_contained(candidate.members, *d.producer);
