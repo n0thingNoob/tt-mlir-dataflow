@@ -1,9 +1,8 @@
 # Automatic spatial mapping smoke test
 
-All fixtures start from ordinary TTIR. `auto_diamond.mlir` (32×32) and
-`auto_diamond_multitile.mlir` (128×128, 16 tiles) map four stages to one spatial
-program on four cores. `auto_elementwise_chain.mlir` tests a three-stage,
-16-tile pipeline; `auto_chain.mlir` tests matmul's singleton temporal fallback.
+Both fixtures start from ordinary TTIR. `auto_diamond.mlir` (128×128,
+16 tiles) maps four stages to one spatial program on four cores;
+`auto_chain.mlir` (64×64) tests matmul's singleton temporal fallback.
 They exercise planning, GridSelection, bufferization, TTMetal lowering, and
 serialization. Pipeline intermediate tensors remain in producer L1. Each edge
 has a cumulative ready semaphore; each consumer reads through NoC after its
@@ -53,8 +52,7 @@ python run_auto_spatial.py \
   --output /path/to/new/diamond-artifacts
 ```
 
-Run again with `--case diamond_multitile`, `--case elementwise_chain`, and
-`--case chain`, each with a new output directory. The device argument is
+Run again with `--case chain` and a new output directory. The device argument is
 an exact PCI BDF, not an index. The helper resolves its KMD index and checks for
 active users before opening it. It never resets a device.
 

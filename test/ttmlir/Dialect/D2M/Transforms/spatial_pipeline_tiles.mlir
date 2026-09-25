@@ -1,9 +1,9 @@
-// RUN: ttmlir-opt %s --d2m-fe-pipeline="execution-strategy=spatial dump-spatial-planning=true" --mlir-print-op-generic -o %t.mlir 2> %t.report
+// RUN: ttmlir-opt %S/../../../Silicon/TTMetal/n150/spatial/auto_diamond.mlir --d2m-fe-pipeline="execution-strategy=spatial dump-spatial-planning=true" --mlir-print-op-generic -o %t.mlir 2> %t.report
 // RUN: FileCheck %s --check-prefix=PLAN --input-file=%t.report
 // RUN: FileCheck %s --check-prefix=IR --input-file=%t.mlir
 // RUN: ttmlir-opt %t.mlir --d2m-materialize-spatial-pipelines -o %t.again --mlir-print-op-generic
 // RUN: diff %t.mlir %t.again
-// RUN: ttmlir-opt %s --ttir-to-ttmetal-pipeline="execution-strategy=spatial" --mlir-print-op-generic -o %t.lowered
+// RUN: ttmlir-opt %S/../../../Silicon/TTMetal/n150/spatial/auto_diamond.mlir --ttir-to-ttmetal-pipeline="execution-strategy=spatial" --mlir-print-op-generic -o %t.lowered
 // RUN: FileCheck %s --check-prefix=LOWER --input-file=%t.lowered --implicit-check-not='memory_space<dram>'
 // RUN: ttmlir-translate %t.lowered --ttmetal-to-flatbuffer -o %t.ttm
 
@@ -26,10 +26,12 @@
 // LOWER: callee = "noc_semaphore_inc"
 // LOWER: callee = "experimental::semaphore_wait_min"
 
-func.func @main(%a: tensor<128x128xbf16>, %b: tensor<128x128xbf16>) -> tensor<128x128xbf16> {
-  %0 = "ttir.add"(%a, %b) : (tensor<128x128xbf16>, tensor<128x128xbf16>) -> tensor<128x128xbf16>
-  %1 = "ttir.relu"(%0) : (tensor<128x128xbf16>) -> tensor<128x128xbf16>
-  %2 = "ttir.neg"(%0) : (tensor<128x128xbf16>) -> tensor<128x128xbf16>
-  %3 = "ttir.add"(%1, %2) : (tensor<128x128xbf16>, tensor<128x128xbf16>) -> tensor<128x128xbf16>
-  return %3 : tensor<128x128xbf16>
-}
+// Reuse the device fixture to check temporal fallback and serialization.
+// RUN: ttmlir-opt %S/../../../Silicon/TTMetal/n150/spatial/auto_chain.mlir --ttir-to-ttmetal-pipeline="execution-strategy=spatial dump-spatial-planning=true" --mlir-print-op-generic -o %t.chain 2> %t.chain.report
+// RUN: FileCheck %S/../../../Silicon/TTMetal/n150/spatial/auto_chain.mlir --input-file=%t.chain.report
+// RUN: ttmlir-translate %t.chain --ttmetal-to-flatbuffer -o %t.chain.ttm
+
+// L1 exhaustion must fail even when ordinary output spilling is enabled.
+// RUN: not ttmlir-opt %S/../../../Silicon/TTMetal/n150/spatial/auto_diamond.mlir --d2m-fe-pipeline="execution-strategy=spatial test-assume-l1-capacity=8192 allow-l1-output-spilling=true" -o /dev/null 2>&1 | FileCheck %s --check-prefix=NOSPILL
+// NOSPILL: required L1 memory usage
+// NOSPILL-SAME: exceeds memory capacity 8192

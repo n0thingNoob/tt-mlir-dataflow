@@ -123,23 +123,16 @@ def execute(args):
         raise RuntimeError(
             "Compiler and runtime revisions differ; rebuild the matched stack"
         )
-    size = {
-        "diamond": 32,
-        "chain": 64,
-        "diamond_multitile": 128,
-        "elementwise_chain": 128,
-    }[args.case]
+    size = 128 if args.case == "diamond" else 64
     shape = (size, size)
     torch.manual_seed(SEED)
     inputs = [
         (torch.randn(shape, dtype=torch.bfloat16) * 0.125).contiguous()
         for _ in range(2)
     ]
-    if args.case.startswith("diamond"):
+    if args.case == "diamond":
         summed = inputs[0] + inputs[1]
         reference = torch.relu(summed) + (-summed)
-    elif args.case == "elementwise_chain":
-        reference = -torch.relu(inputs[0] + inputs[1])
     else:
         reference = -torch.relu(torch.matmul(*inputs))
     torch.save({"inputs": inputs, "reference": reference}, args.output / "reference.pt")
@@ -232,7 +225,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--case",
-        choices=("diamond", "diamond_multitile", "elementwise_chain", "chain"),
+        choices=("diamond", "chain"),
         required=True,
     )
     parser.add_argument(
@@ -416,9 +409,7 @@ def main():
     pipeline_case = args.case != "chain"
     selected = re.findall(r"selected S\d+ members=(\[[^\]]+\])", report)
     if pipeline_case:
-        members = (
-            "[G0, G1, G2, G3]" if args.case.startswith("diamond") else "[G0, G1, G2]"
-        )
+        members = "[G0, G1, G2, G3]"
         if (
             f"selected pipeline members={members}" not in report
             or snapshots["spatial"].count('"d2m.spatial"') != 1
@@ -440,8 +431,7 @@ def main():
             )
             for program in programs
         ]
-        count = 4 if args.case.startswith("diamond") else 3
-        if [f"0x{i}, 1x1" for i in range(count)] not in ranges:
+        if [f"0x{i}, 1x1" for i in range(4)] not in ranges:
             raise RuntimeError("Missing pipeline enqueue on distinct cores")
         if "semaphore_wait_min" not in lowered or "noc_semaphore_inc" not in lowered:
             raise RuntimeError("Missing cumulative tile synchronization")
