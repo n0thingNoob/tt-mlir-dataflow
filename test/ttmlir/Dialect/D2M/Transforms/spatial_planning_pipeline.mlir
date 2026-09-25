@@ -2,7 +2,7 @@
 // RUN: ttmlir-opt %s --d2m-fe-pipeline="execution-strategy=temporal" --mlir-print-ir-before=d2m-grid-selection --mlir-disable-threading -o %t.temporal 2> %t.temporal.before-grid
 // RUN: ttmlir-opt %s --d2m-fe-pipeline="execution-strategy=spatial" --mlir-print-ir-before=d2m-grid-selection --mlir-disable-threading -o %t.spatial 2> %t.spatial.before-grid
 // RUN: diff %t.default.before-grid %t.temporal.before-grid
-// RUN: diff %t.default.before-grid %t.spatial.before-grid
+// RUN: FileCheck %s --check-prefix=SPATIAL --input-file=%t.spatial.before-grid
 // RUN: ttmlir-opt %t.default --d2m-spatial-planning -o %t.bufferized
 // RUN: diff %t.default %t.bufferized
 // RUN: ttmlir-opt %s --d2m-fe-pipeline="execution-strategy=spatial" --dump-pass-pipeline -o /dev/null 2>&1 | FileCheck %s --check-prefix=PIPELINE
@@ -11,16 +11,20 @@
 // RUN: ttmlir-opt %s --ttir-to-ttmetal-pipeline="execution-strategy=spatial" -o %t.metal.spatial
 // RUN: FileCheck %s --check-prefix=METAL --input-file=%t.metal.default --implicit-check-not=d2m.spatial --implicit-check-not=d2m.generic
 // RUN: FileCheck %s --check-prefix=METAL --input-file=%t.metal.spatial --implicit-check-not=d2m.spatial --implicit-check-not=d2m.generic
+// RUN: ttmlir-opt %t.metal.spatial --mlir-print-op-generic -o %t.serialize.mlir
+// RUN: ttmlir-translate %t.serialize.mlir --ttmetal-to-flatbuffer -o %t.ttm
 // RUN: not ttmlir-opt %s --d2m-fe-pipeline="execution-strategy=invalid" 2>&1 | FileCheck %s --check-prefix=INVALID
 // RUN: not ttmlir-opt %s --d2m-fe-pipeline="execution-strategy=auto" 2>&1 | FileCheck %s --check-prefix=AUTO
 
 // Planning must run immediately after conversion, before any D2M optimization.
 // PIPELINE: ttir-to-d2m
-// PIPELINE-NEXT: d2m-spatial-planning,
+// PIPELINE-NEXT: d2m-spatial-planning{dump-regions=false materialize=false prepare-pipelines=true},
 // PIPELINE-NEXT: d2m-scalarize-const-tensors,
 // TEMPORAL: ttir-to-d2m
 // INVALID: Cannot find option named 'invalid'
 // AUTO: Cannot find option named 'auto'
+// SPATIAL-COUNT-3: d2m.spatial {
+// SPATIAL-NOT: d2m.spatial {
 // METAL: "ttmetal.enqueue_write_buffer"
 // METAL: "ttmetal.enqueue_program"
 // METAL: "ttmetal.enqueue_read_buffer"
@@ -31,7 +35,7 @@
 // separately for both strategies.
 
 // A diamond with a repeated operand exercises shared dependencies. Spatial
-// planning must leave the dependent generics sequential while policies are TODO.
+// planning preserves dependencies while packaging the independent branches.
 module {
   func.func @diamond(%a: tensor<64x64xf32>, %b: tensor<64x64xf32>) -> tensor<64x64xf32> {
     %0 = "ttir.add"(%a, %b) : (tensor<64x64xf32>, tensor<64x64xf32>) -> tensor<64x64xf32>

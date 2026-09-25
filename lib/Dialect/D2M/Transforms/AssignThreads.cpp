@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "ttmlir/Dialect/D2M/Transforms/Passes.h"
+#include "ttmlir/Dialect/D2M/Utils/SpatialPipeline.h"
 
 #include "ttmlir/Dialect/D2M/IR/D2MGenericRegionOps.h"
 #include "ttmlir/Dialect/D2M/IR/D2MOps.h"
@@ -129,6 +130,9 @@ static std::optional<ThreadType> classifyOp(Operation *op) {
   }
   // semaphore_wait is replicated into both threads; leave untagged.
   if (mlir::isa<SemaphoreWaitOp>(op)) {
+    if (op->hasAttr(spatial_pipeline::wait)) {
+      return ThreadType::Datamovement;
+    }
     return std::nullopt;
   }
   if (mlir::isa<ShardDMAOpInterface, DeviceSynchronizeOp>(op)) {

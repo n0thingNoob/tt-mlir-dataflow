@@ -6,6 +6,7 @@
 #include "ttmlir/Dialect/D2M/IR/D2MGenericRegionOps.h"
 #include "ttmlir/Dialect/D2M/IR/D2MOps.h"
 #include "ttmlir/Dialect/D2M/Transforms/Passes.h"
+#include "ttmlir/Dialect/D2M/Utils/SpatialPipeline.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -255,6 +256,22 @@ public:
 
     // Wait for DMA to complete.
     rewriter.create<DMAWaitOp>(loc, dmaTx);
+    // Publish only after the full tile write has completed. Each fork edge
+    // has its own cumulative ready counter on the destination core.
+    auto generic = dmaTx.getDefiningOp()->getParentOfType<GenericOp>();
+    if (generic) {
+      if (auto signals =
+              generic->getAttrOfType<ArrayAttr>(spatial_pipeline::signals)) {
+        for (Attribute attr : signals) {
+          auto signal = cast<DenseI64ArrayAttr>(attr).asArrayRef();
+          Value sem = generic.getAdditionalArgs()[signal[0]];
+          Value one = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+          Value y = rewriter.create<arith::ConstantIndexOp>(loc, signal[1]);
+          Value x = rewriter.create<arith::ConstantIndexOp>(loc, signal[2]);
+          rewriter.create<SemaphoreIncOp>(loc, sem, one, ValueRange{y, x});
+        }
+      }
+    }
     // Pop the circular buffer to signal consumption.
     rewriter.create<PopOp>(loc, cb);
     return success();

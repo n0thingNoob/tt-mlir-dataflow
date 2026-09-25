@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "ttmlir/Dialect/D2M/Analysis/BlockFactorAnalysis.h"
+#include "ttmlir/Dialect/D2M/Utils/SpatialPipeline.h"
 
 #include "ttmlir/Dialect/D2M/Analysis/Allocation/Utils.h"
 #include "ttmlir/Dialect/D2M/IR/D2MGenericRegionOps.h"
@@ -640,6 +641,14 @@ static SmallVector<int64_t> chooseReblockedFactors(
     BlockFactorAnalysis::BufferSizePolicy policy,
     ttcore::MemorySpaceAttr l1Attr, uint32_t numBuffers) {
   const SmallVector<int64_t> shardFactors = getShardBlockFactors(genericOp);
+  if (genericOp->hasAttr(spatial_pipeline::group)) {
+    auto factors = genericOp.getBlockFactorsValue();
+    for (unsigned i = 0; i < factors.size(); ++i) {
+      factors[i] *= shardFactors[i];
+    }
+    return factors;
+  }
+
   switch (policy) {
   case BlockFactorAnalysis::BufferSizePolicy::Max:
     return genericOp.getBlockFactorsValue();
