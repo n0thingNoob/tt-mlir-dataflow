@@ -23,9 +23,16 @@ struct D2MPipelineOptions : public PassPipelineOptions<D2MPipelineOptions> {
       llvm::cl::values(
           clEnumValN(D2MExecutionStrategy::Temporal, "temporal",
                      "Use the existing D2M pipeline"),
-          clEnumValN(D2MExecutionStrategy::Spatial, "spatial",
-                     "Enable spatial planning (currently preserves the IR)")),
+          clEnumValN(
+              D2MExecutionStrategy::Spatial, "spatial",
+              "Materialize spatial parallel pairs and temporal singletons")),
       llvm::cl::init(D2MExecutionStrategy::Temporal)};
+
+  Option<bool> dumpSpatialPlanning{
+      *this, "dump-spatial-planning",
+      llvm::cl::desc(
+          "Print spatial candidates, selections and materialized IR"),
+      llvm::cl::init(false)};
 
   ListOption<int64_t> meshShape{
       *this, "mesh-shape", llvm::cl::desc("Set the multi-device mesh shape.")};

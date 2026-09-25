@@ -4,10 +4,12 @@
 
 #include "ttmlir/Dialect/D2M/IR/D2MOps.h"
 #include "ttmlir/Dialect/D2M/Transforms/Passes.h"
+#include "ttmlir/Dialect/D2M/Utils/SpatialPipeline.h"
 
 #include "ttmlir/Asserts.h"
 #include "ttmlir/Dialect/D2M/Analysis/Allocation/Planner.h"
 #include "ttmlir/Dialect/D2M/Analysis/Allocation/Utils.h"
+#include "ttmlir/Dialect/D2M/Utils/Utils.h"
 #include "ttmlir/Dialect/TTCore/IR/TTCore.h"
 #include "ttmlir/Dialect/TTIR/IR/TTIROps.h"
 #include "ttmlir/Utils.h"
@@ -854,7 +856,10 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
             rewriter, analysis, chainRoot.root, chainRoot.type, device);
 
         rootMemrefCtx.genericUsers.insert(genericOp);
-        rootMemrefCtx.isMemspaceBound |= genericCtx.isExplicitDatamovement;
+        rootMemrefCtx.isMemspaceBound |=
+            genericCtx.isExplicitDatamovement ||
+            (genericOp->hasAttr(spatial_pipeline::group) ||
+             genericOp->hasAttr(spatial_pipeline::noSpill));
         rootMemrefCtx.usedForOutput |= operandCtx.isOutput;
 
         if (memref::AllocOp allocOp =
@@ -1440,7 +1445,41 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
   ///    are not broadcast or reduction.
   /// This is a common function shared by isAliasedLoad and isAliasedStore.
   bool canAliasOperand(d2m::GenericOp genericOp, Value genericOperand) const {
-    // Check if operand requires aliasing
+    if (genericOp->hasAttr(spatial_pipeline::group)) {
+      return false;
+    }
+    // Equal tensor shapes do not imply local storage. A spatial consumer may
+    // run on a different core from its operand's backing allocation. Keep DMA
+    // unless both physical placements agree, including the range offset.
+    AffineMap genericMap = genericOp.getGrid().getVirtToPhysicalMap();
+    auto operandMapping = utils::getVirtualGridForwardMapping(genericOperand);
+    if (!genericMap.isEmpty() || operandMapping) {
+      auto shape = genericOp.getGrid().getShape();
+      if (shape.size() != 2) {
+        return false;
+      }
+      auto operandMaps =
+          utils::getGridMapsFromVirtualGridMapping(genericOperand, shape);
+      if (operandMapping && !operandMaps) {
+        return false;
+      }
+      auto identity =
+          AffineMap::getMultiDimIdentityMap(2, genericOp.getContext())
+              .insertResult(getAffineConstantExpr(0, genericOp.getContext()),
+                            0);
+      AffineMap operandMap = operandMaps ? operandMaps->first : identity;
+      if (genericMap.isEmpty()) {
+        genericMap = identity;
+      } else if (genericMap.getNumResults() == 2) {
+        genericMap = genericMap.insertResult(
+            getAffineConstantExpr(0, genericOp.getContext()), 0);
+      }
+      if (simplifyAffineMap(genericMap) != simplifyAffineMap(operandMap)) {
+        return false;
+      }
+    }
+
+    // Check if operand requires aliasing.
     bool isOutput = llvm::find_if(genericOp.getOutputs(), [&](Value operand) {
                       return operand == genericOperand;
                     }) != genericOp.getOutputs().end();

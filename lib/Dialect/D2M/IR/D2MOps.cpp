@@ -3148,6 +3148,7 @@ mlir::LogicalResult d2m::GenericOp::bufferize(
       getGrid(), getBlockFactors(), getIndexingMaps(), getIteratorTypes(),
       getThreads(), getFabricConnectionConfigAttr(),
       /*numRegions=*/getNumRegions());
+  bufferGeneric->setDiscardableAttrs((*this)->getDiscardableAttrDictionary());
   for (mlir::Region &region : bufferGeneric.getRegions()) {
     region.takeBody(getRegion(region.getRegionNumber()));
   }
