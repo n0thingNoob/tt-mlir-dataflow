@@ -166,14 +166,18 @@ static void
 optimizeToLayoutGrid(d2m::ToLayoutOp toLayoutOp, ArrayRef<int64_t> targetGrid,
                      const EffectiveTargetGridRange &effectiveTargetGridRange,
                      bool ttnnMode, ArrayRef<int64_t> optimalGrid,
-                     OpBuilder &builder) {
+                     OpBuilder &builder, bool placeOutput = false) {
   auto emptyOp = toLayoutOp.getOutput().getDefiningOp<d2m::EmptyOp>();
   if (!emptyOp) {
     return;
   }
 
   auto emptyType = mlir::cast<mlir::RankedTensorType>(emptyOp.getType());
-  if (emptyType.getShape().take_front(2) == llvm::ArrayRef(optimalGrid)) {
+  bool needsPlacement =
+      placeOutput && llvm::any_of(effectiveTargetGridRange.offset,
+                                  [](int64_t offset) { return offset != 0; });
+  if (emptyType.getShape().take_front(2) == llvm::ArrayRef(optimalGrid) &&
+      !needsPlacement) {
     return;
   }
 
@@ -192,11 +196,9 @@ optimizeToLayoutGrid(d2m::ToLayoutOp toLayoutOp, ArrayRef<int64_t> targetGrid,
     }
   }
 
-  if (!needsOptimization) {
-    // A selected 1x1 grid does not require producer-side redistribution.
-    // In non-origin spatial regions, offset-aware mapping is materialized on
-    // the output path: applyEmptyOpUpdate updates the outs EmptyOp VGM, and
-    // deriveGridAttrForOutput rebuilds the generic grid mapping from it.
+  if (!needsOptimization && !needsPlacement) {
+    // Inputs can remain on their producer's cores. Outputs must acquire the
+    // spatial range's offset even when the selected grid is still 1x1.
     return;
   }
 
@@ -352,10 +354,10 @@ optimizeTTNNMetalLayoutCastOpGrid(ttir::TTNNMetalLayoutCastOp castOp,
 static void
 applyToLayoutUpdate(const OperandGridInfo &info,
                     const EffectiveTargetGridRange &effectiveTargetGridRange,
-                    bool ttnnMode, OpBuilder &builder) {
+                    bool ttnnMode, OpBuilder &builder, bool placeOutput) {
   auto toLayoutOp = info.getLiveOperand().getDefiningOp<d2m::ToLayoutOp>();
   optimizeToLayoutGrid(toLayoutOp, info.targetGrid, effectiveTargetGridRange,
-                       ttnnMode, info.selectedGrid, builder);
+                       ttnnMode, info.selectedGrid, builder, placeOutput);
 }
 
 static void applyBehindViewToLayoutUpdate(
@@ -774,7 +776,9 @@ static LogicalResult applyGridDecisions(d2m::GenericOp genericOp,
                                builder);
       break;
     case Kind::ToLayout:
-      applyToLayoutUpdate(info, effectiveTargetGridRange, ttnnMode, builder);
+      applyToLayoutUpdate(
+          info, effectiveTargetGridRange, ttnnMode, builder,
+          llvm::is_contained(genericOp.getOutputs(), info.getLiveOperand()));
       break;
     case Kind::Mask:
       applyMaskUpdate(info, effectiveTargetGridRange, ttnnMode, builder);

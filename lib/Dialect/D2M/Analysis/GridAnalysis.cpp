@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "ttmlir/Dialect/D2M/Analysis/GridAnalysis.h"
+#include "ttmlir/Dialect/D2M/Utils/SpatialPipeline.h"
 
 #include "ttmlir/Asserts.h"
 #include "ttmlir/Dialect/D2M/Utils/GridSelectionUtils.h"
@@ -571,6 +572,13 @@ GenericGridAnalysisResult GridAnalysis::analyzeGenericOp(
 EffectiveTargetGridRange getTargetGridRange(GenericOp genericOp,
                                             ArrayRef<int64_t> deviceGridShape) {
   EffectiveTargetGridRange targetGridRange;
+  if (auto range = genericOp->getAttrOfType<ttcore::CoreRangeAttr>(
+          spatial_pipeline::core)) {
+    targetGridRange.shape = {1, 1};
+    targetGridRange.offset = {range.getStartCoord().getY(),
+                              range.getStartCoord().getX()};
+    return targetGridRange;
+  }
   mlir::Region *region = genericOp->getParentRegion();
   if (auto spatialOp = mlir::dyn_cast<d2m::SpatialOp>(region->getParentOp())) {
     mlir::ArrayAttr gridRangesAttr = spatialOp.getGridRanges();

@@ -111,7 +111,10 @@ void createD2MFrontendPipeline(OpPassManager &pm,
   }
   pm.addPass(tt::createTTIRToD2MPass(toD2MOptions));
   if (options.executionStrategy == D2MExecutionStrategy::Spatial) {
-    pm.addPass(d2m::createD2MSpatialPlanning());
+    d2m::D2MSpatialPlanningOptions planningOptions;
+    planningOptions.preparePipelines = true;
+    planningOptions.dumpRegions = options.dumpSpatialPlanning;
+    pm.addPass(d2m::createD2MSpatialPlanning(planningOptions));
   }
   pm.addPass(d2m::createD2MScalarizeConstTensors());
   d2m::D2MGridSelectionOptions gridOptOptions;
@@ -159,6 +162,12 @@ void createD2MFrontendPipeline(OpPassManager &pm,
   }
   pm.addPass(d2m::createD2MReblockGenerics(reblockGenericsOptions));
   pm.addPass(d2m::createD2MMaterializeViewReturns());
+
+  if (options.executionStrategy == D2MExecutionStrategy::Spatial) {
+    d2m::D2MMaterializeSpatialPipelinesOptions spatialOptions;
+    spatialOptions.dumpRegions = options.dumpSpatialPlanning;
+    pm.addPass(d2m::createD2MMaterializeSpatialPipelines(spatialOptions));
+  }
 
   // Run right before allocate to mark synchronized buffers
   d2m::D2MMarkSynchronizedBuffersOptions markSyncBuffersOptions;

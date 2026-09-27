@@ -322,6 +322,7 @@ public:
         generic.getIteratorTypes(), rewriter.getArrayAttr(threads),
         generic.getFabricConnectionConfigAttr(),
         /*numRegions*/ numThreadsToUse + 1);
+    newGeneric->setDiscardableAttrs(generic->getDiscardableAttrDictionary());
 
     // Get the original DM block's argument types.
     SmallVector<Type> argTypes(dmBlock->getArgumentTypes().begin(),

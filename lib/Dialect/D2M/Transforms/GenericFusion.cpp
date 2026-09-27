@@ -6,6 +6,7 @@
 #include "ttmlir/Dialect/D2M/IR/D2MOps.h"
 #include "ttmlir/Dialect/D2M/IR/D2MTraits.h"
 #include "ttmlir/Dialect/D2M/Transforms/Passes.h"
+#include "ttmlir/Dialect/D2M/Utils/SpatialPipeline.h"
 #include "ttmlir/Dialect/D2M/Utils/Utils.h"
 #include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h"
 #include "ttmlir/Dialect/TTCore/IR/Utils.h"
@@ -96,6 +97,9 @@ static bool fitsInDstPostFusion(GenericOp producer, GenericOp consumer) {
 }
 
 static bool isValidElementwiseFusionTarget(GenericOp gOp) {
+  if (gOp->hasAttr(spatial_pipeline::group)) {
+    return false;
+  }
   if (!gOp.isComputeOnlyForm()) {
     return false;
   }
@@ -605,6 +609,9 @@ static bool hasSingleReductionDim(GenericOp gOp) {
 }
 
 static bool isValidReductionFusionConsumer(GenericOp gOp) {
+  if (gOp->hasAttr(spatial_pipeline::group)) {
+    return false;
+  }
   if (!gOp.isComputeOnlyForm()) {
     return false;
   }

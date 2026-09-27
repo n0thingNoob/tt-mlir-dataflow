@@ -6,6 +6,7 @@ add_mlir_dialect_library(MLIRD2MAnalysis
   CBProducerConsumer.cpp
   GenericInterchangeAnalysis.cpp
   GridAnalysis.cpp
+  SpatializationAnalysis.cpp
   TopKShardingStrategy.cpp
 
   ADDITIONAL_HEADER_DIRS
