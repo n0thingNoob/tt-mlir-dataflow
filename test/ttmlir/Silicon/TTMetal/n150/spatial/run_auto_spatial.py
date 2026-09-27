@@ -123,16 +123,32 @@ def execute(args):
         raise RuntimeError(
             "Compiler and runtime revisions differ; rebuild the matched stack"
         )
-    size = 128 if args.case == "diamond" else 64
-    shape = (size, size)
+    if args.case == "gemm_rect":
+        shapes = [(64, 96), (96, 128), (128, 96)]
+    elif args.case == "gemm_chain":
+        shapes = [(64, 64)] * 3
+    elif args.case == "mixed":
+        shapes = [(64, 64)] * 3
+    elif args.case == "elementwise_rect":
+        shapes = [(64, 96)] * 2
+    else:
+        size = 64 if args.case == "chain" else 128
+        shapes = [(size, size)] * 2
     torch.manual_seed(SEED)
     inputs = [
         (torch.randn(shape, dtype=torch.bfloat16) * 0.125).contiguous()
-        for _ in range(2)
+        for shape in shapes
     ]
-    if args.case == "diamond":
+    if args.case in ("diamond", "mixed"):
         summed = inputs[0] + inputs[1]
         reference = torch.relu(summed) + (-summed)
+        if args.case == "mixed":
+            reference = torch.matmul(inputs[2], reference).to(torch.bfloat16)
+    elif args.case.startswith("gemm_"):
+        first = torch.matmul(inputs[0], inputs[1]).to(torch.bfloat16)
+        reference = torch.matmul(torch.relu(first), inputs[2]).to(torch.bfloat16)
+    elif args.case.startswith("elementwise_"):
+        reference = -torch.relu(inputs[0] + inputs[1])
     else:
         reference = -torch.relu(torch.matmul(*inputs))
     torch.save({"inputs": inputs, "reference": reference}, args.output / "reference.pt")
@@ -158,7 +174,7 @@ def execute(args):
             result = runtime.runtime.submit(device, binary.fbb, 0, converted)[0]
             try:
                 host = runtime.runtime.to_host(result, untilize=True, blocking=True)[0]
-                output = torch.empty(shape, dtype=torch.bfloat16)
+                output = torch.empty_like(reference)
                 runtime.runtime.memcpy(output.data_ptr(), host)
             finally:
                 runtime.runtime.deallocate_tensor(result, force=True)
@@ -225,7 +241,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--case",
-        choices=("diamond", "chain"),
+        choices=(
+            "diamond",
+            "chain",
+            "elementwise_chain",
+            "elementwise_rect",
+            "gemm_chain",
+            "gemm_rect",
+            "mixed",
+        ),
         required=True,
     )
     parser.add_argument(
@@ -253,7 +277,11 @@ def main():
         setattr(args, name, getattr(args, name).resolve())
     if args.runs < 3:
         parser.error("--runs must be at least 3 to check repeated execution")
-    fixture = Path(__file__).with_name(f"auto_{args.case}.mlir")
+    fixture_case = {
+        "gemm_rect": "gemm_chain",
+        "elementwise_rect": "elementwise_chain",
+    }.get(args.case, args.case)
+    fixture = Path(__file__).with_name(f"auto_{fixture_case}.mlir")
     os.environ["TT_VISIBLE_DEVICES"] = args.device
     os.environ.pop("TT_METAL_VISIBLE_DEVICES", None)
     if args.worker:
@@ -272,6 +300,13 @@ def main():
     if busy.returncode != 1:
         raise RuntimeError("Device is busy, or fuser could not confirm it is unused")
     args.output.mkdir(parents=True, exist_ok=False)
+    fixture_text = fixture.read_text()
+    if args.case == "gemm_chain":
+        fixture_text = re.sub(r"\d+x\d+xbf16", "64x64xbf16", fixture_text)
+    elif args.case == "elementwise_rect":
+        fixture_text = fixture_text.replace("128x128", "64x96")
+    fixture = args.output / "input.mlir"
+    fixture.write_text(fixture_text)
     manifest = {
         "input_source": "fixed_ttir_fixture",
         "fixture_sha256": digest(fixture),
@@ -406,37 +441,36 @@ def main():
             raise RuntimeError("Compiled L1 addresses overlap reserved memory")
         allocation_addresses[mode] = addresses
     report = (args.output / "compile-spatial.log").read_text()
-    pipeline_case = args.case != "chain"
-    selected = re.findall(r"selected S\d+ members=(\[[^\]]+\])", report)
-    if pipeline_case:
-        members = "[G0, G1, G2, G3]"
-        if (
-            f"selected pipeline members={members}" not in report
-            or snapshots["spatial"].count('"d2m.spatial"') != 1
-        ):
-            raise RuntimeError("Missing complete spatial pipeline")
-    elif (
-        selected != ["[G0]", "[G1]", "[G2]"]
-        or snapshots["spatial"].count('"d2m.spatial"') != 3
+    stage_count = 4 if args.case in ("diamond", "mixed") else 3
+    members = "[" + ", ".join(f"G{i}" for i in range(stage_count)) + "]"
+    expected_spatials = 2 if args.case == "mixed" else 1
+    if (
+        f"selected pipeline members={members}" not in report
+        or snapshots["spatial"].count('"d2m.spatial"') != expected_spatials
+        or "pipeline traversal fallback:" in report
     ):
-        raise RuntimeError(f"Unexpected temporal fallback grouping: {selected}")
+        raise RuntimeError("Missing complete spatial pipeline")
+    if (
+        args.case == "mixed"
+        and "selected S1 members=[G4] reason=temporal fallback:" not in report
+    ):
+        raise RuntimeError("Missing mixed graph's temporal fallback")
     if '"d2m.spatial"' in snapshots["temporal"]:
         raise RuntimeError("Temporal baseline unexpectedly contains spatial ops")
-    if pipeline_case:
-        lowered = (args.output / "spatial.mlir").read_text()
-        programs = lowered.split('"ttmetal.enqueue_program"')[1:]
-        ranges = [
-            re.findall(
-                r"#ttmetal.compute_config<[^,]+, #ttmetal.core_range<([^>]+)>", program
-            )
-            for program in programs
-        ]
-        if [f"0x{i}, 1x1" for i in range(4)] not in ranges:
-            raise RuntimeError("Missing pipeline enqueue on distinct cores")
-        if "semaphore_wait_min" not in lowered or "noc_semaphore_inc" not in lowered:
-            raise RuntimeError("Missing cumulative tile synchronization")
-        if "#ttcore.memory_space<dram>" in lowered:
-            raise RuntimeError("Unexpected DRAM storage in the L1-only smoke fixture")
+    lowered = (args.output / "spatial.mlir").read_text()
+    programs = lowered.split('"ttmetal.enqueue_program"')[1:]
+    ranges = [
+        re.findall(
+            r"#ttmetal.compute_config<[^,]+, #ttmetal.core_range<([^>]+)>", program
+        )
+        for program in programs
+    ]
+    if [f"0x{i}, 1x1" for i in range(stage_count)] not in ranges:
+        raise RuntimeError("Missing pipeline enqueue on distinct cores")
+    if "semaphore_wait_min" not in lowered or "noc_semaphore_inc" not in lowered:
+        raise RuntimeError("Missing cumulative tile synchronization")
+    if "#ttcore.memory_space<dram>" in lowered:
+        raise RuntimeError("Unexpected DRAM storage in the L1-only smoke fixture")
     manifest["l1_allocation_addresses"] = allocation_addresses
     write_json(args.output / "manifest.json", manifest)
     identical_final_ir = (args.output / "temporal.mlir").read_bytes() == (

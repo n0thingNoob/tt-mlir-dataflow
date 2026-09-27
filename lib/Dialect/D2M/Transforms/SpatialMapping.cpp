@@ -97,6 +97,36 @@ static Attribute range(MLIRContext *ctx, int64_t y, int64_t x, int64_t h,
       ctx, ttcore::CoreCoordAttr::get(ctx, y, x),
       ttcore::CoreCoordAttr::get(ctx, y + h - 1, x + w - 1));
 }
+// Recognize only the standard elementwise maps or non-transposed M,N,K
+// matmul. Keeping this structural gate small makes late traversal checks
+// independent of the broader Generic operation classification.
+static bool hasCanonicalPipelineIndexing(GenericOp generic) {
+  auto maps = generic.getIndexingMapsValue();
+  if (generic.isAllParallel() && generic.getNumDims() == 2) {
+    return llvm::all_of(maps, [](AffineMap map) { return map.isIdentity(); });
+  }
+  if (generic.getNumDims() != 3 || generic.getInputs().size() != 2 ||
+      generic.getBlockFactorsValue()[2] != 1) {
+    return false;
+  }
+  auto *ctx = generic.getContext();
+  auto m = getAffineDimExpr(0, ctx);
+  auto n = getAffineDimExpr(1, ctx);
+  auto k = getAffineDimExpr(2, ctx);
+  SmallVector<AffineMap> expected = {AffineMap::get(3, 0, {m, k}, ctx),
+                                     AffineMap::get(3, 0, {k, n}, ctx),
+                                     AffineMap::get(3, 0, {m, n}, ctx)};
+  for (unsigned dim = 0; dim < 3; ++dim) {
+    auto iterator =
+        cast<ttcore::IteratorTypeAttr>(generic.getIteratorTypes()[dim]);
+    if (iterator.getValue() != (dim == 2 ? ttcore::IteratorType::Reduction
+                                         : ttcore::IteratorType::Parallel)) {
+      return false;
+    }
+  }
+  return maps == expected;
+}
+
 // A legality check only: no scores or alternative mapping search. The memory
 // bound intentionally overestimates concurrent storage for this first policy.
 static std::string checkPipelineCandidate(
@@ -104,21 +134,19 @@ static std::string checkPipelineCandidate(
     ArrayRef<int64_t> shape, ttcore::ChipDescAttr chip,
     DominanceInfo &dominance, llvm::SetVector<Operation *> &preparations) {
   std::string rejection;
-  RankedTensorType common;
   uint64_t bytes = 0;
   unsigned cbCount = 0;
   llvm::SmallPtrSet<Operation *, 8> destinations;
   GenericOp anchor = dag.nodes[candidate.members.front()].generic;
   for (unsigned id : candidate.members) {
     GenericOp g = dag.nodes[id].generic;
-    if (g.getNumResults() != 1 || !g.isAllParallel() || g.getNumDims() != 2 ||
+    bool matmul = g.getNumDims() == 3 && g.hasReduction();
+    if (g.getNumResults() != 1 || !hasCanonicalPipelineIndexing(g) ||
         g.getGrid().getShape() != ArrayRef<int64_t>({1, 1}) ||
-        !llvm::all_of(
-            dag.nodes[id].captures,
-            [&](Value v) { return llvm::is_contained(g->getOperands(), v); }) ||
-        !llvm::all_of(g.getIndexingMapsValue(),
-                      [](AffineMap map) { return map.isIdentity(); })) {
-      rejection = "requires single-output 2D elementwise stages";
+        !llvm::all_of(dag.nodes[id].captures, [&](Value v) {
+          return llvm::is_contained(g->getOperands(), v);
+        })) {
+      rejection = "requires canonical elementwise or full-K matmul stages";
       break;
     }
     llvm::SetVector<Value> distinctInputs;
@@ -128,27 +156,37 @@ static std::string checkPipelineCandidate(
       break;
     }
     auto type = cast<RankedTensorType>(g.getResult(0).getType());
-    auto tile = dyn_cast<ttcore::TileType>(type.getElementType());
-    auto layout = cast<ttcore::MetalLayoutAttr>(type.getEncoding());
-    auto logical = layout.getLogicalShape();
-    if (!tile || !tile.getElementType().isBF16() || tile.getHeight() != 32 ||
-        tile.getWidth() != 32 || type.getRank() != 4 ||
-        !llvm::all_of(g.getInputs(),
-                      [&](Value v) { return v.getType() == type; }) ||
-        logical.size() != 2 || logical[0] <= 0 || logical[1] <= 0 ||
-        logical[0] % 32 || logical[1] % 32 || (common && common != type)) {
-      rejection = "requires matching tile-aligned static 2D BF16 layouts";
+    bool validTypes = llvm::all_of(g->getOperandTypes(), [&](Type operandType) {
+      auto tensor = dyn_cast<RankedTensorType>(operandType);
+      if (!tensor || tensor.getRank() != 4 || !tensor.hasStaticShape()) {
+        return false;
+      }
+      auto tile = dyn_cast<ttcore::TileType>(tensor.getElementType());
+      auto layout =
+          dyn_cast_or_null<ttcore::MetalLayoutAttr>(tensor.getEncoding());
+      if (!tile || !tile.getElementType().isBF16() || tile.getHeight() != 32 ||
+          tile.getWidth() != 32 || !layout) {
+        return false;
+      }
+      auto logical = layout.getLogicalShape();
+      return logical.size() == 2 && logical[0] > 0 && logical[1] > 0 &&
+             logical[0] % 32 == 0 && logical[1] % 32 == 0 &&
+             (matmul || tensor == type);
+    });
+    if (!validTypes) {
+      rejection = "requires tile-aligned static 2D BF16 layouts";
       break;
     }
-    common = type;
     unsigned computeCount = 0;
     bool unsupported = false;
     g.walk([&](Operation *op) {
       StringRef name = op->getName().getStringRef();
       if (name.starts_with("d2m.tile_")) {
         ++computeCount;
-        unsupported |= name != "d2m.tile_add" && name != "d2m.tile_relu" &&
-                       name != "d2m.tile_negative";
+        unsupported |= matmul ? name != "d2m.tile_matmul"
+                              : name != "d2m.tile_add" &&
+                                    name != "d2m.tile_relu" &&
+                                    name != "d2m.tile_negative";
       }
     });
     if (unsupported || computeCount != 1 ||
@@ -160,7 +198,12 @@ static std::string checkPipelineCandidate(
     // semaphore/alignment overhead on every core. Allocation performs the
     // final address check.
     cbCount += g.getInputs().size() + g.getOutputs().size();
-    bytes += type.getNumElements() * 2048 * (g.getInputs().size() + 1) + 65536;
+    // Full tensors also bound the size of the GEMM panels. Include two
+    // additional copies for CB storage, plus alignment/semaphore headroom.
+    for (Type operandType : g->getOperandTypes()) {
+      bytes += cast<RankedTensorType>(operandType).getNumElements() * 2048 * 3;
+    }
+    bytes += 65536;
     for (Value operand : g->getOperands()) {
       const auto *edge =
           llvm::find_if(dag.dependencies, [&](const SpatialDependency &d) {
@@ -168,7 +211,15 @@ static std::string checkPipelineCandidate(
                    llvm::is_contained(candidate.members, *d.producer);
           });
       if (edge != dag.dependencies.end()) {
+        if (matmul && operand != g.getInputs()[0]) {
+          rejection = "pipeline matmul supports only an internal left input";
+          break;
+        }
         Value original = operand;
+        auto logical =
+            cast<ttcore::MetalLayoutAttr>(
+                cast<RankedTensorType>(original.getType()).getEncoding())
+                .getLogicalShape();
         // Only cancel an exact tiled -> plain -> same tiled round trip.
         if (original != edge->source) {
           auto outer = original.getDefiningOp<ToLayoutOp>();

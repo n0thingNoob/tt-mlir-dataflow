@@ -28,15 +28,19 @@ def D2MSpatialPlanning : Pass<"d2m-spatial-planning", "::mlir::ModuleOp"> {
     Grid selection, allocation and lowering use the existing D2M passes.
 
     The spatial compiler pipeline uses prepare-pipelines instead: supported
-    same-shape, static 2D BF16 add/relu/neg chains and simple diamonds receive
-    deterministic single-core stages. Exact inverse layout conversions on
+    static 2D BF16 add/relu/neg and non-transposed matmul chains and simple
+    diamonds receive deterministic single-core stages. Matmul completes full
+    K panels per output tile; only its left input may be an internal edge. Exact inverse layout conversions on
     internal edges are bypassed. Full intermediate tensors stay in producer
     L1; no ring-buffer protocol or candidate optimization is introduced.
     Unsupported candidates retain the independent-pair/singleton fallback.
     d2m-materialize-spatial-pipelines runs after bufferization and one-tile
-    reblocking, before allocation. It forms a buffer-form SpatialOp and adds
-    per-edge cumulative ready semaphores. Ready waits use >=, and notifications
-    follow DMA write completion. Allocation cannot spill selected buffers.
+    reblocking, before allocation. It verifies row-major traversal, exact
+    reblocking views and one completed output store per tile before forming a
+    buffer-form SpatialOp. Unproven groups become temporal singletons without
+    ready semaphores. Per-edge cumulative waits use >=: elementwise consumers
+    wait for a tile, matmul left inputs wait for a full row. Notifications
+    follow DMA write completion, after the complete K reduction. Allocation cannot spill selected buffers.
     Failure to allocate legally is an error, not a silent DRAM fallback.
   }];
   let options = [

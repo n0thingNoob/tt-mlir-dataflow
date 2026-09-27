@@ -644,7 +644,14 @@ static SmallVector<int64_t> chooseReblockedFactors(
   if (genericOp->hasAttr(spatial_pipeline::group)) {
     auto factors = genericOp.getBlockFactorsValue();
     for (unsigned i = 0; i < factors.size(); ++i) {
-      factors[i] *= shardFactors[i];
+      // A pipeline GEMM completes the entire reduction inside one output
+      // tile calculation. Splitting K would publish partial sums.
+      if (cast<ttcore::IteratorTypeAttr>(genericOp.getIteratorTypes()[i])
+              .getValue() == ttcore::IteratorType::Reduction) {
+        factors[i] = 1;
+      } else {
+        factors[i] *= shardFactors[i];
+      }
     }
     return factors;
   }

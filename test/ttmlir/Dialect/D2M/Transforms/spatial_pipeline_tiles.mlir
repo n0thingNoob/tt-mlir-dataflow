@@ -26,7 +26,7 @@
 // LOWER: callee = "noc_semaphore_inc"
 // LOWER: callee = "experimental::semaphore_wait_min"
 
-// Reuse the device fixture to check temporal fallback and serialization.
+// Reuse the original matmul chain to check GEMM pipeline and serialization.
 // RUN: ttmlir-opt %S/../../../Silicon/TTMetal/n150/spatial/auto_chain.mlir --ttir-to-ttmetal-pipeline="execution-strategy=spatial dump-spatial-planning=true" --mlir-print-op-generic -o %t.chain 2> %t.chain.report
 // RUN: FileCheck %S/../../../Silicon/TTMetal/n150/spatial/auto_chain.mlir --input-file=%t.chain.report
 // RUN: ttmlir-translate %t.chain --ttmetal-to-flatbuffer -o %t.chain.ttm

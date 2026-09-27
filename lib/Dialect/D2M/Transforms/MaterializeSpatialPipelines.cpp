@@ -2,8 +2,10 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "ttmlir/Dialect/D2M/IR/D2MGenericRegionOps.h"
@@ -45,78 +47,239 @@ struct ReadyEdge {
   unsigned producer;
   unsigned consumer;
   RemoteLoadOp load;
+  int64_t columns;
+  bool wholeRow;
 };
 
-static Value storageRoot(Value value) {
+// Only exact reblocking views preserve the logical row-major tile sequence.
+// Sharing an allocation alone does not prove that two views name the same tile.
+static Value reblockRoot(Value value) {
   while (auto view = value.getDefiningOp<ViewLayoutOp>()) {
+    if (view.getReinterpretLayout() || !view.isReblockOnly()) {
+      return {};
+    }
     value = view.getInput();
   }
   return value;
 }
 
-// Validate the deferred contract before hoisting buffers or creating
-// semaphores.
-static LogicalResult collectReadyEdges(ArrayRef<GenericOp> stages,
-                                       SmallVectorImpl<ReadyEdge> &edges) {
-  for (unsigned id = 0; id < stages.size(); ++id) {
-    GenericOp generic = stages[id];
-    auto stageId = generic->getAttrOfType<IntegerAttr>(spatial_pipeline::stage);
-    auto core =
-        generic->getAttrOfType<ttcore::CoreRangeAttr>(spatial_pipeline::core);
+static SmallVector<int64_t> tiledShape(Value value) {
+  auto type = dyn_cast<MemRefType>(value.getType());
+  if (!type || !type.hasStaticShape() || type.getRank() != 4) {
+    return {};
+  }
+  auto shape = type.getShape();
+  return {shape[0] * shape[2], shape[1] * shape[3]};
+}
+
+// GenerateOuterLoops produces iv + block_offset(dim). A single-core stage
+// has zero logical block offset even when placed at a nonzero physical core.
+static bool isLoopIndex(Value value, affine::AffineForOp loop, unsigned dim) {
+  if (value == loop.getInductionVar()) {
+    return true;
+  }
+  auto add = value.getDefiningOp<arith::AddIOp>();
+  if (!add) {
+    return false;
+  }
+  for (unsigned i = 0; i != 2; ++i) {
+    auto offset = add->getOperand(i).getDefiningOp<BlockOffsetOp>();
+    if (offset && offset.getDim() == dim &&
+        add->getOperand(1 - i) == loop.getInductionVar()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Prove the standard loop nest, rather than inferring traversal from shape.
+// K has exactly one outer iteration: the linalg body computes the full panel
+// reduction before the one output store and therefore before any notification.
+static std::string checkStageTraversal(GenericOp generic) {
+  auto factors = generic.getBlockFactorsValue();
+  bool matmul = generic.hasReduction();
+  if (factors.size() != (matmul ? 3u : 2u) ||
+      generic.getGrid().getShape() != ArrayRef<int64_t>({1, 1}) ||
+      generic.getOutputs().size() != 1 || (matmul && factors[2] != 1)) {
+    return "requires one core and a complete, unsplit K reduction";
+  }
+  auto outputShape = tiledShape(generic.getOutputs()[0]);
+  if (outputShape.size() != 2 || outputShape[0] != factors[0] ||
+      outputShape[1] != factors[1] || factors[0] <= 0 || factors[1] <= 0 ||
+      factors[0] > INT32_MAX / factors[1]) {
+    return "output blocking must cover the row-major tile grid exactly once";
+  }
+  SmallVector<affine::AffineForOp> loops;
+  Block *body = &generic.getRegion(0).front();
+  for (unsigned dim = 0; dim < factors.size(); ++dim) {
+    SmallVector<affine::AffineForOp> nested(
+        body->getOps<affine::AffineForOp>());
+    if (nested.size() != 1) {
+      return "requires one canonical loop per blocking dimension";
+    }
+    auto loop = nested.front();
+    auto bound = loop.getUpperBoundOperands();
+    auto factor = bound.size() == 1
+                      ? bound.front().getDefiningOp<GetBlockFactorOp>()
+                      : GetBlockFactorOp();
+    bool correctUpper =
+        loop.hasConstantUpperBound()
+            ? loop.getConstantUpperBound() == factors[dim]
+            : factor && factor.getDim() == dim &&
+                  loop.getUpperBoundMap() ==
+                      AffineMap::get(
+                          0, 1, getAffineSymbolExpr(0, generic.getContext()));
+    if (!loop.hasConstantLowerBound() || loop.getConstantLowerBound() != 0 ||
+        loop.getStep() != 1 || !correctUpper) {
+      return "incompatible blocking traversal: expected row, column, then full "
+             "K";
+    }
+    loops.push_back(loop);
+    body = loop.getBody();
+  }
+  SmallVector<RemoteLoadOp> loads;
+  SmallVector<RemoteStoreOp> stores;
+  SmallVector<linalg::GenericOp> computes;
+  generic.walk([&](RemoteLoadOp op) { loads.push_back(op); });
+  generic.walk([&](RemoteStoreOp op) { stores.push_back(op); });
+  generic.walk([&](linalg::GenericOp op) { computes.push_back(op); });
+  if (loads.size() != generic.getInputs().size() || stores.size() != 1 ||
+      computes.size() != 1 || stores.front()->getBlock() != body ||
+      computes.front()->getBlock() != body ||
+      !computes.front()->isBeforeInBlock(stores.front())) {
+    return "requires unconditional loads, one compute and one completed store "
+           "per tile";
+  }
+  auto compute = computes.front();
+  auto store = stores.front();
+  if (compute.getIndexingMapsArray() != generic.getIndexingMapsValue() ||
+      compute.getNumDpsInits() != 1 ||
+      static_cast<size_t>(compute.getNumDpsInputs()) !=
+          generic.getInputs().size() ||
+      store.getLocalBuffer() != compute.getDpsInits()[0] ||
+      cast<MemRefType>(store.getLocalBuffer().getType()).getShape() !=
+          ArrayRef<int64_t>({1, 1}) ||
+      store.getMemref() != generic.getOutputs()[0] ||
+      store.getIndices().size() != 2 ||
+      !isLoopIndex(store.getIndices()[0], loops[0], 0) ||
+      !isLoopIndex(store.getIndices()[1], loops[1], 1)) {
+    return "output store does not publish one complete row-major tile";
+  }
+  for (auto [id, input] : llvm::enumerate(generic.getInputs())) {
+    SmallVector<RemoteLoadOp> matching;
+    for (auto load : loads) {
+      if (load.getMemref() == input) {
+        matching.push_back(load);
+      }
+    }
+    if (matching.size() != 1) {
+      return "requires exactly one load per input and iteration";
+    }
+    auto load = matching.front();
+    unsigned rowDim = matmul && id == 1 ? 2 : 0;
+    unsigned colDim = matmul && id == 0 ? 2 : 1;
+    auto shape = tiledShape(input);
+    if (shape.size() != 2 || load->getBlock() != body ||
+        !load->isBeforeInBlock(compute) || load.getIndices().size() != 2 ||
+        !isLoopIndex(load.getIndices()[0], loops[rowDim], rowDim) ||
+        !isLoopIndex(load.getIndices()[1], loops[colDim], colDim)) {
+      return "input traversal does not match its tile/panel dependency";
+    }
+    SmallVector<int64_t> panel = {matmul && id == 1 ? shape[0] : 1,
+                                  matmul && id == 0 ? shape[1] : 1};
+    if (cast<MemRefType>(load.getLocalBuffer().getType()).getShape() !=
+            ArrayRef<int64_t>(panel) ||
+        load.getLocalBuffer() != compute.getDpsInputs()[id]) {
+      return "input blocking does not provide the complete tile or K panel";
+    }
+  }
+  return {};
+}
+
+static std::string collectReadyEdges(ArrayRef<GenericOp> stages,
+                                     SmallVectorImpl<ReadyEdge> &edges) {
+  for (auto [id, stageRef] : llvm::enumerate(stages)) {
+    GenericOp generic = stageRef;
+    if (auto reason = checkStageTraversal(generic); !reason.empty()) {
+      return "stage " + std::to_string(id) + ": " + reason;
+    }
     auto producers =
         generic->getAttrOfType<DenseI64ArrayAttr>(spatial_pipeline::inputs);
-    if (!stageId || stageId.getInt() != id || !core || !producers ||
-        static_cast<size_t>(producers.size()) != generic.getInputs().size() ||
-        generic.getOutputs().size() != 1 ||
-        generic.getBlockFactorsValue().size() != 2) {
-      return generic.emitOpError("invalid prepared spatial pipeline contract");
-    }
     for (auto [inputId, producerId] : llvm::enumerate(producers.asArrayRef())) {
       if (producerId == -1) {
         continue;
       }
-      if (producerId < 0 || producerId >= id) {
-        return generic.emitOpError(
-            "pipeline producer must precede its consumer");
-      }
       Value input = generic.getInputs()[inputId];
       GenericOp producer = stages[producerId];
-      if (storageRoot(input) != storageRoot(producer.getOutputs()[0]) ||
-          ttcore::getMemorySpace(input) != ttcore::MemorySpace::DeviceL1) {
-        return generic.emitOpError(
-            "pipeline edge must share the producer's L1 storage");
+      Value output = producer.getOutputs()[0];
+      auto shape = tiledShape(output);
+      bool wholeRow = generic.hasReduction();
+      if (!reblockRoot(input) || reblockRoot(input) != reblockRoot(output) ||
+          tiledShape(input) != shape ||
+          ttcore::getMemorySpace(input) != ttcore::MemorySpace::DeviceL1 ||
+          (wholeRow && inputId != 0)) {
+        return "edge does not preserve producer L1 tile coordinates";
       }
-      SmallVector<RemoteLoadOp> loads;
-      generic.walk([&](RemoteLoadOp load) {
-        if (load.getMemref() == input) {
-          loads.push_back(load);
+      RemoteLoadOp load;
+      generic.walk([&](RemoteLoadOp op) {
+        if (op.getMemref() == input) {
+          load = op;
         }
       });
-      if (loads.size() != 1 || loads.front().getIndices().size() != 2 ||
-          cast<MemRefType>(loads.front().getLocalBuffer().getType())
-                  .getNumElements() != 1) {
-        return generic.emitOpError(
-            "pipeline requires one single-tile remote load per internal input");
-      }
-      edges.push_back({static_cast<unsigned>(producerId), id, loads.front()});
+      edges.push_back({static_cast<unsigned>(producerId),
+                       static_cast<unsigned>(id), load, shape[1], wholeRow});
     }
   }
-  return success();
+  return {};
 }
 
-static void insertReadyWait(OpBuilder &builder, GenericOp consumer,
-                            RemoteLoadOp load, Value semaphore) {
+static void insertReadyWait(OpBuilder &builder, const ReadyEdge &edge,
+                            Value semaphore) {
+  RemoteLoadOp load = edge.load;
   builder.setInsertionPoint(load);
   auto indices = load.getIndices();
-  auto factors = consumer.getBlockFactorsValue();
   Value columns =
-      builder.create<arith::ConstantIndexOp>(load.getLoc(), factors[1]);
-  Value row = builder.create<arith::MulIOp>(load.getLoc(), indices[0], columns);
-  Value ordinal = builder.create<arith::AddIOp>(load.getLoc(), row, indices[1]);
+      builder.create<arith::ConstantIndexOp>(load.getLoc(), edge.columns);
   Value one = builder.create<arith::ConstantIndexOp>(load.getLoc(), 1);
-  Value count = builder.create<arith::AddIOp>(load.getLoc(), ordinal, one);
+  Value count;
+  if (edge.wholeRow) {
+    Value nextRow =
+        builder.create<arith::AddIOp>(load.getLoc(), indices[0], one);
+    count = builder.create<arith::MulIOp>(load.getLoc(), nextRow, columns);
+  } else {
+    Value row =
+        builder.create<arith::MulIOp>(load.getLoc(), indices[0], columns);
+    Value ordinal =
+        builder.create<arith::AddIOp>(load.getLoc(), row, indices[1]);
+    count = builder.create<arith::AddIOp>(load.getLoc(), ordinal, one);
+  }
   auto wait = builder.create<SemaphoreWaitOp>(load.getLoc(), semaphore, count);
   wait->setAttr(spatial_pipeline::wait, builder.getUnitAttr());
+}
+
+// Late fallback retains the already established layouts and placement. There
+// is no ready protocol to undo: the entire group is checked before mutation.
+static void materializeTemporalStages(ArrayRef<GenericOp> stages, bool dump) {
+  for (GenericOp stage : stages) {
+    OpBuilder builder(stage);
+    auto range = stage->getAttr(spatial_pipeline::core);
+    auto spatial = builder.create<SpatialOp>(
+        stage.getLoc(), TypeRange{}, stage.getInputs(), stage.getOutputs(),
+        builder.getArrayAttr({range}), 1);
+    for (StringRef attr : {spatial_pipeline::group, spatial_pipeline::stage,
+                           spatial_pipeline::core, spatial_pipeline::inputs,
+                           spatial_pipeline::signals}) {
+      stage->removeAttr(attr);
+    }
+    stage->setAttr(spatial_pipeline::noSpill, builder.getUnitAttr());
+    Block *body = builder.createBlock(&spatial.getRegions().front());
+    stage->moveBefore(body, body->end());
+    if (dump) {
+      llvm::errs() << "emitted temporal fallback ";
+      spatial.print(llvm::errs());
+      llvm::errs() << '\n';
+    }
+  }
 }
 
 class D2MMaterializeSpatialPipelines
@@ -168,7 +331,37 @@ public:
     llvm::SetVector<Value> inputs;
     SmallVector<Value> outputs;
     SmallVector<Attribute> ranges;
-    for (GenericOp stage : stages) {
+    auto device = ttcore::lookupDeviceOp(first);
+    if (!device) {
+      return first.emitOpError(
+          "prepared pipeline requires a registered device");
+    }
+    auto grid = device.getDeviceAttr().getWorkerGrid().getShape();
+    llvm::SetVector<Attribute> occupied;
+    for (auto [id, stageRef] : llvm::enumerate(stages)) {
+      GenericOp stage = stageRef;
+      auto stageId = stage->getAttrOfType<IntegerAttr>(spatial_pipeline::stage);
+      auto core =
+          stage->getAttrOfType<ttcore::CoreRangeAttr>(spatial_pipeline::core);
+      auto producers =
+          stage->getAttrOfType<DenseI64ArrayAttr>(spatial_pipeline::inputs);
+      if (!stageId || stageId.getInt() != static_cast<int64_t>(id) || !core ||
+          !producers ||
+          static_cast<size_t>(producers.size()) != stage.getInputs().size() ||
+          llvm::any_of(
+              producers.asArrayRef(),
+              [stageIndex = static_cast<int64_t>(id)](int64_t producer) {
+                return producer < -1 || producer >= stageIndex;
+              })) {
+        return stage.emitOpError("invalid prepared spatial pipeline contract");
+      }
+      auto start = core.getStartCoord();
+      if (grid.size() != 2 || start != core.getEndCoord() || start.getY() < 0 ||
+          start.getX() < 0 || start.getY() >= grid[0] ||
+          start.getX() >= grid[1] || !occupied.insert(core)) {
+        return stage.emitOpError(
+            "pipeline requires distinct legal single-core ranges");
+      }
       if (stage.getNumResults() || stage.getNumRegions() != 1) {
         return stage.emitOpError(
             "prepared spatial stage must be bufferized with one region");
@@ -184,15 +377,17 @@ public:
       outputs.append(stage.getOutputs().begin(), stage.getOutputs().end());
     }
     SmallVector<ReadyEdge> edges;
-    if (failed(collectReadyEdges(stages, edges))) {
-      return failure();
+    if (auto reason = collectReadyEdges(stages, edges); !reason.empty()) {
+      if (dumpRegions) {
+        llvm::errs() << "pipeline traversal fallback: " << reason << '\n';
+      }
+      materializeTemporalStages(stages, dumpRegions);
+      return success();
     }
     for (Operation *prep : preparations) {
       prep->moveBefore(first);
     }
     builder.setInsertionPoint(first);
-    auto device = ttcore::lookupDeviceOp(first);
-    auto grid = device.getDeviceAttr().getWorkerGrid().getShape();
     Type uint32 = IntegerType::get(&getContext(), 32, IntegerType::Unsigned);
     auto memory = ttcore::MemorySpaceAttr::get(&getContext(),
                                                ttcore::MemorySpace::DeviceL1);
@@ -223,7 +418,7 @@ public:
           cast<ttcore::CoreRangeAttr>(ranges[producerId]).getStartCoord();
       signals[producerId].push_back(builder.getDenseI64ArrayAttr(
           {index, core.getY() - origin.getY(), core.getX() - origin.getX()}));
-      insertReadyWait(builder, consumer, edge.load, sem);
+      insertReadyWait(builder, edge, sem);
     }
     for (auto [i, stage] : llvm::enumerate(stages)) {
       stage->setAttr(spatial_pipeline::signals,
