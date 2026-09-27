@@ -183,10 +183,8 @@ static std::string checkPipelineCandidate(
       StringRef name = op->getName().getStringRef();
       if (name.starts_with("d2m.tile_")) {
         ++computeCount;
-        unsupported |= matmul ? name != "d2m.tile_matmul"
-                              : name != "d2m.tile_add" &&
-                                    name != "d2m.tile_relu" &&
-                                    name != "d2m.tile_negative";
+        unsupported |= matmul ? !isa<TileMatmulOp>(op)
+                              : !isa<TileAddOp, TileReluOp, TileNegativeOp>(op);
       }
     });
     if (unsupported || computeCount != 1 ||

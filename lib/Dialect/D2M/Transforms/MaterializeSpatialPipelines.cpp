@@ -95,7 +95,9 @@ static bool isLoopIndex(Value value, affine::AffineForOp loop, unsigned dim) {
 // Prove the standard loop nest, rather than inferring traversal from shape.
 // K has exactly one outer iteration: the linalg body computes the full panel
 // reduction before the one output store and therefore before any notification.
-static std::string checkStageTraversal(GenericOp generic) {
+static std::string
+checkStageTraversal(GenericOp generic,
+                    SmallVectorImpl<RemoteLoadOp> &inputLoads) {
   auto factors = generic.getBlockFactorsValue();
   bool matmul = generic.hasReduction();
   if (factors.size() != (matmul ? 3u : 2u) ||
@@ -166,16 +168,13 @@ static std::string checkStageTraversal(GenericOp generic) {
     return "output store does not publish one complete row-major tile";
   }
   for (auto [id, input] : llvm::enumerate(generic.getInputs())) {
-    SmallVector<RemoteLoadOp> matching;
-    for (auto load : loads) {
-      if (load.getMemref() == input) {
-        matching.push_back(load);
-      }
-    }
-    if (matching.size() != 1) {
+    auto matchesInput = [operand = input](RemoteLoadOp load) {
+      return load.getMemref() == operand;
+    };
+    if (llvm::count_if(loads, matchesInput) != 1) {
       return "requires exactly one load per input and iteration";
     }
-    auto load = matching.front();
+    RemoteLoadOp load = *llvm::find_if(loads, matchesInput);
     unsigned rowDim = matmul && id == 1 ? 2 : 0;
     unsigned colDim = matmul && id == 0 ? 2 : 1;
     auto shape = tiledShape(input);
@@ -192,6 +191,7 @@ static std::string checkStageTraversal(GenericOp generic) {
         load.getLocalBuffer() != compute.getDpsInputs()[id]) {
       return "input blocking does not provide the complete tile or K panel";
     }
+    inputLoads.push_back(load);
   }
   return {};
 }
@@ -200,7 +200,10 @@ static std::string collectReadyEdges(ArrayRef<GenericOp> stages,
                                      SmallVectorImpl<ReadyEdge> &edges) {
   for (auto [id, stageRef] : llvm::enumerate(stages)) {
     GenericOp generic = stageRef;
-    if (auto reason = checkStageTraversal(generic); !reason.empty()) {
+    // Reuse the validated loads in operand order when constructing edges.
+    SmallVector<RemoteLoadOp> inputLoads;
+    if (auto reason = checkStageTraversal(generic, inputLoads);
+        !reason.empty()) {
       return "stage " + std::to_string(id) + ": " + reason;
     }
     auto producers =
@@ -214,20 +217,15 @@ static std::string collectReadyEdges(ArrayRef<GenericOp> stages,
       Value output = producer.getOutputs()[0];
       auto shape = tiledShape(output);
       bool wholeRow = generic.hasReduction();
-      if (!reblockRoot(input) || reblockRoot(input) != reblockRoot(output) ||
-          tiledShape(input) != shape ||
+      Value root = reblockRoot(input);
+      if (!root || root != reblockRoot(output) || tiledShape(input) != shape ||
           ttcore::getMemorySpace(input) != ttcore::MemorySpace::DeviceL1 ||
           (wholeRow && inputId != 0)) {
         return "edge does not preserve producer L1 tile coordinates";
       }
-      RemoteLoadOp load;
-      generic.walk([&](RemoteLoadOp op) {
-        if (op.getMemref() == input) {
-          load = op;
-        }
-      });
       edges.push_back({static_cast<unsigned>(producerId),
-                       static_cast<unsigned>(id), load, shape[1], wholeRow});
+                       static_cast<unsigned>(id), inputLoads[inputId], shape[1],
+                       wholeRow});
     }
   }
   return {};

@@ -125,9 +125,7 @@ def execute(args):
         )
     if args.case == "gemm_rect":
         shapes = [(64, 96), (96, 128), (128, 96)]
-    elif args.case == "gemm_chain":
-        shapes = [(64, 64)] * 3
-    elif args.case == "mixed":
+    elif args.case in ("gemm_chain", "mixed"):
         shapes = [(64, 64)] * 3
     elif args.case == "elementwise_rect":
         shapes = [(64, 96)] * 2
@@ -344,26 +342,18 @@ def main():
                 timeout=timeout,
             )
 
-    worker = [
-        sys.executable,
-        str(Path(__file__).resolve()),
-        "--case",
-        args.case,
-        "--source",
-        str(args.source),
-        "--compiler",
-        str(args.compiler),
-        "--translate",
-        str(args.translate),
-        "--metal-home",
-        str(args.metal_home),
-        "--device",
-        args.device,
-        "--output",
-        str(args.output),
-        "--runs",
-        str(args.runs),
-    ]
+    worker = [sys.executable, str(Path(__file__).resolve())]
+    for option in (
+        "case",
+        "source",
+        "compiler",
+        "translate",
+        "metal_home",
+        "device",
+        "output",
+        "runs",
+    ):
+        worker.extend(["--" + option.replace("_", "-"), str(getattr(args, option))])
     run("query", [*worker, "--worker", "query"])
     descriptor = args.output / "device.ttsys"
     manifest["descriptor_sha256"] = digest(descriptor)
