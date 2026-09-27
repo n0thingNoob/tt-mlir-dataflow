@@ -2830,8 +2830,12 @@ def TTNN_SDPAForwardOp : TTNN_Op<"sdpa_fw"> {
       is set, also returns the per-row log-sum-exp intermediates used by the
       backward pass.
 
-      All tensors are rank 4 `(B, H, S, D)`. `attention_mask` is only valid when
-      `mask_type` is `arbitrary`.
+      All tensors are rank 4 `(B, H, S, D)`. The sequence dimension `S` of Q,
+      K and V must be a multiple of `TILE_HEIGHT`, and the head dimension `D`
+      of Q and K must be a multiple of `TILE_WIDTH`. V's head dimension may be
+      unaligned because the backing operation supports a different V dimension.
+
+      `attention_mask` is only valid when `mask_type` is `arbitrary`.
     }];
 
     let arguments = (ins AnyRankedTensor:$query,
@@ -2863,8 +2867,12 @@ def TTNN_SDPABackwardOp : TTNN_Op<"sdpa_bw"> {
       and the forward pass tensors (output, Q, K, V and log-sum-exp
       intermediates), computes the gradients w.r.t. query, key and value.
 
-      All tensors are rank 4 `(B, H, S, D)`. `attention_mask` is only valid when
-      `mask_type` is `arbitrary`.
+      All tensors are rank 4 `(B, H, S, D)`. The sequence dimension `S` of Q,
+      K and V must be a multiple of `TILE_HEIGHT`, and the head dimension `D`
+      of Q and K must be a multiple of `TILE_WIDTH`. V's head dimension may be
+      unaligned because the backing operation supports a different V dimension.
+
+      `attention_mask` is only valid when `mask_type` is `arbitrary`.
 
       `dropout_probability` must be 0.0. Dropout is not implemented in the
       backward pass, so a nonzero value would silently produce the gradients of
@@ -4742,6 +4750,49 @@ def TTNN_FlashMlaPrefillOp : TTNN_Op<"flash_mla_prefill", [AttrSizedOperandSegme
         return wa::TTNNOperandsWorkaroundsFactory::createFlashMlaPrefillOpOperandsWorkarounds(getOperation());
       }
     }];
+
+    let hasVerifier = 1;
+}
+
+def TTNN_ChunkGatedDeltaRuleOp : TTNN_Op<"chunk_gated_delta_rule",
+    [AttrSizedOperandSegments, TTNN_ComputeKernelConfigOpInterface, OpModelExempt]> {
+    let summary = "Chunked gated delta rule forward operation.";
+    let description = [{
+      Implements the chunked gated delta rule used by gated linear attention
+      models. Mirrors `ttnn::transformer::chunk_gated_delta_rule`.
+
+      `query` and `key` are `[B, T, H, K]`, `value` is `[B, T, HV, V]`,
+      and `g` and `beta` are `[B, T, HV]`. The operation also accepts the
+      flat rank-3 Q/K/V representation supported by tt-metal. `initial_state`
+      is `[B, HV, K, V]`.
+
+      The default output is token-major `[B, T, HV, V]`. When
+      `output_head_major` is true it is `[B * HV, T, V]`. `final_state` is
+      present exactly when `output_final_state` is true. The four optional
+      constant tensors (`eye`, `tril`, `ones`, and `masks`) must either all be
+      supplied or all be absent.
+    }];
+
+    let arguments = (ins AnyRankedTensor:$query,
+                         AnyRankedTensor:$key,
+                         AnyRankedTensor:$value,
+                         AnyRankedTensor:$g,
+                         AnyRankedTensor:$beta,
+                         Optional<AnyRankedTensor>:$initial_state,
+                         Optional<AnyRankedTensor>:$eye,
+                         Optional<AnyRankedTensor>:$tril,
+                         Optional<AnyRankedTensor>:$ones,
+                         Optional<AnyRankedTensor>:$masks,
+                         OptionalAttr<F32Attr>:$scale,
+                         DefaultValuedAttr<BoolAttr, "false">:$output_final_state,
+                         DefaultValuedAttr<UI32Attr, "64">:$chunk_size,
+                         DefaultValuedAttr<BoolAttr, "false">:$use_qk_l2norm,
+                         DefaultValuedAttr<BoolAttr, "false">:$output_head_major,
+                         OptionalAttr<TTNN_MemoryConfigAttr>:$memory_config,
+                         OptionalAttr<TTNN_DeviceComputeKernelConfig>:$compute_config);
+
+    let results = (outs AnyRankedTensor:$output,
+                        Optional<AnyRankedTensor>:$final_state);
 
     let hasVerifier = 1;
 }

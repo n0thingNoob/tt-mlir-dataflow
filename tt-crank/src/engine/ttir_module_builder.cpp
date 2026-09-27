@@ -17,7 +17,9 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/MLIRContext.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/Support/LLVM.h"
+#include "ttmlir/Dialect/TTCore/IR/TTCoreOps.h"
 #include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h"
 #include "ttmlir/Dialect/TTIR/IR/TTIROps.h"
 #include "llvm/ADT/APFloat.h"
@@ -110,6 +112,25 @@ ModuleBuilder ModuleBuilder::init(llvm::ArrayRef<TensorTypeSpec> inputs,
 
     return ModuleBuilder(mlir::OwningOpRef<mlir::ModuleOp>(module_op), func, std::move(body_builder), loc,
                          std::move(args));
+}
+
+llvm::SmallVector<mlir::Value> ModuleBuilder::create_composite(llvm::StringRef name, llvm::ArrayRef<mlir::Value> inputs,
+                                                               llvm::ArrayRef<mlir::Type> result_types,
+                                                               llvm::ArrayRef<mlir::NamedAttribute> attributes,
+                                                               CompositeDecomposition decomposition) {
+    auto func = mlir::func::FuncOp::create(loc_, (name + "_decomposition").str(),
+                                           builder_.getFunctionType(mlir::ValueRange(inputs).getTypes(), result_types));
+    func.setPrivate();
+    mlir::SymbolTable(*module_op_).insert(func);
+    {
+        mlir::OpBuilder::InsertionGuard guard(builder_);
+        builder_.setInsertionPointToStart(func.addEntryBlock());
+        builder_.create<mlir::func::ReturnOp>(loc_, mlir::ValueRange(decomposition(*this, func.getArguments())));
+    }
+    auto op = create<mlir::tt::ttcore::CompositeOp>(result_types, inputs, builder_.getStringAttr(name),
+                                                    mlir::FlatSymbolRefAttr::get(func),
+                                                    builder_.getDictionaryAttr(attributes));
+    return llvm::SmallVector<mlir::Value>(op.getResults().begin(), op.getResults().end());
 }
 
 mlir::OwningOpRef<mlir::ModuleOp> ModuleBuilder::finalize(llvm::ArrayRef<mlir::Value> outputs) && {
@@ -1633,6 +1654,35 @@ mlir::Value build_conv3d(ModuleBuilder &mb, mlir::Value input, mlir::Value weigh
 
     // NDHWC[N,D_out,H_out,W_out,C_out] → NCDHW[N,C_out,D_out,H_out,W_out]
     return build_permute(mb, ndhwc_result, {0, 4, 1, 2, 3});
+}
+
+mlir::Value build_addcdiv(ModuleBuilder &mb, mlir::Value input, mlir::Value tensor1, mlir::Value tensor2,
+                          double value) {
+    auto div = build_div(mb, tensor1, tensor2);
+    mlir::Value scaled = div;
+    if (value != 1.0) {
+        scaled = scale_tensor(mb, div, value);
+    }
+    return build_add(mb, input, scaled);
+}
+
+mlir::Value build_addcmul(ModuleBuilder &mb, mlir::Value input, mlir::Value tensor1, mlir::Value tensor2,
+                          double value) {
+    auto prod = build_mul(mb, tensor1, tensor2);
+    mlir::Value scaled = prod;
+    if (value != 1.0) {
+        scaled = scale_tensor(mb, prod, value);
+    }
+    return build_add(mb, input, scaled);
+}
+
+mlir::Value build_lerp(ModuleBuilder &mb, mlir::Value input, mlir::Value end, double weight) {
+    auto diff = build_sub(mb, end, input);
+    mlir::Value scaled = diff;
+    if (weight != 1.0) {
+        scaled = scale_tensor(mb, diff, weight);
+    }
+    return build_add(mb, input, scaled);
 }
 
 } // namespace tt::crank
