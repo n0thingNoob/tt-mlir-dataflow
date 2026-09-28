@@ -770,6 +770,16 @@ def D2MGridSelection: Pass<"d2m-grid-selection", "::mlir::ModuleOp"> {
   }];
   let dependentDialects = ["::mlir::tt::d2m::D2MDialect", "::mlir::tt::ttcore::TTCoreDialect"];
   let options = [
+    Option<"spatialPipelineMaxShards", "spatial-pipeline-max-shards", "int64_t", "0",
+        "Maximum equal M shards per pipeline stage; zero uses the device budget.">,
+    Option<"dumpSpatialPlanning", "dump-spatial-planning", "bool", "false",
+        "Print region-wide pipeline grid decisions and resource rejections.">,
+    ListOption<"availableL1AddrRange", "available-l1-addr-range", "int64_t",
+        "L1 address range shared with allocation.">,
+    Option<"testAssumeL1Capacity", "test-assume-l1-capacity", "int64_t", "0",
+        "Override usable L1 capacity for testing.">,
+    Option<"numStreamBuffers", "num-stream-buffers", "unsigned", "2",
+        "Number of streaming buffers reserved per pipeline operand.">,
     ListOption<"overrideDeviceShape", "override-device-shape", "int64_t",
         "Override the device shape for grid optimization.">,
     Option<"ttnnMode", "ttnn-mode", "bool", /*default=*/"false",

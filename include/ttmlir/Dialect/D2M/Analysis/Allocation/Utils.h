@@ -47,6 +47,25 @@ inline llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
 //===---------------------------------------------------------------------===//
 namespace mlir::tt::d2m::allocation {
 
+// Shared by grid feasibility and the final allocator. The test-only capacity
+// override intentionally permits synthetic capacities larger than the device.
+inline std::pair<int64_t, int64_t> getL1AddressBounds(ttcore::ChipDescAttr chip,
+                                                      ArrayRef<int64_t> range,
+                                                      int64_t capacity) {
+  TT_assertv((range.empty() || range.size() == 2),
+             "Expected two L1 address bounds");
+  TT_assertv((range.empty() || capacity == 0),
+             "Cannot override both L1 address range and capacity");
+  int64_t base = range.empty() ? chip.getL1UnreservedBase() : range[0];
+  int64_t limit = range.empty()
+                      ? (capacity > 0 ? base + capacity : chip.getL1Size())
+                      : range[1];
+  TT_assertv((base >= chip.getL1UnreservedBase() && limit >= base &&
+              (capacity > 0 || limit <= chip.getL1Size())),
+             "Invalid L1 address bounds");
+  return {base, limit};
+}
+
 inline bool debugEnabled() {
   return (llvm::DebugFlag &&
           ttmlir::isLogLevelEnabled(ttmlir::LogLevel::Debug));

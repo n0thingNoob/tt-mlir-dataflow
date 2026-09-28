@@ -127,22 +127,18 @@ static bool hasCanonicalPipelineIndexing(GenericOp generic) {
   return maps == expected;
 }
 
-// A legality check only: no scores or alternative mapping search. The memory
-// bound intentionally overestimates concurrent storage for this first policy.
+// Structural legality only. GridSelection chooses sharding and checks the
+// complete region resource budget after membership is established.
 static std::string checkPipelineCandidate(
     const SpatialGenericDAG &dag, const RegionCandidate &candidate,
-    ArrayRef<int64_t> shape, ttcore::ChipDescAttr chip,
     DominanceInfo &dominance, llvm::SetVector<Operation *> &preparations) {
   std::string rejection;
-  uint64_t bytes = 0;
-  unsigned cbCount = 0;
   llvm::SmallPtrSet<Operation *, 8> destinations;
   GenericOp anchor = dag.nodes[candidate.members.front()].generic;
   for (unsigned id : candidate.members) {
     GenericOp g = dag.nodes[id].generic;
     bool matmul = g.getNumDims() == 3 && g.hasReduction();
     if (g.getNumResults() != 1 || !hasCanonicalPipelineIndexing(g) ||
-        g.getGrid().getShape() != ArrayRef<int64_t>({1, 1}) ||
         !llvm::all_of(dag.nodes[id].captures, [&](Value v) {
           return llvm::is_contained(g->getOperands(), v);
         })) {
@@ -192,16 +188,6 @@ static std::string checkPipelineCandidate(
       rejection = "unsupported compute or destination alias";
       break;
     }
-    // Conservatively reserve all full tensors plus CBs and
-    // semaphore/alignment overhead on every core. Allocation performs the
-    // final address check.
-    cbCount += g.getInputs().size() + g.getOutputs().size();
-    // Full tensors also bound the size of the GEMM panels. Include two
-    // additional copies for CB storage, plus alignment/semaphore headroom.
-    for (Type operandType : g->getOperandTypes()) {
-      bytes += cast<RankedTensorType>(operandType).getNumElements() * 2048 * 3;
-    }
-    bytes += 65536;
     for (Value operand : g->getOperands()) {
       const auto *edge =
           llvm::find_if(dag.dependencies, [&](const SpatialDependency &d) {
@@ -245,15 +231,6 @@ static std::string checkPipelineCandidate(
       break;
     }
   }
-  if (candidate.members.size() > static_cast<uint64_t>(shape[0] * shape[1])) {
-    rejection = "insufficient worker cores";
-  }
-  if (bytes > chip.getL1Size() - chip.getL1UnreservedBase()) {
-    rejection = "full tensors and conservative CB reservation exceed L1";
-  }
-  if (cbCount > chip.getNumCBs()) {
-    rejection = "insufficient circular buffer ports for one program";
-  }
   return rejection;
 }
 
@@ -275,7 +252,6 @@ static void prepareSpatialPipeline(const SpatialGenericDAG &dag,
     generic->setAttr(spatial_pipeline::group,
                      builder.getI64IntegerAttr(group.members.front()));
     generic->setAttr(spatial_pipeline::stage, builder.getI64IntegerAttr(stage));
-    generic->setAttr(spatial_pipeline::core, group.ranges[stage]);
     SmallVector<int64_t> producers(generic.getInputs().size(), -1);
     for (const auto &edge : dag.dependencies) {
       if (edge.consumer != id || !edge.producer ||
@@ -302,8 +278,7 @@ static void prepareSpatialPipeline(const SpatialGenericDAG &dag,
     llvm::errs() << "selected pipeline members=[";
     llvm::interleaveComma(group.members, llvm::errs(),
                           [](unsigned id) { llvm::errs() << "G" << id; });
-    llvm::errs() << "] internal=L1->NoC->L1 ranges="
-                 << builder.getArrayAttr(group.ranges) << '\n';
+    llvm::errs() << "] internal=L1->NoC->L1 placement=deferred\n";
   }
 }
 
@@ -365,8 +340,6 @@ selectSpatialGroups(const SpatializationAnalysisResult &analysis, bool dump,
   llvm::BitVector covered(dag.nodes.size());
   DominanceInfo dominance;
   if (pipelines) {
-    auto system = ttcore::getCurrentScopeSystemDesc(first);
-    auto chip = system.getChipDescs().front();
     for (auto [candidateId, candidate] : llvm::enumerate(analysis.candidates)) {
       if (!llvm::is_contained(candidate.kinds,
                               RegionCandidateKind::ProducerConsumerChain) &&
@@ -378,8 +351,8 @@ selectSpatialGroups(const SpatializationAnalysisResult &analysis, bool dump,
         continue;
       }
       llvm::SetVector<Operation *> preparations;
-      std::string rejection = checkPipelineCandidate(
-          dag, candidate, shape, chip, dominance, preparations);
+      std::string rejection =
+          checkPipelineCandidate(dag, candidate, dominance, preparations);
       if (!rejection.empty()) {
         if (dump) {
           llvm::errs() << "  pipeline fallback R" << candidateId << ": "
@@ -391,9 +364,7 @@ selectSpatialGroups(const SpatializationAnalysisResult &analysis, bool dump,
       group.pipeline = true;
       group.members = candidate.members;
       group.preparations.assign(preparations.begin(), preparations.end());
-      for (auto [stage, id] : llvm::enumerate(group.members)) {
-        group.ranges.push_back(range(first.getContext(), stage / shape[1],
-                                     stage % shape[1], 1, 1));
+      for (unsigned id : group.members) {
         covered.set(id);
       }
       usedCandidates.set(candidateId);

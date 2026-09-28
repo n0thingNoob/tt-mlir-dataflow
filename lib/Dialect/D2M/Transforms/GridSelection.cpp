@@ -4,14 +4,17 @@
 
 #include "ttmlir/Dialect/D2M/Transforms/Passes.h"
 
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "ttmlir/AffineMapUtils.h"
 #include "ttmlir/Asserts.h"
+#include "ttmlir/Dialect/D2M/Analysis/Allocation/Utils.h"
 #include "ttmlir/Dialect/D2M/Analysis/BlockFactorAnalysis.h"
 #include "ttmlir/Dialect/D2M/Analysis/GridAnalysis.h"
 #include "ttmlir/Dialect/D2M/Analysis/TopKShardingStrategy.h"
 #include "ttmlir/Dialect/D2M/IR/D2MGenericRegionOps.h"
 #include "ttmlir/Dialect/D2M/Utils/GridSelectionUtils.h"
 #include "ttmlir/Dialect/D2M/Utils/SpatialOpNormalizeUtil.h"
+#include "ttmlir/Dialect/D2M/Utils/SpatialPipeline.h"
 #include "ttmlir/Dialect/D2M/Utils/TopKUtils.h"
 #include "ttmlir/Dialect/D2M/Utils/Utils.h"
 #include "ttmlir/Dialect/D2M/Utils/VirtualGrid.h"
@@ -20,6 +23,7 @@
 #include "ttmlir/Dialect/TTCore/IR/Utils.h"
 #include "ttmlir/Dialect/TTIR/IR/TTIROps.h"
 #include "ttmlir/Utils.h"
+#include "llvm/ADT/MapVector.h"
 
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Builders.h"
@@ -776,9 +780,10 @@ static LogicalResult applyGridDecisions(d2m::GenericOp genericOp,
                                builder);
       break;
     case Kind::ToLayout:
-      applyToLayoutUpdate(
-          info, effectiveTargetGridRange, ttnnMode, builder,
-          llvm::is_contained(genericOp.getOutputs(), info.getLiveOperand()));
+      applyToLayoutUpdate(info, effectiveTargetGridRange, ttnnMode, builder,
+                          genericOp->hasAttr(spatial_pipeline::shards) ||
+                              llvm::is_contained(genericOp.getOutputs(),
+                                                 info.getLiveOperand()));
       break;
     case Kind::Mask:
       applyMaskUpdate(info, effectiveTargetGridRange, ttnnMode, builder);
@@ -942,10 +947,23 @@ public:
     // ttnn.empty() call. This can be removed only when we implement support
     // for creating padded tensors in D2MToTTNN pass.
     this->ttnnMode = options.ttnnMode;
+    spatialPipelineMaxShards = options.spatialPipelineMaxShards;
+    dumpSpatialPlanning = options.dumpSpatialPlanning;
+    availableL1AddrRange = options.availableL1AddrRange;
+    testAssumeL1Capacity = options.testAssumeL1Capacity;
+    numStreamBuffers = options.numStreamBuffers;
   }
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
+
+    if (spatialPipelineMaxShards < 0) {
+      module.emitError("spatial-pipeline-max-shards must be nonnegative");
+      return signalPassFailure();
+    }
+    if (failed(selectPipelineGrids(module))) {
+      return signalPassFailure();
+    }
 
     // Phase 1: Analyze all generics (no IR mutation).
     GridAnalysis gridAnalysis(module, getDeviceGridShape(), this->ttnnMode);
@@ -974,6 +992,251 @@ public:
   }
 
 private:
+  // All stages use identical rectangles, packed row-major. The search is
+  // deliberately deterministic and checks shape, not only total core count.
+  SmallVector<Attribute> placePipeline(int64_t p, int64_t stages,
+                                       ArrayRef<int64_t> deviceShape) {
+    SmallVector<Attribute> ranges;
+    auto *ctx = &getContext();
+    for (int64_t h = 1; h <= deviceShape[0] && h <= p; ++h) {
+      if (p % h) {
+        continue;
+      }
+      int64_t w = p / h;
+      if (w > deviceShape[1] ||
+          (deviceShape[0] / h) * (deviceShape[1] / w) < stages) {
+        continue;
+      }
+      for (int64_t i = 0; i < stages; ++i) {
+        int64_t y = i / (deviceShape[1] / w) * h;
+        int64_t x = i % (deviceShape[1] / w) * w;
+        ranges.push_back(ttcore::CoreRangeAttr::get(
+            ctx, ttcore::CoreCoordAttr::get(ctx, y, x),
+            ttcore::CoreCoordAttr::get(ctx, y + h - 1, x + w - 1)));
+      }
+      break;
+    }
+    return ranges;
+  }
+
+  static SmallVector<int64_t> pipelineShape(Value value) {
+    auto type = cast<RankedTensorType>(value.getType());
+    auto shape =
+        cast<ttcore::MetalLayoutAttr>(type.getEncoding()).getLogicalShape();
+    return {shape[0] / 32, shape[1] / 32};
+  }
+
+  static Value pipelineBacking(Value value) {
+    while (true) {
+      if (auto view = value.getDefiningOp<ViewLayoutOp>()) {
+        value = view.getInput();
+      } else if (auto layout = value.getDefiningOp<ToLayoutOp>()) {
+        value = layout.getOutput();
+      } else if (auto generic = value.getDefiningOp<GenericOp>()) {
+        value = generic.getOutputs()[cast<OpResult>(value).getResultNumber()];
+      } else {
+        return value;
+      }
+    }
+  }
+
+  // Bound the existing common-address L1 allocator as well as each worker.
+  // Summing each allocation's largest shard is conservative across disjoint
+  // ranges, but never assumes unsupported per-core address reuse. Full operand
+  // sizes also bound the tile/panel buffers used by reblocking.
+  std::string checkPipelineResources(ArrayRef<GenericOp> stages, int64_t p,
+                                     ttcore::ChipDescAttr chip,
+                                     int64_t capacity) {
+    uint64_t bytes = 0;
+    uint64_t ports = 0;
+    const uint64_t alignment = chip.getNocL1AddressAlignBytes();
+    llvm::SmallDenseSet<Value> counted;
+    for (GenericOp stage : stages) {
+      auto producers =
+          stage->getAttrOfType<DenseI64ArrayAttr>(spatial_pipeline::inputs);
+      for (auto [index, operand] :
+           llvm::enumerate(stage.getInputsAndOutputs())) {
+        auto shape = pipelineShape(operand);
+        bool rhs = stage.hasReduction() && index == 1;
+        uint64_t tiles = shape[0] * shape[1] / (rhs ? 1 : p);
+        uint64_t size = llvm::alignTo(tiles * 2048, alignment);
+        // Internal inputs share their producer's backing allocation.
+        bool internal = index < static_cast<size_t>(producers.size()) &&
+                        producers[index] >= 0;
+        if (!internal && counted.insert(pipelineBacking(operand)).second) {
+          bytes += size;
+        }
+        bytes += size * numStreamBuffers;
+        ++ports;
+        if (internal) {
+          bytes += alignment;
+        }
+      }
+      // Keep baseline headroom for scratch, views and allocator alignment.
+      bytes += 65536;
+    }
+    // Other stages/programs may leave tensors live across this region. Charge
+    // their complete backing storage as well; do not assume program boundaries
+    // free tensors or permit overlapping L1 addresses.
+    auto func = stages.front()->getParentOfType<func::FuncOp>();
+    func.walk([&](GenericOp other) {
+      if (llvm::is_contained(stages, other)) {
+        return;
+      }
+      for (Value operand : other.getInputsAndOutputs()) {
+        Value root = pipelineBacking(operand);
+        auto type = dyn_cast<RankedTensorType>(root.getType());
+        if (!type || !type.hasStaticShape() || !counted.insert(root).second) {
+          continue;
+        }
+        auto layout =
+            dyn_cast_or_null<ttcore::MetalLayoutAttr>(type.getEncoding());
+        if (!layout ||
+            layout.getMemorySpace() != ttcore::MemorySpace::DeviceL1) {
+          continue;
+        }
+        auto tile = dyn_cast<ttcore::TileType>(type.getElementType());
+        uint64_t elementBytes = tile ? tile.getSizeBytes()
+                                     : (type.getElementTypeBitWidth() + 7) / 8;
+        bytes += llvm::alignTo(type.getNumElements() * elementBytes, alignment);
+      }
+    });
+    if (ports > chip.getNumCBs()) {
+      return "insufficient circular buffer ports for one program";
+    }
+    if (bytes > static_cast<uint64_t>(capacity)) {
+      return "pipeline tensors, full RHS and CB reservation exceed L1";
+    }
+    return {};
+  }
+
+  LogicalResult selectPipelineGrids(ModuleOp module) {
+    auto shape = getDeviceGridShape();
+    auto workerShape = ttcore::lookupDevice(module).getWorkerGrid().getShape();
+    if (shape.size() != 2 || shape[0] <= 0 || shape[1] <= 0) {
+      return module.emitError(
+          "pipeline selection requires a positive 2D worker grid");
+    }
+    // Overrides can restrict pipeline resources, never create workers outside
+    // the descriptor's actual device grid.
+    for (unsigned dim = 0; dim < 2; ++dim) {
+      shape[dim] = std::min(shape[dim], workerShape[dim]);
+    }
+    auto chip = ttcore::getCurrentScopeSystemDesc(module).getChipDesc(0);
+    auto [base, limit] = allocation::getL1AddressBounds(
+        chip, llvm::to_vector(availableL1AddrRange), testAssumeL1Capacity);
+    OpBuilder builder(module);
+    for (auto func : module.getOps<func::FuncOp>()) {
+      if (auto expected = func->getAttrOfType<IntegerAttr>(
+              spatial_pipeline::expectedStages)) {
+        int64_t actual = 0;
+        for (Block &block : func.getBody()) {
+          for (auto stage : block.getOps<GenericOp>()) {
+            actual += stage->hasAttr(spatial_pipeline::group);
+          }
+        }
+        if (actual != expected.getInt()) {
+          return func.emitOpError(
+              "prepared pipeline stages were lost before grid selection");
+        }
+      }
+      int64_t selectedStages = 0;
+      for (Block &block : func.getBody()) {
+        llvm::MapVector<int64_t, SmallVector<GenericOp>> groups;
+        for (auto stage : block.getOps<GenericOp>()) {
+          if (auto group =
+                  stage->getAttrOfType<IntegerAttr>(spatial_pipeline::group)) {
+            groups[group.getInt()].push_back(stage);
+          }
+        }
+        for (auto &[id, stages] : groups) {
+          for (auto [index, stage] : llvm::enumerate(stages)) {
+            auto stageId =
+                stage->getAttrOfType<IntegerAttr>(spatial_pipeline::stage);
+            auto inputs = stage->getAttrOfType<DenseI64ArrayAttr>(
+                spatial_pipeline::inputs);
+            if (!stageId || stageId.getInt() != static_cast<int64_t>(index) ||
+                !inputs ||
+                static_cast<size_t>(inputs.size()) !=
+                    stage.getInputs().size() ||
+                llvm::any_of(inputs.asArrayRef(),
+                             [stageIndex = static_cast<int64_t>(index)](
+                                 int64_t producer) {
+                               return producer < -1 || producer >= stageIndex;
+                             })) {
+              return stage.emitOpError(
+                  "invalid prepared spatial pipeline contract");
+            }
+          }
+          int64_t rows = pipelineShape(stages.front().getOutputs()[0])[0];
+          int64_t upper =
+              std::min<int64_t>(rows, shape[0] * shape[1] / stages.size());
+          if (spatialPipelineMaxShards) {
+            upper = std::min<int64_t>(upper, spatialPipelineMaxShards);
+          }
+          SmallVector<Attribute> ranges;
+          int64_t chosen = 0;
+          std::string reason = "insufficient worker cores";
+          for (int64_t p = upper; p >= 1; --p) {
+            if (rows % p) {
+              continue;
+            }
+            bool compatible = llvm::all_of(stages, [&](GenericOp stage) {
+              return pipelineShape(stage.getOutputs()[0])[0] == rows;
+            });
+            if (!compatible) {
+              reason = "incompatible M shard boundaries";
+              break;
+            }
+            ranges = placePipeline(p, stages.size(), shape);
+            reason = ranges.empty() ? "stage rectangles do not fit worker grid"
+                                    : checkPipelineResources(stages, p, chip,
+                                                             limit - base);
+            if (reason.empty()) {
+              chosen = p;
+              break;
+            }
+            if (dumpSpatialPlanning) {
+              llvm::errs() << "pipeline grid G" << id << " reject P=" << p
+                           << ": " << reason << '\n';
+            }
+          }
+          for (auto [index, stage] : llvm::enumerate(stages)) {
+            if (chosen) {
+              stage->setAttr(spatial_pipeline::shards,
+                             builder.getI64IntegerAttr(chosen));
+              stage->setAttr(spatial_pipeline::core, ranges[index]);
+              ++selectedStages;
+            } else {
+              for (StringRef attr :
+                   {spatial_pipeline::group, spatial_pipeline::stage,
+                    spatial_pipeline::inputs, spatial_pipeline::core,
+                    spatial_pipeline::shards}) {
+                stage->removeAttr(attr);
+              }
+            }
+          }
+          if (dumpSpatialPlanning) {
+            if (chosen) {
+              llvm::errs() << "pipeline grid G" << id << " P=" << chosen
+                           << " cores=" << chosen * stages.size()
+                           << " ranges=" << builder.getArrayAttr(ranges)
+                           << '\n';
+            } else {
+              llvm::errs() << "pipeline grid G" << id
+                           << " temporal fallback: " << reason << '\n';
+            }
+          }
+        }
+      }
+      if (func->hasAttr(spatial_pipeline::expectedStages)) {
+        func->setAttr(spatial_pipeline::expectedStages,
+                      builder.getI64IntegerAttr(selectedStages));
+      }
+    }
+    return success();
+  }
+
   // A leaf reduces raw input (`generate_indices`). Collected before any leaf is
   // rebuilt, so the replacements this phase emits are not walked again.
   LogicalResult planTopKPlacements(ModuleOp module) {

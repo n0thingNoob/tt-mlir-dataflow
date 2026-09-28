@@ -122,6 +122,12 @@ void createD2MFrontendPipeline(OpPassManager &pm,
     gridOptOptions.overrideDeviceShape =
         llvm::to_vector(options.overrideDeviceShape);
     gridOptOptions.ttnnMode = options.ttnnMode;
+    gridOptOptions.spatialPipelineMaxShards = options.spatialPipelineMaxShards;
+    gridOptOptions.dumpSpatialPlanning = options.dumpSpatialPlanning;
+    gridOptOptions.availableL1AddrRange =
+        llvm::to_vector(options.availableL1AddrRange);
+    gridOptOptions.testAssumeL1Capacity = options.testAssumel1Capacity;
+    gridOptOptions.numStreamBuffers = options.numStreamBuffers;
   }
   pm.addPass(d2m::createD2MMaterializeViewReturns());
   pm.addPass(d2m::createD2MGridSelection(gridOptOptions));
