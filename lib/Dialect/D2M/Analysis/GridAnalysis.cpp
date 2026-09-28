@@ -379,6 +379,28 @@ GenericGridAnalysisResult GridAnalysis::analyzeGenericOp(
   result.effectiveTargetGridRange = effectiveTargetGridRange;
   ArrayRef<int64_t> targetGridShape = result.effectiveTargetGridRange.shape;
 
+  // A pipeline owns one region-wide decision. Do not re-optimize its members
+  // independently or shard a GEMM's N/K dimensions.
+  if (auto shards =
+          genericOp->getAttrOfType<IntegerAttr>(spatial_pipeline::shards)) {
+    for (auto [index, operand] :
+         llvm::enumerate(genericOp.getInputsAndOutputs())) {
+      SmallVector<int64_t> grid = {
+          genericOp.hasReduction() && index == 1 ? 1 : shards.getInt(), 1};
+      OperandGridInfo info;
+      info.setOwner(genericOp);
+      info.setOperandIndex(index);
+      info.selectedGrid = grid;
+      info.targetGrid = grid;
+      if (utils::getToLayoutProducerBehindViews(operand)) {
+        info.viewSourceGrid = grid;
+      }
+      result.normalizedOperandGrids.push_back(grid);
+      result.operandInfos.push_back(std::move(info));
+    }
+    return result;
+  }
+
   // Build per-operand target grids. When a loop dimension maps to different
   // operand-dim positions across operands (e.g. matmul K is dim 1 of LHS but
   // dim 0 of RHS), those positions must use min(gridDims) so that
@@ -574,7 +596,9 @@ EffectiveTargetGridRange getTargetGridRange(GenericOp genericOp,
   EffectiveTargetGridRange targetGridRange;
   if (auto range = genericOp->getAttrOfType<ttcore::CoreRangeAttr>(
           spatial_pipeline::core)) {
-    targetGridRange.shape = {1, 1};
+    targetGridRange.shape = {
+        range.getEndCoord().getY() - range.getStartCoord().getY() + 1,
+        range.getEndCoord().getX() - range.getStartCoord().getX() + 1};
     targetGridRange.offset = {range.getStartCoord().getY(),
                               range.getStartCoord().getX()};
     return targetGridRange;

@@ -1755,30 +1755,10 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
     {
       // Currently, we only need L1 and DRAM slots in 'info'.
 
-      const bool L1AddrRangeOverrideSet = l1AddrRangeOverride.size() == 2;
-      const bool l1CapacityOverrideSet = l1CapacityOverride > 0;
-
-      TT_assertv(
-          !(L1AddrRangeOverrideSet && l1CapacityOverrideSet),
-          "overriding both L1 addr range and L1 capacity is not allowed");
-
-      if (L1AddrRangeOverrideSet) {
-        TT_assert(l1AddrRangeOverride[0] >= chipDesc.getL1UnreservedBase());
-        TT_assert(l1AddrRangeOverride[1] <= chipDesc.getL1Size());
-
-        info[ordinal(MemorySpace::DeviceL1)] =
-            MemorySpaceInfo(l1AddrRangeOverride[0], l1AddrRangeOverride[1],
-                            chipDesc.getNocL1AddressAlignBytes());
-      } else {
-        const AllocSizeT l1AddrLimit =
-            l1CapacityOverrideSet
-                ? (chipDesc.getL1UnreservedBase() + l1CapacityOverride)
-                : chipDesc.getL1Size();
-
-        info[ordinal(MemorySpace::DeviceL1)] =
-            MemorySpaceInfo(chipDesc.getL1UnreservedBase(), l1AddrLimit,
-                            chipDesc.getNocL1AddressAlignBytes());
-      }
+      auto [base, limit] = allocation::getL1AddressBounds(
+          chipDesc, l1AddrRangeOverride, l1CapacityOverride);
+      info[ordinal(MemorySpace::DeviceL1)] =
+          MemorySpaceInfo(base, limit, chipDesc.getNocL1AddressAlignBytes());
 
       info[ordinal(MemorySpace::DeviceDRAM)] = MemorySpaceInfo(
           chipDesc.getDramUnreservedBase(), chipDesc.getDramChannelSize(),

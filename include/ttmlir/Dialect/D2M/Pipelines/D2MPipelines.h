@@ -28,6 +28,11 @@ struct D2MPipelineOptions : public PassPipelineOptions<D2MPipelineOptions> {
               "Materialize spatial parallel pairs and temporal singletons")),
       llvm::cl::init(D2MExecutionStrategy::Temporal)};
 
+  Option<int64_t> spatialPipelineMaxShards{
+      *this, "spatial-pipeline-max-shards",
+      llvm::cl::desc("Maximum M shards per pipeline stage (0: device budget)"),
+      llvm::cl::init(0)};
+
   Option<bool> dumpSpatialPlanning{
       *this, "dump-spatial-planning",
       llvm::cl::desc(

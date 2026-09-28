@@ -123,15 +123,17 @@ def execute(args):
         raise RuntimeError(
             "Compiler and runtime revisions differ; rebuild the matched stack"
         )
-    if args.case == "gemm_rect":
-        shapes = [(64, 96), (96, 128), (128, 96)]
-    elif args.case in ("gemm_chain", "mixed"):
-        shapes = [(64, 64)] * 3
-    elif args.case == "elementwise_rect":
-        shapes = [(64, 96)] * 2
-    else:
-        size = 64 if args.case == "chain" else 128
-        shapes = [(size, size)] * 2
+    # Read the actual fixture signature, including requested M-shape variants.
+    signature = (
+        (args.output / "input.mlir")
+        .read_text()
+        .split("func.func @main", 1)[1]
+        .split(" ->", 1)[0]
+    )
+    shapes = [
+        tuple(map(int, shape))
+        for shape in re.findall(r"tensor<(\d+)x(\d+)xbf16>", signature)
+    ]
     torch.manual_seed(SEED)
     inputs = [
         (torch.randn(shape, dtype=torch.bfloat16) * 0.125).contiguous()
@@ -266,6 +268,29 @@ def main():
         "--output", type=Path, required=True, help="New artifact directory"
     )
     parser.add_argument("--runs", type=int, default=3)
+    parser.add_argument(
+        "--max-shards",
+        type=int,
+        default=1,
+        help="Pipeline M-shard limit; 0 selects the largest legal P",
+    )
+    parser.add_argument(
+        "--expect-shards",
+        type=int,
+        default=1,
+        help="Required actual number of cores per stage",
+    )
+    parser.add_argument(
+        "--tile-rows",
+        type=int,
+        default=0,
+        help="Override M tile rows for gemm_rect or elementwise fixtures",
+    )
+    parser.add_argument(
+        "--worker-grid",
+        default="",
+        help="Restrict the worker grid, e.g. 6,2 for 2D stage rectangles",
+    )
     parser.add_argument("--worker", choices=("query", "run"), help=argparse.SUPPRESS)
     parser.add_argument(
         "--mode", choices=("temporal", "spatial"), help=argparse.SUPPRESS
@@ -303,6 +328,16 @@ def main():
         fixture_text = re.sub(r"\d+x\d+xbf16", "64x64xbf16", fixture_text)
     elif args.case == "elementwise_rect":
         fixture_text = fixture_text.replace("128x128", "64x96")
+    if args.tile_rows:
+        if args.case not in (
+            "gemm_rect",
+            "diamond",
+            "elementwise_chain",
+            "elementwise_rect",
+        ):
+            parser.error("--tile-rows requires gemm_rect or an elementwise case")
+        old_rows = 64 if args.case in ("gemm_rect", "elementwise_rect") else 128
+        fixture_text = fixture_text.replace(f"{old_rows}x", f"{args.tile_rows * 32}x")
     fixture = args.output / "input.mlir"
     fixture.write_text(fixture_text)
     manifest = {
@@ -311,6 +346,9 @@ def main():
         "runner_sha256": digest(__file__),
         "seed": SEED,
         "runs": args.runs,
+        "max_shards": args.max_shards,
+        "expected_shards": args.expect_shards,
+        "worker_grid": args.worker_grid,
         "device": {"kmd": int(kmd), "bdf": args.device},
         "compiler": {"path": str(args.compiler), "sha256": digest(args.compiler)},
         "translate": {"path": str(args.translate), "sha256": digest(args.translate)},
@@ -352,6 +390,10 @@ def main():
         "device",
         "output",
         "runs",
+        "max_shards",
+        "expect_shards",
+        "tile_rows",
+        "worker_grid",
     ):
         worker.extend(["--" + option.replace("_", "-"), str(getattr(args, option))])
     run("query", [*worker, "--worker", "query"])
@@ -359,7 +401,9 @@ def main():
     manifest["descriptor_sha256"] = digest(descriptor)
     descriptor_info = json.loads((args.output / "descriptor.json").read_text())
     for mode in ("temporal", "spatial"):
-        pipeline = f"system-desc-path={descriptor} execution-strategy={mode} dump-spatial-planning=true"
+        pipeline = f"system-desc-path={descriptor} execution-strategy={mode} dump-spatial-planning=true spatial-pipeline-max-shards={args.max_shards}"
+        if args.worker_grid:
+            pipeline += f" override-device-shape={args.worker_grid}"
         ir = args.output / f"{mode}.mlir"
         run(
             f"compile-{mode}",
@@ -392,7 +436,11 @@ def main():
         chip["l1_unreserved_base"]
         for chip in descriptor_info["system_desc"]["chip_descs"]
     )
+    l1_limit = min(
+        chip["l1_size"] for chip in descriptor_info["system_desc"]["chip_descs"]
+    )
     allocation_addresses = {}
+    allocation_extents = {}
     marker = "// -----// IR Dump Before D2MGridSelection"
     for mode in ("temporal", "spatial"):
         trace = (args.output / f"compile-{mode}.log").read_text()
@@ -421,15 +469,29 @@ def main():
         if "#l1 = #ttcore.memory_space<l1>" not in ir_text:
             raise RuntimeError("Expected L1 alias for this fixed fixture")
         addresses = []
+        extents = []
         for line in ir_text.splitlines():
             if '"ttmetal.create_buffer"' in line and "#l1>" in line:
                 match = re.search(r"address = (\d+) : i64", line)
                 if not match:
                     raise RuntimeError("Missing L1 buffer address")
-                addresses.append(int(match.group(1)))
+                address = int(match.group(1))
+                shape = re.search(r"memref<((?:\d+x)+)", line)
+                layout = re.search(
+                    r"#ttcore.(?:shard|cb_layout)<(\d+)x\d+, (\d+)>", line
+                )
+                if not shape or not layout:
+                    raise RuntimeError("Cannot verify L1 allocation extent")
+                dimensions = [int(dim) for dim in shape.group(1).rstrip("x").split("x")]
+                size = dimensions[-2] * int(layout.group(1)) * int(layout.group(2))
+                if address < l1_base or address + size > l1_limit:
+                    raise RuntimeError("L1 allocation crosses the live device bounds")
+                addresses.append(address)
+                extents.append({"address": address, "per_core_bytes": size})
         if not addresses or min(addresses) < l1_base:
             raise RuntimeError("Compiled L1 addresses overlap reserved memory")
         allocation_addresses[mode] = addresses
+        allocation_extents[mode] = extents
     report = (args.output / "compile-spatial.log").read_text()
     stage_count = 4 if args.case in ("diamond", "mixed") else 3
     members = "[" + ", ".join(f"G{i}" for i in range(stage_count)) + "]"
@@ -455,8 +517,53 @@ def main():
         )
         for program in programs
     ]
-    if [f"0x{i}, 1x1" for i in range(stage_count)] not in ranges:
-        raise RuntimeError("Missing pipeline enqueue on distinct cores")
+    pipeline_ranges = None
+    for program_ranges in ranges:
+        if len(program_ranges) != stage_count:
+            continue
+        occupied = set()
+        valid = True
+        for core_range in program_ranges:
+            match = re.fullmatch(r"(\d+)x(\d+), (\d+)x(\d+)", core_range)
+            if not match:
+                valid = False
+                break
+            y, x, h, w = map(int, match.groups())
+            cores = {(y + dy, x + dx) for dy in range(h) for dx in range(w)}
+            if h * w != args.expect_shards or occupied & cores:
+                valid = False
+                break
+            occupied |= cores
+        if valid:
+            pipeline_ranges = program_ranges
+            break
+    if pipeline_ranges is None:
+        raise RuntimeError("Missing shared enqueue with disjoint multi-core stages")
+    if f"P={args.expect_shards} cores={args.expect_shards * stage_count}" not in report:
+        raise RuntimeError("GridSelection did not choose the expected region budget")
+    manifest["pipeline_core_ranges"] = pipeline_ranges
+    manifest["pipeline_compute_cores"] = args.expect_shards * stage_count
+    signature = fixture_text.split("func.func @main", 1)[1].split(" ->", 1)[0]
+    tile_rows = int(re.search(r"tensor<(\d+)x", signature).group(1)) // 32
+    coverage = {}
+    for generic in snapshots["spatial"].split('"d2m.generic"')[1:]:
+        stage = re.search(r"d2m.pipeline_stage = (\d+)", generic)
+        if not stage:
+            continue
+        factors = re.search(r"block_factors = \[(\d+), (\d+)(?:, (\d+))?\]", generic)
+        if not factors or (factors.group(3) and factors.group(3) != "1"):
+            raise RuntimeError("Missing canonical full-K stage traversal")
+        local_rows = int(factors.group(1))
+        if local_rows * args.expect_shards != tile_rows:
+            raise RuntimeError("Stage shards duplicate or omit output tile rows")
+        coverage[stage.group(1)] = [
+            [shard * local_rows, (shard + 1) * local_rows]
+            for shard in range(args.expect_shards)
+        ]
+    if len(coverage) != stage_count:
+        raise RuntimeError("Missing per-stage shard coverage proof")
+    manifest["stage_tile_row_intervals"] = coverage
+    manifest["l1_allocation_extents"] = allocation_extents
     if "semaphore_wait_min" not in lowered or "noc_semaphore_inc" not in lowered:
         raise RuntimeError("Missing cumulative tile synchronization")
     if "#ttcore.memory_space<dram>" in lowered:

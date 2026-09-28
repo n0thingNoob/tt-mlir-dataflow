@@ -1,4 +1,4 @@
-// RUN: ttmlir-opt %s --ttir-to-ttmetal-pipeline="execution-strategy=spatial dump-spatial-planning=true system-desc-path=%system_desc_path%" --mlir-print-op-generic -o %t.mlir 2> %t.report
+// RUN: ttmlir-opt %s --ttir-to-ttmetal-pipeline="execution-strategy=spatial spatial-pipeline-max-shards=1 dump-spatial-planning=true system-desc-path=%system_desc_path%" --mlir-print-op-generic -o %t.mlir 2> %t.report
 // RUN: FileCheck %s --input-file=%t.report
 // RUN: ttmlir-translate %t.mlir --ttmetal-to-flatbuffer -o %t.ttm
 // CHECK: selected pipeline members=[G0, G1, G2]
