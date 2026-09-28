@@ -1,14 +1,14 @@
 // RUN: ttmlir-opt %s --d2m-fe-pipeline --mlir-print-ir-before=d2m-grid-selection --mlir-disable-threading -o %t.default 2> %t.default.before-grid
 // RUN: ttmlir-opt %s --d2m-fe-pipeline="execution-strategy=temporal" --mlir-print-ir-before=d2m-grid-selection --mlir-disable-threading -o %t.temporal 2> %t.temporal.before-grid
-// RUN: ttmlir-opt %s --d2m-fe-pipeline="execution-strategy=spatial" --mlir-print-ir-before=d2m-grid-selection --mlir-disable-threading -o %t.spatial 2> %t.spatial.before-grid
+// RUN: ttmlir-opt %s --d2m-fe-pipeline="execution-strategy=spatial spatial-pipeline-max-shards=1" --mlir-print-ir-before=d2m-grid-selection --mlir-disable-threading -o %t.spatial 2> %t.spatial.before-grid
 // RUN: diff %t.default.before-grid %t.temporal.before-grid
 // RUN: FileCheck %s --check-prefix=SPATIAL --input-file=%t.spatial.before-grid
 // RUN: ttmlir-opt %t.default --d2m-spatial-planning -o %t.bufferized
 // RUN: diff %t.default %t.bufferized
-// RUN: ttmlir-opt %s --d2m-fe-pipeline="execution-strategy=spatial" --dump-pass-pipeline -o /dev/null 2>&1 | FileCheck %s --check-prefix=PIPELINE
+// RUN: ttmlir-opt %s --d2m-fe-pipeline="execution-strategy=spatial spatial-pipeline-max-shards=1" --dump-pass-pipeline -o /dev/null 2>&1 | FileCheck %s --check-prefix=PIPELINE
 // RUN: ttmlir-opt %s --d2m-fe-pipeline="execution-strategy=temporal" --dump-pass-pipeline -o /dev/null 2>&1 | FileCheck %s --check-prefix=TEMPORAL --implicit-check-not=d2m-spatial-planning
 // RUN: ttmlir-opt %s --ttir-to-ttmetal-pipeline -o %t.metal.default
-// RUN: ttmlir-opt %s --ttir-to-ttmetal-pipeline="execution-strategy=spatial" -o %t.metal.spatial
+// RUN: ttmlir-opt %s --ttir-to-ttmetal-pipeline="execution-strategy=spatial spatial-pipeline-max-shards=1" -o %t.metal.spatial
 // RUN: FileCheck %s --check-prefix=METAL --input-file=%t.metal.default --implicit-check-not=d2m.spatial --implicit-check-not=d2m.generic
 // RUN: FileCheck %s --check-prefix=METAL --input-file=%t.metal.spatial --implicit-check-not=d2m.spatial --implicit-check-not=d2m.generic
 // RUN: ttmlir-opt %t.metal.spatial --mlir-print-op-generic -o %t.serialize.mlir
