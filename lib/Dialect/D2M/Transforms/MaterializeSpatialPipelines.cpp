@@ -49,6 +49,7 @@ struct ReadyEdge {
   RemoteLoadOp load;
   int64_t columns;
   bool wholeRow;
+  bool sharded;
 };
 
 // Only exact reblocking views preserve the logical row-major tile sequence.
@@ -74,9 +75,10 @@ static SmallVector<int64_t> tiledShape(Value value) {
 
 // GenerateOuterLoops produces iv + block_offset(dim). A single-core stage
 // has zero logical block offset even when placed at a nonzero physical core.
-static bool isLoopIndex(Value value, affine::AffineForOp loop, unsigned dim) {
+static bool isLoopIndex(Value value, affine::AffineForOp loop, unsigned dim,
+                        bool requireOffset = false) {
   if (value == loop.getInductionVar()) {
-    return true;
+    return !requireOffset;
   }
   auto add = value.getDefiningOp<arith::AddIOp>();
   if (!add) {
@@ -100,13 +102,16 @@ checkStageTraversal(GenericOp generic,
                     SmallVectorImpl<RemoteLoadOp> &inputLoads) {
   auto factors = generic.getBlockFactorsValue();
   bool matmul = generic.hasReduction();
+  auto shardAttr =
+      generic->getAttrOfType<IntegerAttr>(spatial_pipeline::shards);
+  int64_t shards = shardAttr ? shardAttr.getInt() : 1;
   if (factors.size() != (matmul ? 3u : 2u) ||
-      generic.getGrid().getShape() != ArrayRef<int64_t>({1, 1}) ||
+      generic.getGrid().getShape() != ArrayRef<int64_t>({shards, 1}) ||
       generic.getOutputs().size() != 1 || (matmul && factors[2] != 1)) {
-    return "requires one core and a complete, unsplit K reduction";
+    return "requires an M-only grid and a complete, unsplit K reduction";
   }
   auto outputShape = tiledShape(generic.getOutputs()[0]);
-  if (outputShape.size() != 2 || outputShape[0] != factors[0] ||
+  if (outputShape.size() != 2 || outputShape[0] != factors[0] * shards ||
       outputShape[1] != factors[1] || factors[0] <= 0 || factors[1] <= 0 ||
       factors[0] > INT32_MAX / factors[1]) {
     return "output blocking must cover the row-major tile grid exactly once";
@@ -163,7 +168,7 @@ checkStageTraversal(GenericOp generic,
           ArrayRef<int64_t>({1, 1}) ||
       store.getMemref() != generic.getOutputs()[0] ||
       store.getIndices().size() != 2 ||
-      !isLoopIndex(store.getIndices()[0], loops[0], 0) ||
+      !isLoopIndex(store.getIndices()[0], loops[0], 0, shards > 1) ||
       !isLoopIndex(store.getIndices()[1], loops[1], 1)) {
     return "output store does not publish one complete row-major tile";
   }
@@ -180,7 +185,8 @@ checkStageTraversal(GenericOp generic,
     auto shape = tiledShape(input);
     if (shape.size() != 2 || load->getBlock() != body ||
         !load->isBeforeInBlock(compute) || load.getIndices().size() != 2 ||
-        !isLoopIndex(load.getIndices()[0], loops[rowDim], rowDim) ||
+        !isLoopIndex(load.getIndices()[0], loops[rowDim], rowDim,
+                     shards > 1 && rowDim == 0) ||
         !isLoopIndex(load.getIndices()[1], loops[colDim], colDim)) {
       return "input traversal does not match its tile/panel dependency";
     }
@@ -225,7 +231,7 @@ static std::string collectReadyEdges(ArrayRef<GenericOp> stages,
       }
       edges.push_back({static_cast<unsigned>(producerId),
                        static_cast<unsigned>(id), inputLoads[inputId], shape[1],
-                       wholeRow});
+                       wholeRow, generic.getGrid().getShape()[0] > 1});
     }
   }
   return {};
@@ -239,14 +245,17 @@ static void insertReadyWait(OpBuilder &builder, const ReadyEdge &edge,
   Value columns =
       builder.create<arith::ConstantIndexOp>(load.getLoc(), edge.columns);
   Value one = builder.create<arith::ConstantIndexOp>(load.getLoc(), 1);
+  Value rowIndex = indices[0];
+  if (edge.sharded) {
+    Value offset = builder.create<BlockOffsetOp>(load.getLoc(), int64_t{0});
+    rowIndex = builder.create<arith::SubIOp>(load.getLoc(), rowIndex, offset);
+  }
   Value count;
   if (edge.wholeRow) {
-    Value nextRow =
-        builder.create<arith::AddIOp>(load.getLoc(), indices[0], one);
+    Value nextRow = builder.create<arith::AddIOp>(load.getLoc(), rowIndex, one);
     count = builder.create<arith::MulIOp>(load.getLoc(), nextRow, columns);
   } else {
-    Value row =
-        builder.create<arith::MulIOp>(load.getLoc(), indices[0], columns);
+    Value row = builder.create<arith::MulIOp>(load.getLoc(), rowIndex, columns);
     Value ordinal =
         builder.create<arith::AddIOp>(load.getLoc(), row, indices[1]);
     count = builder.create<arith::AddIOp>(load.getLoc(), ordinal, one);
@@ -264,9 +273,10 @@ static void materializeTemporalStages(ArrayRef<GenericOp> stages, bool dump) {
     auto spatial = builder.create<SpatialOp>(
         stage.getLoc(), TypeRange{}, stage.getInputs(), stage.getOutputs(),
         builder.getArrayAttr({range}), 1);
-    for (StringRef attr : {spatial_pipeline::group, spatial_pipeline::stage,
-                           spatial_pipeline::core, spatial_pipeline::inputs,
-                           spatial_pipeline::signals}) {
+    for (StringRef attr :
+         {spatial_pipeline::group, spatial_pipeline::stage,
+          spatial_pipeline::core, spatial_pipeline::inputs,
+          spatial_pipeline::signals, spatial_pipeline::shards}) {
       stage->removeAttr(attr);
     }
     stage->setAttr(spatial_pipeline::noSpill, builder.getUnitAttr());
@@ -335,7 +345,9 @@ public:
           "prepared pipeline requires a registered device");
     }
     auto grid = device.getDeviceAttr().getWorkerGrid().getShape();
-    llvm::SetVector<Attribute> occupied;
+    llvm::SmallDenseSet<std::pair<int64_t, int64_t>> occupied;
+    int64_t commonShards = 0;
+    SmallVector<int64_t> commonRangeShape;
     for (auto [id, stageRef] : llvm::enumerate(stages)) {
       GenericOp stage = stageRef;
       auto stageId = stage->getAttrOfType<IntegerAttr>(spatial_pipeline::stage);
@@ -354,11 +366,57 @@ public:
         return stage.emitOpError("invalid prepared spatial pipeline contract");
       }
       auto start = core.getStartCoord();
-      if (grid.size() != 2 || start != core.getEndCoord() || start.getY() < 0 ||
-          start.getX() < 0 || start.getY() >= grid[0] ||
-          start.getX() >= grid[1] || !occupied.insert(core)) {
+      auto end = core.getEndCoord();
+      auto shardAttr =
+          stage->getAttrOfType<IntegerAttr>(spatial_pipeline::shards);
+      int64_t shards = shardAttr ? shardAttr.getInt() : 1;
+      SmallVector<int64_t> rangeShape = {end.getY() - start.getY() + 1,
+                                         end.getX() - start.getX() + 1};
+      if (id == 0) {
+        commonShards = shards;
+        commonRangeShape = rangeShape;
+      }
+      if (grid.size() != 2 || shards <= 0 || shards != commonShards ||
+          rangeShape != commonRangeShape || rangeShape[0] <= 0 ||
+          rangeShape[1] <= 0 || rangeShape[0] * rangeShape[1] != shards ||
+          start.getY() < 0 || start.getX() < 0 || end.getY() >= grid[0] ||
+          end.getX() >= grid[1]) {
         return stage.emitOpError(
-            "pipeline requires distinct legal single-core ranges");
+            "pipeline requires compatible legal M-shard ranges");
+      }
+      auto forward = stage.getGrid().getVirtToPhysicalMap();
+      auto inverse = stage.getGrid().getPhysicalToVirtMap();
+      for (int64_t shard = 0; shard < shards; ++shard) {
+        int64_t y = start.getY() + shard / rangeShape[1];
+        int64_t x = start.getX() + shard % rangeShape[1];
+        SmallVector<int64_t> physical = {0, shard, 0};
+        SmallVector<int64_t> logical = {0, y, x};
+        if (forward && !forward.isEmpty()) {
+          if (forward.getNumDims() != 2 || forward.getNumSymbols() ||
+              forward.getNumResults() != 3) {
+            return stage.emitOpError("invalid pipeline forward grid mapping");
+          }
+          physical = forward.compose({shard, 0});
+        }
+        if (inverse && !inverse.isEmpty()) {
+          if (inverse.getNumDims() != 2 || inverse.getNumSymbols() ||
+              inverse.getNumResults() != 3) {
+            return stage.emitOpError("invalid pipeline inverse grid mapping");
+          }
+          logical = inverse.compose({y, x});
+        }
+        if (physical != SmallVector<int64_t>({0, y, x}) ||
+            logical != SmallVector<int64_t>({0, shard, 0})) {
+          return stage.emitOpError(
+              "pipeline grid mapping does not cover its range exactly once");
+        }
+      }
+      for (int64_t y = start.getY(); y <= end.getY(); ++y) {
+        for (int64_t x = start.getX(); x <= end.getX(); ++x) {
+          if (!occupied.insert({y, x}).second) {
+            return stage.emitOpError("pipeline core ranges overlap");
+          }
+        }
       }
       if (stage.getNumResults() || stage.getNumRegions() != 1) {
         return stage.emitOpError(
@@ -414,8 +472,13 @@ public:
       // Kernel outlining applies its placement offset exactly once.
       auto origin =
           cast<ttcore::CoreRangeAttr>(ranges[producerId]).getStartCoord();
-      signals[producerId].push_back(builder.getDenseI64ArrayAttr(
-          {index, core.getY() - origin.getY(), core.getX() - origin.getX()}));
+      if (commonShards == 1) {
+        signals[producerId].push_back(builder.getDenseI64ArrayAttr(
+            {index, core.getY() - origin.getY(), core.getX() - origin.getX()}));
+      } else {
+        signals[producerId].push_back(builder.getDenseI64ArrayAttr(
+            {index, core.getY(), core.getX(), commonRangeShape[1]}));
+      }
       insertReadyWait(builder, edge, sem);
     }
     for (auto [i, stage] : llvm::enumerate(stages)) {

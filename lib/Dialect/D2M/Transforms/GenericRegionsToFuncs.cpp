@@ -7,6 +7,7 @@
 #include "ttmlir/Dialect/D2M/IR/D2MOps.h"
 #include "ttmlir/Dialect/D2M/Transforms/Passes.h"
 #include "ttmlir/Dialect/D2M/Utils/CBUtils.h"
+#include "ttmlir/Dialect/D2M/Utils/SpatialPipeline.h"
 #include "ttmlir/Dialect/TTCore/IR/Utils.h"
 #include "ttmlir/FunctionTypes.h"
 
@@ -87,6 +88,7 @@ materializeCoreCoordinateOperandsInPhysicalSpace(GenericOp generic,
 
   auto rewriteSemaphoreCoreIndex = [&](auto semaphoreOp) {
     if (semaphoreOp->template getParentOfType<GenericOp>() != generic ||
+        semaphoreOp->hasAttr(spatial_pipeline::absoluteDestination) ||
         semaphoreOp.getDstCoreIndex().empty() ||
         !semaphoreOp.getStartDevice().empty()) {
       return;

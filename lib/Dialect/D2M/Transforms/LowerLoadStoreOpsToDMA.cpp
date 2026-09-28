@@ -268,7 +268,21 @@ public:
           Value one = rewriter.create<arith::ConstantIndexOp>(loc, 1);
           Value y = rewriter.create<arith::ConstantIndexOp>(loc, signal[1]);
           Value x = rewriter.create<arith::ConstantIndexOp>(loc, signal[2]);
-          rewriter.create<SemaphoreIncOp>(loc, sem, one, ValueRange{y, x});
+          if (signal.size() == 4) {
+            Value shard = rewriter.create<CoreIndexOp>(loc, 0);
+            Value width =
+                rewriter.create<arith::ConstantIndexOp>(loc, signal[3]);
+            Value row = rewriter.create<arith::DivSIOp>(loc, shard, width);
+            Value column = rewriter.create<arith::RemSIOp>(loc, shard, width);
+            y = rewriter.create<arith::AddIOp>(loc, y, row);
+            x = rewriter.create<arith::AddIOp>(loc, x, column);
+          }
+          auto inc =
+              rewriter.create<SemaphoreIncOp>(loc, sem, one, ValueRange{y, x});
+          if (signal.size() == 4) {
+            inc->setAttr(spatial_pipeline::absoluteDestination,
+                         rewriter.getUnitAttr());
+          }
         }
       }
     }
