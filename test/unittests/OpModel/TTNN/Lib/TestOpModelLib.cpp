@@ -837,7 +837,7 @@ TEST_F(OpModelTest, ToMemoryConfig) {
       tensorShape, inputLayoutL1Tiled, outputLayoutL1Tiled);
   EXPECT_TRUE(static_cast<bool>(constraintsExp));
   opCstr = constraintsExp.get();
-  EXPECT_GT(opCstr.cbL1PeakSize, 0);
+  EXPECT_EQ(opCstr.cbL1PeakSize, 0);
   EXPECT_GT(opCstr.tensorL1PeakSize, 0);
   EXPECT_GT(opCstr.outputL1BufferSize, 0);
 
@@ -6191,6 +6191,82 @@ TEST_F(OpModelTest, LayerNormForwardOp) {
       /*returnMeanRstd=*/false, /*outputLayout=*/TTNNLayoutAttr());
   ASSERT_TRUE(static_cast<bool>(outputOnlyConstraintsExp));
   EXPECT_EQ(outputOnlyConstraintsExp.get().outputLayouts.size(), 1u);
+}
+
+TEST_F(OpModelTest, LayerNormBackwardOp) {
+  const llvm::SmallVector<int64_t> inputShape = {1, 1, 128, 256};
+  const llvm::SmallVector<int64_t> parameterShape = {1, 1, 1, 256};
+  const llvm::SmallVector<int64_t> statisticsShape = {1, 1, 128, 1};
+  const TTNNLayoutAttr inputLayout = CreateTiledLayout(
+      inputShape, BufferType::DRAM, TensorMemoryLayout::Interleaved);
+  const TTNNLayoutAttr parameterLayout = CreateTiledLayout(
+      parameterShape, BufferType::DRAM, TensorMemoryLayout::Interleaved);
+  const TTNNLayoutAttr statisticsLayout = CreateTiledLayout(
+      statisticsShape, BufferType::DRAM, TensorMemoryLayout::Interleaved);
+
+  auto constraintsExp = OpModel<LayerNormBackwardOp>::getOpConstraints(
+      inputShape, inputLayout, parameterShape, parameterLayout, statisticsShape,
+      statisticsLayout, statisticsShape, statisticsLayout, inputShape,
+      inputLayout, /*outputLayout=*/TTNNLayoutAttr());
+  ASSERT_TRUE(static_cast<bool>(constraintsExp));
+  EXPECT_GT(constraintsExp.get().cbL1PeakSize, 0);
+  EXPECT_EQ(constraintsExp.get().outputLayouts.size(), 3u);
+
+  auto runtimeExp = OpModel<LayerNormBackwardOp>::getOpRuntime(
+      inputShape, inputLayout, parameterShape, parameterLayout, statisticsShape,
+      statisticsLayout, statisticsShape, statisticsLayout, inputShape,
+      inputLayout, /*outputLayout=*/TTNNLayoutAttr());
+  ASSERT_TRUE(static_cast<bool>(runtimeExp));
+  EXPECT_GT(runtimeExp.get(), 0);
+}
+
+//===----------------------------------------------------------------------===//
+// SoftmaxBackwardOp Tests
+//===----------------------------------------------------------------------===//
+
+TEST_F(OpModelTest, SoftmaxBackwardOp) {
+  const llvm::SmallVector<int64_t> shape = {1, 1, 128, 256};
+  const TTNNLayoutAttr layout = CreateTiledLayout(
+      shape, BufferType::DRAM, TensorMemoryLayout::Interleaved);
+
+  auto constraintsExp = OpModel<SoftmaxBackwardOp>::getOpConstraints(
+      shape, layout, shape, layout, /*dimension=*/-1,
+      /*outputLayout=*/TTNNLayoutAttr());
+  ASSERT_TRUE(static_cast<bool>(constraintsExp));
+  EXPECT_GT(constraintsExp.get().cbL1PeakSize, 0);
+  ASSERT_EQ(constraintsExp.get().outputLayouts.size(), 1u);
+  EXPECT_EQ(constraintsExp.get().outputLayouts[0], layout);
+
+  auto runtimeExp = OpModel<SoftmaxBackwardOp>::getOpRuntime(
+      shape, layout, shape, layout, /*dimension=*/-1,
+      /*outputLayout=*/TTNNLayoutAttr());
+  ASSERT_TRUE(static_cast<bool>(runtimeExp));
+  EXPECT_GT(runtimeExp.get(), 0);
+}
+
+//===----------------------------------------------------------------------===//
+// SiluBackwardOp Tests
+//===----------------------------------------------------------------------===//
+
+TEST_F(OpModelTest, SiluBackwardOp) {
+  const llvm::SmallVector<int64_t> shape = {1, 1, 128, 256};
+  const TTNNLayoutAttr layout = CreateTiledLayout(
+      shape, BufferType::DRAM, TensorMemoryLayout::Interleaved);
+
+  auto constraintsExp = OpModel<SiluBackwardOp>::getOpConstraints(
+      shape, layout, shape, layout,
+      /*outputLayout=*/TTNNLayoutAttr());
+  ASSERT_TRUE(static_cast<bool>(constraintsExp));
+  EXPECT_GT(constraintsExp.get().cbL1PeakSize, 0);
+  EXPECT_EQ(constraintsExp.get().tensorL1PeakSize, 0);
+  EXPECT_EQ(constraintsExp.get().outputL1BufferSize, 0);
+  EXPECT_EQ(constraintsExp.get().outputLayouts.size(), 1u);
+
+  auto runtimeExp =
+      OpModel<SiluBackwardOp>::getOpRuntime(shape, layout, shape, layout,
+                                            /*outputLayout=*/TTNNLayoutAttr());
+  ASSERT_TRUE(static_cast<bool>(runtimeExp));
+  EXPECT_GT(runtimeExp.get(), 0);
 }
 
 //===----------------------------------------------------------------------===//

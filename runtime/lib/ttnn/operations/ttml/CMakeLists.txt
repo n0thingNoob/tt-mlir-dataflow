@@ -10,11 +10,14 @@ endif()
 
 add_library(TTRuntimeTTMLOps STATIC
   adamw.cpp
+  layernorm_bw.cpp
+  layernorm_fw.cpp
   rmsnorm_bw.cpp
   rmsnorm_fw.cpp
-  layernorm_fw.cpp
   sdpa_fw.cpp
   sdpa_bw.cpp
+  softmax_backward.cpp
+  silu_bw.cpp
   swiglu_elemwise_bw.cpp
   cross_entropy_fw.cpp
   cross_entropy_bw.cpp

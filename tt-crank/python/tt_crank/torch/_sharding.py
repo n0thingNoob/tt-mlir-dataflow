@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import torch
-from torch.distributed.tensor import Replicate, Shard
+from torch.distributed.tensor import Partial, Replicate, Shard
 from torch.distributed.tensor.experimental import register_sharding
 
 
@@ -79,6 +79,106 @@ def _sdpa_overrideable_sharding(
     ]
 
 
+# torch ships no meta kernel for the overrideable backward; DTensor's sharding propagation (and later
+# AOTAutograd) needs one to shape the outputs without running the kernel.
+@torch.library.register_fake(
+    "aten::_scaled_dot_product_fused_attention_overrideable_backward"
+)
+def _(
+    grad_out,
+    query,
+    key,
+    value,
+    attn_bias,
+    grad_input_mask,
+    out,
+    logsumexp,
+    cum_seq_q,
+    cum_seq_k,
+    max_q,
+    max_k,
+    dropout_p,
+    is_causal,
+    philox_seed,
+    philox_offset,
+    *,
+    scale=None,
+):
+    # Mirror grad_input_mask like the eager kernel: undefined (None) for inputs that need no gradient.
+    dq = torch.empty_like(query) if grad_input_mask[0] else None
+    dk = torch.empty_like(key) if grad_input_mask[1] else None
+    dv = torch.empty_like(value) if grad_input_mask[2] else None
+    return dq, dk, dv, None
+
+
+def _sdpa_overrideable_backward_sharding(
+    grad_out,
+    query,
+    key,
+    value,
+    attn_bias,
+    grad_input_mask,
+    out,
+    logsumexp,
+    cum_seq_q,
+    cum_seq_k,
+    max_q,
+    max_k,
+    dropout_p,
+    is_causal,
+    philox_seed,
+    philox_offset,
+    scale=None,
+):
+    """DTensor strategy for `_scaled_dot_product_fused_attention_overrideable_backward`.
+
+    grad_out, q, k, v, out and logsumexp carry one common placement (Replicate, Shard(0) = batch,
+    Shard(1) = heads) and dq/dk/dv come back with that same placement, so nothing is gathered. The
+    optional mask and the 0-D philox tensors stay replicated; non-tensor args get None.
+
+    Outputs follow `grad_input_mask`: a gradient the caller did not ask for is an undefined tensor
+    (the fake kernel above returns None for it), and DTensor rejects a placement for an output with
+    no tensor behind it. So those slots get None too, and the attn_bias grad is never produced.
+
+    Shard(0) row, inputs in schema order:
+        [S0, S0, S0, S0, R, -, S0, S0, -, -, -, -, -, -, R, R]  ->  outputs [S0, S0, S0, -]
+    (with grad_input_mask = [True, False, False, False] the outputs are [S0, -, -, -]).
+    """
+    assert not grad_input_mask[
+        3
+    ], "DTensor SDPA backward strategy does not support a grad w.r.t. attn_bias"
+
+    def placed(arg, placement):
+        # Tensor args arrive as DTensor specs (have `placements`); undefined/None tensors and scalars get None.
+        return placement if hasattr(arg, "placements") else None
+
+    def row(shard):
+        replicated = Replicate()
+        inputs = [
+            shard,  # grad_out
+            shard,  # query
+            shard,  # key
+            shard,  # value
+            placed(attn_bias, replicated),
+            None,  # grad_input_mask
+            shard,  # out
+            shard,  # logsumexp
+            placed(cum_seq_q, replicated),
+            placed(cum_seq_k, replicated),
+            None,  # max_q
+            None,  # max_k
+            None,  # dropout_p
+            None,  # is_causal
+            placed(philox_seed, replicated),
+            placed(philox_offset, replicated),
+        ]
+        # dq, dk, dv only where requested (see docstring); the attn_bias grad slot is always None.
+        grads = [shard if wanted else None for wanted in grad_input_mask[:3]]
+        return (grads + [None], inputs)
+
+    return [row(Replicate()), row(Shard(0)), row(Shard(1))]
+
+
 def _index_copy_sharding(self, dim, index, source):
     """DTensor sharding strategy for `index_copy_`/`index_copy`.
 
@@ -96,17 +196,116 @@ def _index_copy_sharding(self, dim, index, source):
     return shardings
 
 
-def register_sharding_strategies() -> None:
-    """Register the tt-specific DTensor sharding strategies on the propagator.
+def _linear_backward_sharding(self, grad_output, weight, output_mask):
+    """`linear_backward` on tt: DP, column-TP (weight Shard(0)) and row-TP (weight Shard(1)), no redistribution."""
+    # torch's meta returns grad_weight and grad_bias together when either is requested; the eager tt
+    # kernel returns only what is masked on. A spec on a None result is ignored, a missing one raises.
+    wanted = (
+        output_mask[0],
+        output_mask[1] or output_mask[2],
+        output_mask[1] or output_mask[2],
+    )
 
-    All go through the public `register_sharding`: the overrideable SDPA op (which
-    torch ships a strategy for only in its CUDA-family fused variants) and both the
-    in-place and functional `index_copy` overloads (which appear depending on
-    whether the write is traced (compile) or run eagerly).
+    def outputs(*placements):
+        return [
+            placement if want else None for placement, want in zip(placements, wanted)
+        ]
+
+    last = self.ndim - 1
+    shardings = [
+        (
+            outputs(Replicate(), Replicate(), Replicate()),
+            [Replicate(), Replicate(), Replicate(), None],
+        )
+    ]
+    for d in range(last):
+        shardings.append(
+            (
+                outputs(Shard(d), Partial(), Partial()),
+                [Shard(d), Shard(d), Replicate(), None],
+            )
+        )
+    shardings.append(
+        (
+            outputs(Partial(), Shard(0), Shard(0)),
+            [Replicate(), Shard(last), Shard(0), None],
+        )
+    )
+    shardings.append(
+        (
+            outputs(Shard(last), Shard(1), Replicate()),
+            [Shard(last), Replicate(), Shard(1), None],
+        )
+    )
+    return shardings
+
+
+def _matmul_backward_sharding(grad, self, other, output_mask):
+    """`matmul_backward` on tt: one family per batch dim of `grad`, the matrix dims never shard.
+
+    Batch dims align from the right (matmul broadcasting), so a batch dim of `grad` sits at a
+    different index on `self` and `other`, or is missing / size 1 on one of them. An operand
+    without the dim stays Replicate and its gradient comes back Partial: the kernel sums it over
+    the broadcast dim per shard, DTensor sums the shards.
+
+        grad [B, H, S, E]  self [B, H, S, D]  other [H, D, E]     grad [B, S, E]  self [B, S, D]  other [D, E]
+        Shard(1)           Shard(1)           Shard(0)            Shard(0)        Shard(0)        Replicate
+          -> grad_self Shard(1), grad_other Shard(0)                -> grad_self Shard(0), grad_other Partial
+
+    A 1-D operand has no batch dims and shifts grad's rank; those shapes get the replicate family only.
     """
+    wanted = (output_mask[0], output_mask[1])
+
+    def outputs(*placements):
+        return [
+            placement if want else None for placement, want in zip(placements, wanted)
+        ]
+
+    shardings = [
+        (
+            outputs(Replicate(), Replicate()),
+            [Replicate(), Replicate(), Replicate(), None],
+        )
+    ]
+    if self.ndim < 2 or other.ndim < 2:
+        return shardings
+
+    def operand_dim(t, d):
+        """`t`'s dim for grad's batch dim `d`, or None when `t` is broadcast there."""
+        td = d - (grad.ndim - t.ndim)
+        return td if td >= 0 and t.shape[td] != 1 else None
+
+    for d in range(grad.ndim - 2):
+        sd, od = operand_dim(self, d), operand_dim(other, d)
+        if sd is None and od is None:
+            continue
+        shardings.append(
+            (
+                outputs(
+                    Partial() if sd is None else Shard(sd),
+                    Partial() if od is None else Shard(od),
+                ),
+                [
+                    Shard(d),
+                    Replicate() if sd is None else Shard(sd),
+                    Replicate() if od is None else Shard(od),
+                    None,
+                ],
+            )
+        )
+    return shardings
+
+
+def register_sharding_strategies() -> None:
+    """Register the tt-specific DTensor sharding strategies on the propagator."""
     aten = torch.ops.aten
     register_sharding(aten._scaled_dot_product_fused_attention_overrideable.default)(
         _sdpa_overrideable_sharding
     )
+    register_sharding(
+        aten._scaled_dot_product_fused_attention_overrideable_backward.default
+    )(_sdpa_overrideable_backward_sharding)
     register_sharding(aten.index_copy_.default)(_index_copy_sharding)
     register_sharding(aten.index_copy.default)(_index_copy_sharding)
+    register_sharding(aten.linear_backward.default)(_linear_backward_sharding)
+    register_sharding(aten.matmul_backward.default)(_matmul_backward_sharding)

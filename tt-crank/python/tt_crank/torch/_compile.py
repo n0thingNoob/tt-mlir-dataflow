@@ -126,6 +126,20 @@ def _skip_prepare(*targets):
     return decorator
 
 
+def _compiling_training_graph() -> bool:
+    """True while lowering the forward of a graph AOT built a backward for.
+
+    AOT decides this once per graph from whether any input requires grad and
+    records it as `fw_metadata.is_train` on the tracing context, which is live
+    for the whole compile. Grad mode is no substitute here: AOT runs the forward
+    compiler under no_grad whenever a backward exists, so `torch.is_grad_enabled()`
+    reads False exactly when training. No metadata (a graph compiled outside AOT)
+    counts as inference, the same fallback `_fw_args_roles` takes.
+    """
+    fw_meta = getattr(torch._guards.TracingContext.try_get(), "fw_metadata", None)
+    return bool(getattr(fw_meta, "is_train", False))
+
+
 @_lowering(_aten.add.Tensor)
 def _(mb, a, b, *, alpha=1):
     return mb.add(a, b, float(alpha))
@@ -860,8 +874,12 @@ def _(mb, input, diagonal=0):
     return mb.tril(input, int(diagonal))
 
 
-@_lowering(_aten._scaled_dot_product_fused_attention_overrideable.default)
-@_skip_prepare(_aten._scaled_dot_product_fused_attention_overrideable.default)
+_SDPA_FUSED_FW = _aten._scaled_dot_product_fused_attention_overrideable.default
+_SDPA_FUSED_BW = _aten._scaled_dot_product_fused_attention_overrideable_backward.default
+
+
+@_lowering(_SDPA_FUSED_FW)
+@_skip_prepare(_SDPA_FUSED_FW)
 def _(
     mb,
     query,
@@ -875,17 +893,92 @@ def _(
 ):
     if dropout_p:
         raise NotImplementedError(
-            f"tt-crank sdpa: dropout_p must be 0 (inference only), got {dropout_p}"
+            f"tt-crank sdpa: dropout_p must be 0, got {dropout_p}"
         )
     if return_debug_mask:
         raise NotImplementedError(
             "tt-crank sdpa: return_debug_mask=True is not supported"
         )
-    result = mb.sdpa(
+    if not _compiling_training_graph():
+        result = mb.sdpa(
+            query, key, value, is_causal=is_causal, scale=scale, attn_mask=attn_bias
+        )
+        return (result, None, None, None, None, None, None, None, None)
+    output, logsumexp = mb.sdpa_fw(
         query, key, value, is_causal=is_causal, scale=scale, attn_mask=attn_bias
     )
-    # Returns a 9-tuple; downstream getitem[0] extracts the attention output.
-    return (result, None, None, None, None, None, None, None, None)
+    # Slots 6/7 (dropout RNG state) are saved by torch's derivative formula, so they need values.
+    rng = mb.zeros([], _to_runtime_dtype(torch.int64))
+    return (output, logsumexp, None, None, None, None, rng, rng, None)
+
+
+@_lowering(_SDPA_FUSED_BW)
+@_skip_prepare(_SDPA_FUSED_BW)
+def _(
+    mb,
+    grad_out,
+    query,
+    key,
+    value,
+    attn_bias,
+    grad_input_mask,
+    out,
+    logsumexp,
+    cum_seq_q,
+    cum_seq_k,
+    max_q,
+    max_k,
+    dropout_p,
+    is_causal,
+    philox_seed,
+    philox_offset,
+    scale=None,
+):
+    if grad_input_mask[3]:
+        raise NotImplementedError(
+            "tt-crank sdpa backward: a gradient w.r.t. attn_bias is not supported"
+        )
+    grad_query, grad_key, grad_value = mb.sdpa_bw(
+        grad_out,
+        out,
+        query,
+        key,
+        value,
+        logsumexp,
+        is_causal=is_causal,
+        scale=scale,
+        attn_mask=attn_bias,
+    )
+    return (grad_query, grad_key, grad_value, None)
+
+
+_RMS_NORM_FW = _aten._fused_rms_norm.default
+_RMS_NORM_BW = _aten._fused_rms_norm_backward.default
+
+
+@_lowering(_RMS_NORM_FW)
+@_skip_prepare(_RMS_NORM_FW)
+def _(mb, input, normalized_shape, weight=None, eps=None):
+    # Only ttml-shaped calls reach here: tt's rms_norm (ops/rmsnorm.cpp) decomposes the rest before tracing.
+    # A direct _fused_rms_norm call bypasses that; a non-bf16 one fails in build_rmsnorm_fw when training.
+    if len(normalized_shape) != 1:
+        raise NotImplementedError(
+            "tt-crank compile: _fused_rms_norm over more than one normalized dim; use F.rms_norm"
+        )
+    eps = torch.finfo(torch.float32).eps if eps is None else float(eps)
+    if _compiling_training_graph():
+        return mb.rmsnorm_fw(input, weight, eps)
+    return mb.rms_norm(input, weight, eps), None
+
+
+@_lowering(_RMS_NORM_BW)
+@_skip_prepare(_RMS_NORM_BW)
+def _(mb, grad_out, input, normalized_shape, rstd, weight, output_mask):
+    grad_input, grad_weight = mb.rmsnorm_bw(grad_out, input, rstd, weight)
+    return (
+        grad_input if output_mask[0] else None,
+        grad_weight if output_mask[1] else None,
+    )
 
 
 # aten's cross_entropy is `_log_softmax` + `nll_loss_forward`, its backward `nll_loss_backward` +
@@ -1230,6 +1323,7 @@ class CompileOption(StrEnum):
     EXPERIMENTAL_KV_CACHE_DTYPE = "experimental_kv_cache_dtype"  # BfpDtype
     MATH_FIDELITY = "math_fidelity"  # MathFidelity
     FP32_DEST_ACC_EN = "fp32_dest_acc_en"  # bool
+    MATH_APPROX_MODE = "math_approx_mode"  # bool
     EXPERIMENTAL_ENABLE_FUSING_CONV2D_WITH_MULTIPLY_PATTERN = (
         "experimental_enable_fusing_conv2d_with_multiply_pattern"  # bool
     )
@@ -1314,6 +1408,9 @@ def _compile_options(
 
     if CompileOption.FP32_DEST_ACC_EN in options:
         opts.fp32_dest_acc_en = options[CompileOption.FP32_DEST_ACC_EN]
+
+    if CompileOption.MATH_APPROX_MODE in options:
+        opts.math_approx_mode = options[CompileOption.MATH_APPROX_MODE]
 
     if CompileOption.EXPERIMENTAL_ENABLE_FUSING_CONV2D_WITH_MULTIPLY_PATTERN in options:
         opts.experimental_enable_fusing_conv2d_with_multiply_pattern = options[

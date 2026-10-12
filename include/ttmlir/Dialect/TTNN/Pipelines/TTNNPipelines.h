@@ -250,6 +250,22 @@ struct TTIRToTTNNCommonPipelineOptions
                      "Analysis and Memory Layout Analysis. [0.0-1.0]"),
       llvm::cl::init(0.95f)};
 
+  // Option to enable generation of DRAM-sharded matmuls in the optimizer. Off
+  // by default: DS trades compute width for per-bank read efficiency, and
+  // whether that pays depends on the part's bank-to-worker ratio. Unset, the
+  // matmul DRAM-shard rule book is suppressed and matmuls take the other
+  // (1D/2D mcast) program configs. Takes effect only with memory layout
+  // analysis enabled (optimization level 2): DS relies on the L1 sharded
+  // layouts and the L1 spill management that only that tier runs, so the
+  // option is forced off below it once the level is resolved, for the optimizer
+  // and the fusing pass alike.
+  mutable Option<bool> enableDRAMShardedMatmul{
+      *this, OptionNames::enableDramShardedMatmul,
+      llvm::cl::desc("Enable generation of DRAM-sharded matmuls in the "
+                     "optimizer. Requires memory-layout-analysis-enabled "
+                     "(optimization level 2)."),
+      llvm::cl::init(false)};
+
   // Option to enable/disable the workaround pass.
   //
   Option<bool> disableWorkarounds{
@@ -311,6 +327,17 @@ struct TTIRToTTNNCommonPipelineOptions
   Option<bool> enableFusing{*this, "enable-fusing-pass",
                             llvm::cl::desc("Enable fusing pass."),
                             llvm::cl::init(true)};
+
+  // Set multicast program configs on DRAM-interleaved matmul/linear ops after
+  // the optimizer has decided layouts.
+  // If not explicitly set, enabled only without memory layout analysis: the
+  // pass sizes circular buffers against an empty L1, which does not hold once
+  // the optimizer keeps tensors in L1 across matmuls.
+  mutable Option<bool> enableMatmulProgramConfig{
+      *this, "enable-matmul-program-config",
+      llvm::cl::desc("Set matmul program configs on DRAM-interleaved "
+                     "ttnn.matmul and ttnn.linear ops."),
+      llvm::cl::init(true)};
 
   // Enable the TTNNCreateD2MSubgraphs pass. This pass finds maximal chains
   // of elementwise TTNN ops, outlines each chain into a private function, and
@@ -583,6 +610,12 @@ struct TTIRToTTNNCommonPipelineOptions
     }
     if (!memoryLayoutAnalysisEnabled.hasValue()) {
       memoryLayoutAnalysisEnabled = (optimizationLevel >= 2);
+    }
+    if (!enableMatmulProgramConfig.hasValue()) {
+      enableMatmulProgramConfig = !memoryLayoutAnalysisEnabled;
+    }
+    if (!memoryLayoutAnalysisEnabled) {
+      enableDRAMShardedMatmul = false;
     }
     if (!computeCfgMathFidelity.hasValue() && optimizationLevel > 0) {
       computeCfgMathFidelity = OptionalMathFidelity::Undefined;

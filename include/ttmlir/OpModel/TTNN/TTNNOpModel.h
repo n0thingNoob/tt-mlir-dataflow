@@ -2432,6 +2432,26 @@ struct OpModel<SDPABackwardOp> {
 };
 
 //===----------------------------------------------------------------------===//
+// SoftmaxBackwardOp
+//===----------------------------------------------------------------------===//
+
+template <>
+struct OpModel<SoftmaxBackwardOp> {
+  static llvm::Expected<OpConstraints>
+  getOpConstraints(llvm::ArrayRef<int64_t> softmaxOutputShape,
+                   TTNNLayoutAttr softmaxOutputLayout,
+                   llvm::ArrayRef<int64_t> gradShape, TTNNLayoutAttr gradLayout,
+                   int32_t dimension, TTNNLayoutAttr outputLayout,
+                   const MockAllocatorState *initialState = nullptr);
+
+  static llvm::Expected<size_t>
+  getOpRuntime(llvm::ArrayRef<int64_t> softmaxOutputShape,
+               TTNNLayoutAttr softmaxOutputLayout,
+               llvm::ArrayRef<int64_t> gradShape, TTNNLayoutAttr gradLayout,
+               int32_t dimension, TTNNLayoutAttr outputLayout);
+};
+
+//===----------------------------------------------------------------------===//
 // RMSNormForwardOp
 //===----------------------------------------------------------------------===//
 
@@ -2496,6 +2516,30 @@ struct OpModel<LayerNormForwardOp> {
 };
 
 //===----------------------------------------------------------------------===//
+// LayerNormBackwardOp
+//===----------------------------------------------------------------------===//
+
+template <>
+struct OpModel<LayerNormBackwardOp> {
+  static llvm::Expected<OpConstraints> getOpConstraints(
+      llvm::ArrayRef<int64_t> inputShape, TTNNLayoutAttr inputLayout,
+      llvm::ArrayRef<int64_t> gammaShape, TTNNLayoutAttr gammaLayout,
+      llvm::ArrayRef<int64_t> meanShape, TTNNLayoutAttr meanLayout,
+      llvm::ArrayRef<int64_t> rstdShape, TTNNLayoutAttr rstdLayout,
+      llvm::ArrayRef<int64_t> dL_doutShape, TTNNLayoutAttr dL_doutLayout,
+      TTNNLayoutAttr outputLayout,
+      const MockAllocatorState *initialState = nullptr);
+
+  static llvm::Expected<size_t>
+  getOpRuntime(llvm::ArrayRef<int64_t> inputShape, TTNNLayoutAttr inputLayout,
+               llvm::ArrayRef<int64_t> gammaShape, TTNNLayoutAttr gammaLayout,
+               llvm::ArrayRef<int64_t> meanShape, TTNNLayoutAttr meanLayout,
+               llvm::ArrayRef<int64_t> rstdShape, TTNNLayoutAttr rstdLayout,
+               llvm::ArrayRef<int64_t> dL_doutShape,
+               TTNNLayoutAttr dL_doutLayout, TTNNLayoutAttr outputLayout);
+};
+
+//===----------------------------------------------------------------------===//
 // CrossEntropyForwardOp
 //===----------------------------------------------------------------------===//
 
@@ -2532,6 +2576,25 @@ struct OpModel<CrossEntropyBackwardOp> {
                llvm::ArrayRef<int64_t> targetShape, TTNNLayoutAttr targetLayout,
                llvm::ArrayRef<int64_t> gradShape, TTNNLayoutAttr gradLayout,
                llvm::APFloat scaler, TTNNLayoutAttr outputLayout);
+};
+
+//===----------------------------------------------------------------------===//
+// SiluBackwardOp
+//===----------------------------------------------------------------------===//
+
+template <>
+struct OpModel<SiluBackwardOp> {
+  static llvm::Expected<OpConstraints>
+  getOpConstraints(llvm::ArrayRef<int64_t> inputShape,
+                   TTNNLayoutAttr inputLayout,
+                   llvm::ArrayRef<int64_t> gradOutputShape,
+                   TTNNLayoutAttr gradOutputLayout, TTNNLayoutAttr outputLayout,
+                   const MockAllocatorState *initialState = nullptr);
+
+  static llvm::Expected<size_t>
+  getOpRuntime(llvm::ArrayRef<int64_t> inputShape, TTNNLayoutAttr inputLayout,
+               llvm::ArrayRef<int64_t> gradOutputShape,
+               TTNNLayoutAttr gradOutputLayout, TTNNLayoutAttr outputLayout);
 };
 
 //===----------------------------------------------------------------------===//

@@ -3779,6 +3779,51 @@ void AllToAllDispatchMetadataOp::allocateSemaphores(
 }
 
 //===----------------------------------------------------------------------===//
+// SoftmaxBackwardOp
+//===----------------------------------------------------------------------===//
+
+::mlir::LogicalResult mlir::tt::ttnn::SoftmaxBackwardOp::verify() {
+  RankedTensorType outputType = getSoftmaxOutput().getType();
+  RankedTensorType gradType = getGrad().getType();
+  RankedTensorType resultType = getResult().getType();
+
+  if (outputType.getRank() < 2) {
+    return emitOpError("softmax_output must have rank at least 2");
+  }
+
+  auto verifyMatchingType = [&](llvm::StringRef name,
+                                RankedTensorType type) -> LogicalResult {
+    if (type.getShape() != outputType.getShape()) {
+      return emitOpError() << name << " shape must match softmax_output shape";
+    }
+    if (type.getElementType() != outputType.getElementType()) {
+      return emitOpError() << name
+                           << " element type must match softmax_output element "
+                              "type";
+    }
+    return success();
+  };
+  if (failed(verifyMatchingType("grad", gradType)) ||
+      failed(verifyMatchingType("result", resultType))) {
+    return failure();
+  }
+
+  Type elementType = outputType.getElementType();
+  if (!elementType.isBF16() && !elementType.isF32()) {
+    return emitOpError("only bf16 and f32 element types are supported");
+  }
+
+  int64_t dim = getDimension();
+  int64_t rank = outputType.getRank();
+  int64_t normalizedDim = dim < 0 ? dim + rank : dim;
+  if (normalizedDim != rank - 1) {
+    return emitOpError("dimension must select the last dimension");
+  }
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // SortOp
 //===----------------------------------------------------------------------===//
 
@@ -4231,6 +4276,65 @@ static LogicalResult verifySDPATileAlignment(Operation *op,
 }
 
 //===----------------------------------------------------------------------===//
+// LayerNormBackwardOp
+//===----------------------------------------------------------------------===//
+::mlir::LogicalResult mlir::tt::ttnn::LayerNormBackwardOp::verify() {
+  RankedTensorType inputType = getInput().getType();
+  RankedTensorType gammaType = getGamma().getType();
+  RankedTensorType meanType = getMean().getType();
+  RankedTensorType rstdType = getRstd().getType();
+  RankedTensorType gradType = getDLDout().getType();
+
+  if (inputType.getRank() != 4 || gammaType.getRank() != 4 ||
+      meanType.getRank() != 4 || rstdType.getRank() != 4 ||
+      gradType.getRank() != 4) {
+    return emitOpError("all inputs must be rank 4");
+  }
+
+  int64_t normalizedSize = inputType.getDimSize(3);
+  llvm::SmallVector<int64_t, 4> expectedGammaShape{1, 1, 1, normalizedSize};
+  if (gammaType.getShape() != llvm::ArrayRef<int64_t>(expectedGammaShape)) {
+    return emitOpError("gamma must have shape (1, 1, 1, ")
+           << normalizedSize << ")";
+  }
+
+  llvm::SmallVector<int64_t, 4> expectedStatsShape(inputType.getShape());
+  expectedStatsShape.back() = 1;
+  if (meanType.getShape() != llvm::ArrayRef<int64_t>(expectedStatsShape) ||
+      rstdType.getShape() != llvm::ArrayRef<int64_t>(expectedStatsShape)) {
+    return emitOpError("mean and rstd must have shape (B, N, S, 1)");
+  }
+  if (gradType.getShape() != inputType.getShape()) {
+    return emitOpError("dL_dout must have the same shape as input");
+  }
+
+  Type elementType = inputType.getElementType();
+  if (gammaType.getElementType() != elementType ||
+      meanType.getElementType() != elementType ||
+      rstdType.getElementType() != elementType ||
+      gradType.getElementType() != elementType) {
+    return emitOpError("all inputs must have the same element type");
+  }
+
+  RankedTensorType dxType = getDx().getType();
+  RankedTensorType dgammaType = getDgamma().getType();
+  RankedTensorType dbetaType = getDbeta().getType();
+  if (dxType.getShape() != inputType.getShape()) {
+    return emitOpError("dx must have the same shape as input");
+  }
+  if (dgammaType.getShape() != gammaType.getShape() ||
+      dbetaType.getShape() != gammaType.getShape()) {
+    return emitOpError("dgamma and dbeta must have the same shape as gamma");
+  }
+  if (dxType.getElementType() != elementType ||
+      dgammaType.getElementType() != elementType ||
+      dbetaType.getElementType() != elementType) {
+    return emitOpError("all outputs must have the same element type as input");
+  }
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // DitRMSNormUnaryFusedOp
 //===----------------------------------------------------------------------===//
 ::mlir::LogicalResult mlir::tt::ttnn::DitRMSNormUnaryFusedOp::verify() {
@@ -4390,6 +4494,43 @@ static LogicalResult verifySDPATileAlignment(Operation *op,
   if (!targetType.getElementType().isIntOrIndex()) {
     return emitOpError("target must have an integer element type, got ")
            << targetType.getElementType();
+  }
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// SiluBackwardOp
+//===----------------------------------------------------------------------===//
+
+::mlir::LogicalResult mlir::tt::ttnn::SiluBackwardOp::verify() {
+  RankedTensorType inputType = getInput().getType();
+
+  if (inputType.getRank() != 4) {
+    return emitOpError("input must be a 4D tensor, got rank ")
+           << inputType.getRank();
+  }
+
+  llvm::ArrayRef<int64_t> inputShape = inputType.getShape();
+  mlir::Type elementType = inputType.getElementType();
+  auto verifyType = [this, inputShape, elementType](
+                        llvm::StringRef name, Value value) -> LogicalResult {
+    RankedTensorType type = cast<RankedTensorType>(value.getType());
+    if (type.getShape() != inputShape) {
+      return emitOpError(name) << " shape must match input shape, expected "
+                               << inputShape << ", got " << type.getShape();
+    }
+    if (type.getElementType() != elementType) {
+      return emitOpError(name)
+             << " element type must match input element type, expected "
+             << elementType << ", got " << type.getElementType();
+    }
+    return success();
+  };
+
+  if (failed(verifyType("grad_output", getGradOutput())) ||
+      failed(verifyType("result", getGradInput()))) {
+    return failure();
   }
 
   return success();
@@ -7960,7 +8101,7 @@ mlir::tt::ttnn::PagedFlashMultiLatentAttentionDecodeOp::verify() {
     return emitOpError("Key must be a 4D tensor [B, 1, T, D]");
   }
   if (weightsType.getRank() != 4) {
-    return emitOpError("Weights must be a 4D tensor [B, Hi, Sq, 1]");
+    return emitOpError("Weights must be a 4D tensor [B, 1, Sq, Hi]");
   }
   if (resultType.getRank() != 4) {
     return emitOpError("Result must be a 4D tensor [B, 1, Sq, T]");
@@ -7987,12 +8128,11 @@ mlir::tt::ttnn::PagedFlashMultiLatentAttentionDecodeOp::verify() {
     return emitOpError("Key head dim must match query head dim");
   }
 
-  if (weightsType.getShape()[0] != batch ||
-      weightsType.getShape()[1] != numHeads ||
+  if (weightsType.getShape()[0] != batch || weightsType.getShape()[1] != 1 ||
       weightsType.getShape()[2] != querySeqLen ||
-      weightsType.getShape()[3] != 1) {
+      weightsType.getShape()[3] != numHeads) {
     return emitOpError(
-        "Weights shape must be [batch, num_heads, query_seq_len, 1]");
+        "Weights shape must be [batch, 1, query_seq_len, num_heads]");
   }
 
   if (resultType.getShape()[0] != batch || resultType.getShape()[1] != 1 ||

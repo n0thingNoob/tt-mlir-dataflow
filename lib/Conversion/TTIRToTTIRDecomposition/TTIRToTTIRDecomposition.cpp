@@ -1167,8 +1167,8 @@ public:
     StringRef compositeName = op.getCompositeName();
     if (compositeName != "sdpa_fw" && compositeName != "sdpa_bw" &&
         compositeName != "rmsnorm_fw" && compositeName != "rmsnorm_bw" &&
-        compositeName != "layernorm_fw" &&
-        compositeName != "swiglu_elemwise_bw") {
+        compositeName != "layernorm_fw" && compositeName != "layernorm_bw" &&
+        compositeName != "silu_bw" && compositeName != "swiglu_elemwise_bw") {
       return failure();
     }
 

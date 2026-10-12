@@ -586,6 +586,40 @@ public:
         return tk::build_sdpa(*mb_, query, key, value, is_causal, scale, attn_mask.value_or(mlir::Value{}));
     }
 
+    std::pair<mlir::Value, mlir::Value> sdpa_fw(mlir::Value query, mlir::Value key, mlir::Value value, bool is_causal,
+                                                std::optional<double> scale, std::optional<mlir::Value> attn_mask) {
+        assert_builder();
+        return tk::build_sdpa_fw(*mb_, query, key, value, is_causal, scale, attn_mask.value_or(mlir::Value{}));
+    }
+
+    std::tuple<mlir::Value, mlir::Value, mlir::Value>
+    sdpa_bw(mlir::Value grad_output, mlir::Value attn_output, mlir::Value query, mlir::Value key, mlir::Value value,
+            mlir::Value logsumexp, bool is_causal, std::optional<double> scale, std::optional<mlir::Value> attn_mask) {
+        assert_builder();
+        return tk::build_sdpa_bw(*mb_, grad_output, attn_output, query, key, value, logsumexp, is_causal, scale,
+                                 attn_mask.value_or(mlir::Value{}));
+    }
+
+    mlir::Value rms_norm(mlir::Value input, std::optional<mlir::Value> weight, double epsilon) {
+        assert_builder();
+        return tk::build_rms_norm(*mb_, input, weight.value_or(mlir::Value{}), epsilon);
+    }
+
+    // stats_in_f32=false keeps rms in the input dtype, the only form ttml promotes.
+    std::pair<mlir::Value, mlir::Value> rmsnorm_fw(mlir::Value input, std::optional<mlir::Value> weight,
+                                                   double epsilon) {
+        assert_builder();
+        return tk::build_rmsnorm_fw(*mb_, input, weight.value_or(mlir::Value{}), epsilon, /*stats_in_f32=*/false);
+    }
+
+    std::pair<mlir::Value, std::optional<mlir::Value>> rmsnorm_bw(mlir::Value grad_output, mlir::Value input,
+                                                                  mlir::Value rstd, std::optional<mlir::Value> weight) {
+        assert_builder();
+        auto [grad_input, grad_weight] = tk::build_rmsnorm_bw(*mb_, grad_output, input, rstd,
+                                                              weight.value_or(mlir::Value{}), /*stats_in_f32=*/false);
+        return {grad_input, grad_weight ? std::optional{grad_weight} : std::nullopt};
+    }
+
     // Always 4 entries; the last is None without amsgrad.
     std::vector<std::optional<mlir::Value>> adamw(mlir::Value param, mlir::Value grad, mlir::Value exp_avg,
                                                   mlir::Value exp_avg_sq, std::optional<mlir::Value> max_exp_avg_sq,
@@ -825,6 +859,7 @@ NB_MODULE(_native, m) {
         .def_rw("experimental_kv_cache_dtype", &::tt::crank::CompileOptions::experimental_kv_cache_dtype)
         .def_rw("math_fidelity", &::tt::crank::CompileOptions::math_fidelity)
         .def_rw("fp32_dest_acc_en", &::tt::crank::CompileOptions::fp32_dest_acc_en)
+        .def_rw("math_approx_mode", &::tt::crank::CompileOptions::math_approx_mode)
         .def_rw("experimental_enable_fusing_conv2d_with_multiply_pattern",
                 &::tt::crank::CompileOptions::experimental_enable_fusing_conv2d_with_multiply_pattern)
         .def_rw("experimental_enable_permute_matmul_fusion",
@@ -944,6 +979,13 @@ NB_MODULE(_native, m) {
         .def("where", &PyModuleBuilder::where, "condition"_a, "true_val"_a, "false_val"_a)
         .def("sdpa", &PyModuleBuilder::sdpa, "query"_a, "key"_a, "value"_a, "is_causal"_a = true,
              "scale"_a = nb::none(), "attn_mask"_a = nb::none())
+        .def("sdpa_fw", &PyModuleBuilder::sdpa_fw, "query"_a, "key"_a, "value"_a, "is_causal"_a = false,
+             "scale"_a = nb::none(), "attn_mask"_a = nb::none())
+        .def("sdpa_bw", &PyModuleBuilder::sdpa_bw, "grad_output"_a, "attn_output"_a, "query"_a, "key"_a, "value"_a,
+             "logsumexp"_a, "is_causal"_a = false, "scale"_a = nb::none(), "attn_mask"_a = nb::none())
+        .def("rms_norm", &PyModuleBuilder::rms_norm, "input"_a, "weight"_a, "epsilon"_a)
+        .def("rmsnorm_fw", &PyModuleBuilder::rmsnorm_fw, "input"_a, "weight"_a, "epsilon"_a)
+        .def("rmsnorm_bw", &PyModuleBuilder::rmsnorm_bw, "grad_output"_a, "input"_a, "rstd"_a, "weight"_a)
         .def("adamw", &PyModuleBuilder::adamw, "param"_a, "grad"_a, "exp_avg"_a, "exp_avg_sq"_a, "max_exp_avg_sq"_a,
              "step"_a, "lr"_a, "beta1"_a, "beta2"_a, "epsilon"_a, "weight_decay"_a)
         .def("index_copy", &PyModuleBuilder::index_copy, "input"_a, "dim"_a, "index"_a, "source"_a)

@@ -166,9 +166,7 @@ class GeluBackwardOpConversionPattern
           mlir::tt::ttnn::GeluBackwardOp> {
 private:
   std::string getPrefixSearchPattern() const override { return "ttnn.gelu_bw"; }
-  std::string getPrefixSwapPattern() const override {
-    return "ttnn.experimental.gelu_bw";
-  }
+  std::string getPrefixSwapPattern() const override { return "ttnn.gelu_bw"; }
 
 public:
   using TTNNToEmitPyBaseOpConversionPattern<
@@ -184,11 +182,27 @@ public:
     llvm::SmallVector<mlir::Attribute> args{
         emitter.emit(srcOp.getLhs()),
         emitter.emit(srcOp.getRhs()),
-        emitter.emit(srcOp.getApproximate(), "approximate"),
+        emitter.emitExpression(srcOp.getApproximate() == "tanh"
+                                   ? "ttnn.GeluVariant.Tanh"
+                                   : "ttnn.GeluVariant.Accurate",
+                               "variant"),
         emitter.emit(srcOp.getMemoryConfigAttr(), "memory_config"),
     };
 
-    emitter.replaceOp(*this, args);
+    // ttnn.gelu_bw hands back a one-element list of gradients while the
+    // dialect op is single-result, so call it as a list and index element 0.
+    auto tensorListType = emitpy::OpaqueType::get(
+        rewriter.getContext(),
+        ttnn_to_emitpy::TypeNameV<std::vector<::ttnn::Tensor>>);
+    mlir::Value callResult = emitter.createCall(*this, args, tensorListType);
+
+    auto index = rewriter.create<emitpy::LiteralOp>(
+        srcOp.getLoc(), rewriter.getIndexType(), "0");
+    auto subscriptOp = rewriter.create<emitpy::SubscriptOp>(
+        srcOp.getLoc(),
+        getTypeConverter()->convertType(srcOp.getResult().getType()),
+        callResult, index.getResult());
+    rewriter.replaceOp(srcOp, subscriptOp.getResult());
 
     return success();
   }
@@ -5690,6 +5704,26 @@ public:
   }
 };
 
+// SoftmaxBackward conversion pattern. The low-level TTML primitive is not
+// exposed through tt-train's Python bindings.
+class SoftmaxBackwardOpConversionPattern
+    : public TTNNToEmitPyBaseOpConversionPattern<
+          mlir::tt::ttnn::SoftmaxBackwardOp> {
+public:
+  using TTNNToEmitPyBaseOpConversionPattern<
+      mlir::tt::ttnn::SoftmaxBackwardOp>::TTNNToEmitPyBaseOpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(mlir::tt::ttnn::SoftmaxBackwardOp srcOp, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    return rewriter.notifyMatchFailure(
+        srcOp,
+        "EmitPy lowering for ttnn.softmax_backward is not supported: ttml "
+        "does not expose metal::softmax_backward through Python "
+        "bindings.");
+  }
+};
+
 // RMSNormBackward conversion pattern.
 //
 // EmitPy lowering for ttnn.rmsnorm_bw is intentionally unsupported, for the
@@ -5735,6 +5769,46 @@ public:
         "EmitPy lowering for ttnn.layernorm_fw is not supported: ttml does not "
         "expose the metal::layernorm_fw primitive through its Python "
         "bindings.");
+  }
+};
+
+class LayerNormBackwardOpConversionPattern
+    : public TTNNToEmitPyBaseOpConversionPattern<
+          mlir::tt::ttnn::LayerNormBackwardOp> {
+public:
+  using TTNNToEmitPyBaseOpConversionPattern<
+      mlir::tt::ttnn::LayerNormBackwardOp>::TTNNToEmitPyBaseOpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(mlir::tt::ttnn::LayerNormBackwardOp srcOp, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    return rewriter.notifyMatchFailure(
+        srcOp,
+        "EmitPy lowering for ttnn.layernorm_bw is not supported: ttml does not "
+        "expose the metal::layernorm_bw primitive through its Python "
+        "bindings.");
+  }
+};
+
+// SiluBackward conversion pattern.
+//
+// EmitPy lowering for ttnn.silu_bw is intentionally unsupported. The emitted
+// Python would need to call the low-level ttml::metal::silu_bw primitive,
+// which tt-train does not expose through its Python bindings.
+class SiluBackwardOpConversionPattern
+    : public TTNNToEmitPyBaseOpConversionPattern<
+          mlir::tt::ttnn::SiluBackwardOp> {
+public:
+  using TTNNToEmitPyBaseOpConversionPattern<
+      mlir::tt::ttnn::SiluBackwardOp>::TTNNToEmitPyBaseOpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(mlir::tt::ttnn::SiluBackwardOp srcOp, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    return rewriter.notifyMatchFailure(
+        srcOp, "EmitPy lowering for ttnn.silu_bw is not supported: ttml does "
+               "not expose the metal::silu_bw primitive through its Python "
+               "bindings.");
   }
 };
 
@@ -6188,19 +6262,20 @@ void populateTTNNToEmitPyPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
   patterns.add<PagedFlashMultiLatentAttentionDecodeOpConversionPattern>(
       typeConverter, ctx);
 
-  // AdamW: deliberately declines conversion (see TODO(pglusac) above).
+  // TTML ops: deliberately decline conversion (see issue above).
   patterns.add<AdamWOpConversionPattern>(typeConverter, ctx);
-
-  // SDPAForward: deliberately declines conversion (see comment above).
   patterns.add<SDPAForwardOpConversionPattern>(typeConverter, ctx);
-
-  // SDPABackward: deliberately declines conversion (see comment above).
   patterns.add<SDPABackwardOpConversionPattern>(typeConverter, ctx);
 
   // Normalization forward ops deliberately decline conversion.
   patterns.add<RMSNormForwardOpConversionPattern>(typeConverter, ctx);
   patterns.add<RMSNormBackwardOpConversionPattern>(typeConverter, ctx);
+  patterns.add<SoftmaxBackwardOpConversionPattern>(typeConverter, ctx);
   patterns.add<LayerNormForwardOpConversionPattern>(typeConverter, ctx);
+  patterns.add<LayerNormBackwardOpConversionPattern>(typeConverter, ctx);
+
+  // SiluBackward: deliberately declines conversion, same reason.
+  patterns.add<SiluBackwardOpConversionPattern>(typeConverter, ctx);
 
   // SwigluElemwiseBackward: deliberately declines conversion, same reason.
   patterns.add<SwigluElemwiseBackwardOpConversionPattern>(typeConverter, ctx);

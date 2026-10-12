@@ -113,6 +113,7 @@ void createTTNNPipelineAnalysisPasses(
     DevicePassesWrapperOptions wrapperOptions;
     wrapperOptions.devicePtr = options.devicePtr;
     wrapperOptions.tensorL1UsageCap = options.tensorL1UsageCap;
+    wrapperOptions.enableDRAMShardedMatmul = options.enableDRAMShardedMatmul;
 
     ttnn::TTNNOperationValidationAndFallbackOptions validationOptions;
     validationOptions.maxFallbackAttempts = options.maxFallbackAttempts;
@@ -214,6 +215,7 @@ void createTTNNResolveCompositesPass(
     DevicePassesWrapperOptions wrapperOptions;
     wrapperOptions.devicePtr = options.devicePtr;
     wrapperOptions.tensorL1UsageCap = options.tensorL1UsageCap;
+    wrapperOptions.enableDRAMShardedMatmul = options.enableDRAMShardedMatmul;
     pm.addPass(createDevicePassesWrapper(
         [](OpPassManager &innerPm) {
           TTNNResolveCompositesOptions resolveOptions;
@@ -248,18 +250,24 @@ void createTTNNFusingPass(OpPassManager &pm,
       DevicePassesWrapperOptions wrapperOptions;
       wrapperOptions.devicePtr = options.devicePtr;
       wrapperOptions.tensorL1UsageCap = options.tensorL1UsageCap;
+      wrapperOptions.enableDRAMShardedMatmul = options.enableDRAMShardedMatmul;
 
       uint32_t fallbackAttempts = options.maxFallbackAttempts;
       bool enableEltwiseActivationFusion =
           options.enableEltwiseActivationFusion;
+      // Fusing needs to know whether DRAM sharding is on so it can keep an
+      // activation off a producer matmul. Only the optimizer selects DS
+      // configs, so the non-optimizer path below leaves the pass default alone.
+      bool enableDRAMShardedMatmul = options.enableDRAMShardedMatmul;
       pm.addPass(createDevicePassesWrapper(
-          [fallbackAttempts,
-           enableEltwiseActivationFusion](OpPassManager &innerPm) {
+          [fallbackAttempts, enableEltwiseActivationFusion,
+           enableDRAMShardedMatmul](OpPassManager &innerPm) {
             TTNNFusingOptions fusingOptions;
             fusingOptions.enableOpConstraints = true;
             fusingOptions.maxFallbackAttempts = fallbackAttempts;
             fusingOptions.enableEltwiseActivationFusion =
                 enableEltwiseActivationFusion;
+            fusingOptions.enableDRAMShardedMatmul = enableDRAMShardedMatmul;
             innerPm.addPass(mlir::tt::ttnn::createTTNNFusing(fusingOptions));
           },
           wrapperOptions));
@@ -273,6 +281,36 @@ void createTTNNFusingPass(OpPassManager &pm,
           options.enableEltwiseActivationFusion;
       pm.addPass(mlir::tt::ttnn::createTTNNFusing(fusingOptions));
     }
+  }
+}
+
+// Create the matmul program config pass. With the optimizer enabled it runs
+// inside the device wrapper and validates every chosen config with OpModel,
+// dropping configs that fail. Without the optimizer there is no OpModel device,
+// so configs are set unvalidated.
+void createTTNNSetMatmulProgramConfigPass(
+    OpPassManager &pm, const TTIRToTTNNCommonPipelineOptions &options) {
+  if (!options.enableMatmulProgramConfig) {
+    return;
+  }
+  if (options.optimizerPassEnabled) {
+#ifdef TTMLIR_ENABLE_OPMODEL
+    DevicePassesWrapperOptions wrapperOptions;
+    wrapperOptions.devicePtr = options.devicePtr;
+    wrapperOptions.tensorL1UsageCap = options.tensorL1UsageCap;
+    pm.addPass(createDevicePassesWrapper(
+        [](OpPassManager &innerPm) {
+          TTNNSetMatmulProgramConfigOptions configOptions;
+          configOptions.enableOpConstraints = true;
+          innerPm.addPass(createTTNNSetMatmulProgramConfig(configOptions));
+        },
+        wrapperOptions));
+#else
+    llvm::llvm_unreachable_internal(
+        "TTNN optimizer passes require OpModel support to be enabled.");
+#endif
+  } else {
+    pm.addPass(createTTNNSetMatmulProgramConfig());
   }
 }
 
@@ -391,6 +429,8 @@ void createTTIRToTTNNCommonPipeline(
         DevicePassesWrapperOptions decompWrapperOptions;
         decompWrapperOptions.devicePtr = options.devicePtr;
         decompWrapperOptions.tensorL1UsageCap = options.tensorL1UsageCap;
+        decompWrapperOptions.enableDRAMShardedMatmul =
+            options.enableDRAMShardedMatmul;
 
         uint32_t decompFallbackAttempts = options.maxFallbackAttempts;
         devicePm.addPass(createDevicePassesWrapper(
@@ -474,6 +514,8 @@ void createTTIRToTTNNCommonPipeline(
     }
 
     createTTNNPipelineAnalysisPasses(devicePm, options);
+
+    createTTNNSetMatmulProgramConfigPass(devicePm, options);
 
     // Materialize PrepareConv3dWeightsOp for every Conv3dOp. Runs after the
     // optimizer (so it can read the optimizer's chosen Conv3dConfigAttr) but

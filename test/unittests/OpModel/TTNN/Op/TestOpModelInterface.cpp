@@ -6590,6 +6590,66 @@ TEST_F(OpModelBase, LayerNormForwardOpInterface) {
   }
 }
 
+TEST_F(OpModelBase, SoftmaxBackwardOpInterface) {
+  llvm::SmallVector<int64_t> shape = {1, 1, 128, 256};
+  auto layout = CreateTiledLayout(shape, BufferType::DRAM,
+                                  TensorMemoryLayout::Interleaved);
+  auto softmaxOutput = createEmptyTensor(shape, builder.getBF16Type(), layout);
+  auto grad = createEmptyTensor(shape, builder.getBF16Type(), layout);
+  auto resultType =
+      createRankedTensorType(shape, builder.getBF16Type(), layout);
+  auto op = builder.create<SoftmaxBackwardOp>(builder.getUnknownLoc(),
+                                              resultType, softmaxOutput, grad,
+                                              builder.getSI32IntegerAttr(-1));
+
+  auto backend = dyn_cast<OpModel>(op.getOperation());
+  ASSERT_TRUE(backend);
+  auto inputLayouts = getInputLayouts(op.getOperation());
+  ASSERT_EQ(inputLayouts.size(), 2u);
+  auto constraintsExp = backend.getOpConstraints(inputLayouts, OpConfig());
+  ASSERT_TRUE(static_cast<bool>(constraintsExp));
+  ASSERT_EQ(constraintsExp.get().outputLayouts.size(), 1u);
+  auto runtimeExp = backend.getOpRuntime(inputLayouts, OpConfig());
+  ASSERT_TRUE(static_cast<bool>(runtimeExp));
+  EXPECT_GT(runtimeExp.get(), 0);
+}
+
+TEST_F(OpModelBase, SiluBackwardOpInterface) {
+  llvm::SmallVector<int64_t> shape = {1, 1, 128, 256};
+  auto layout = CreateTiledLayout(shape, BufferType::DRAM,
+                                  TensorMemoryLayout::Interleaved);
+
+  auto input = createEmptyTensor(shape, builder.getBF16Type(), layout);
+  auto gradOutput = createEmptyTensor(shape, builder.getBF16Type(), layout);
+  auto resultType =
+      createRankedTensorType(shape, builder.getBF16Type(), layout);
+
+  auto siluBackward = builder.create<SiluBackwardOp>(
+      builder.getUnknownLoc(), resultType, input, gradOutput);
+
+  auto backend = dyn_cast<OpModel>(siluBackward.getOperation());
+  ASSERT_TRUE(backend);
+  auto inputLayouts = getInputLayouts(siluBackward.getOperation());
+  ASSERT_EQ(inputLayouts.size(), 2u);
+
+  auto constraintsExp = backend.getOpConstraints(inputLayouts, OpConfig());
+  if (constraintsExp) {
+    EXPECT_GT(constraintsExp.get().cbL1PeakSize, 0);
+    ASSERT_EQ(constraintsExp.get().outputLayouts.size(), 1u);
+  } else {
+    FAIL() << "Missing constraints for SiluBackwardOp; Error="
+           << llvm::toString(constraintsExp.takeError());
+  }
+
+  auto runtimeExp = backend.getOpRuntime(inputLayouts, OpConfig());
+  if (runtimeExp) {
+    EXPECT_GT(runtimeExp.get(), 0);
+  } else {
+    FAIL() << "Error getting runtime for SiluBackwardOp: "
+           << llvm::toString(runtimeExp.takeError());
+  }
+}
+
 TEST_F(OpModelBase, SwigluElemwiseBackwardOpInterface) {
   llvm::SmallVector<int64_t> shape = {1, 1, 128, 256};
   auto layout = CreateTiledLayout(shape, BufferType::DRAM,
@@ -6626,6 +6686,50 @@ TEST_F(OpModelBase, SwigluElemwiseBackwardOpInterface) {
     FAIL() << "Error getting runtime for SwigluElemwiseBackwardOp: "
            << llvm::toString(runtimeExp.takeError());
   }
+}
+
+TEST_F(OpModelBase, LayerNormBackwardOpInterface) {
+  llvm::SmallVector<int64_t> inputShape = {1, 1, 128, 256};
+  llvm::SmallVector<int64_t> parameterShape = {1, 1, 1, 256};
+  llvm::SmallVector<int64_t> statisticsShape = {1, 1, 128, 1};
+  auto inputLayout = CreateTiledLayout(inputShape, BufferType::DRAM,
+                                       TensorMemoryLayout::Interleaved);
+  auto parameterLayout = CreateTiledLayout(parameterShape, BufferType::DRAM,
+                                           TensorMemoryLayout::Interleaved);
+  auto statisticsLayout = CreateTiledLayout(statisticsShape, BufferType::DRAM,
+                                            TensorMemoryLayout::Interleaved);
+
+  auto input =
+      createEmptyTensor(inputShape, builder.getBF16Type(), inputLayout);
+  auto gamma =
+      createEmptyTensor(parameterShape, builder.getBF16Type(), parameterLayout);
+  auto mean = createEmptyTensor(statisticsShape, builder.getBF16Type(),
+                                statisticsLayout);
+  auto rstd = createEmptyTensor(statisticsShape, builder.getBF16Type(),
+                                statisticsLayout);
+  auto grad = createEmptyTensor(inputShape, builder.getBF16Type(), inputLayout);
+  auto outputType =
+      createRankedTensorType(inputShape, builder.getBF16Type(), inputLayout);
+  auto parameterOutputType = createRankedTensorType(
+      parameterShape, builder.getBF16Type(), parameterLayout);
+
+  auto op = builder.create<LayerNormBackwardOp>(
+      builder.getUnknownLoc(),
+      TypeRange{outputType, parameterOutputType, parameterOutputType}, input,
+      gamma, mean, rstd, grad);
+  auto backend = dyn_cast<OpModel>(op.getOperation());
+  ASSERT_TRUE(backend);
+  auto inputLayouts = getInputLayouts(op.getOperation());
+  ASSERT_EQ(inputLayouts.size(), 5u);
+
+  auto constraintsExp = backend.getOpConstraints(inputLayouts, OpConfig());
+  ASSERT_TRUE(static_cast<bool>(constraintsExp));
+  EXPECT_GT(constraintsExp.get().cbL1PeakSize, 0);
+  EXPECT_EQ(constraintsExp.get().outputLayouts.size(), 3u);
+
+  auto runtimeExp = backend.getOpRuntime(inputLayouts, OpConfig());
+  ASSERT_TRUE(static_cast<bool>(runtimeExp));
+  EXPECT_GT(runtimeExp.get(), 0);
 }
 
 TEST_F(OpModelBase, QuantizeOpInterface) {
@@ -7623,10 +7727,10 @@ TEST_F(OpModelBase, FlashMlaPrefillOpInterfaceWithMask) {
 // failing elsewhere.
 TEST_F(OpModelBase, IndexerScoreDsaOpInterface) {
   // Shapes mirror the transformer lit tests: query [B, Hi, Sq, D],
-  // key [B, 1, T, D], weights [B, Hi, Sq, 1] -> score [B, 1, Sq, T].
+  // key [B, 1, T, D], weights [B, 1, Sq, Hi] -> score [B, 1, Sq, T].
   llvm::SmallVector<int64_t> queryShape = {1, 8, 32, 128};
   llvm::SmallVector<int64_t> keyShape = {1, 1, 32, 128};
-  llvm::SmallVector<int64_t> weightsShape = {1, 8, 32, 1};
+  llvm::SmallVector<int64_t> weightsShape = {1, 1, 32, 8};
   llvm::SmallVector<int64_t> outputShape = {1, 1, 32, 32};
 
   auto tiledElemType = ttcore::TileType::get(builder.getBF16Type());

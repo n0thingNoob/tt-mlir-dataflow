@@ -262,6 +262,10 @@ public:
   static TTNNOperandsWorkarounds
   createCrossEntropyBackwardOpOperandsWorkarounds();
 
+  // Create workarounds for SiLU backward op operands.
+  static TTNNOperandsWorkarounds
+  createSiluBackwardOpOperandsWorkarounds(Operation *op);
+
   // Create workarounds for swiglu elementwise backward op operands.
   static TTNNOperandsWorkarounds
   createSwigluElemwiseBackwardOpOperandsWorkarounds(Operation *op);
@@ -319,8 +323,9 @@ public:
 
   static TTNNOperandsWorkarounds createTanhOpOperandsWorkarounds();
 
+  // Create workarounds for float-only unary ops invoked with integer inputs.
   static TTNNOperandsWorkarounds
-  createErfOpOperandsWorkarounds(mlir::RankedTensorType inputType);
+  createIntegerToBFloat16OperandsWorkarounds(mlir::RankedTensorType inputType);
 
   // Create workarounds for group norm op operands.
   static TTNNOperandsWorkarounds
@@ -403,6 +408,11 @@ public:
   static TTNNOperandsWorkarounds
   createSDPABackwardOpOperandsWorkarounds(Operation *op);
 
+  // Force TILE layout for the ttml softmax backward operands and result.
+  // Dtype (BF16/F32) and memory configuration are preserved.
+  static TTNNOperandsWorkarounds
+  createSoftmaxBackwardOpOperandsWorkarounds(Operation *op);
+
   // Create workarounds for the ttml rmsnorm_fw op: force bf16, tile layout
   // and DRAM interleaved memory for every operand and result. The backing metal
   // op (ttml::metal::rmsnorm_fw) TT_FATALs on anything else.
@@ -421,6 +431,11 @@ public:
   // op (ttml::metal::layernorm_fw) TT_FATALs on anything else.
   static TTNNOperandsWorkarounds
   createLayerNormForwardOpOperandsWorkarounds(Operation *op);
+
+  // Create workarounds for the ttml layernorm_bw op: force bf16, tile layout
+  // and DRAM interleaved memory for every operand and result.
+  static TTNNOperandsWorkarounds
+  createLayerNormBackwardOpOperandsWorkarounds(Operation *op);
 
   // Create workarounds for sparse_matmul op operands.
   // Sparsity tensor must be in ROW_MAJOR layout.

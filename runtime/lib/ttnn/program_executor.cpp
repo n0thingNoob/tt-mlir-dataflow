@@ -131,11 +131,14 @@
 #include "operations/ttml/adamw.h"
 #include "operations/ttml/cross_entropy_bw.h"
 #include "operations/ttml/cross_entropy_fw.h"
+#include "operations/ttml/layernorm_bw.h"
 #include "operations/ttml/layernorm_fw.h"
 #include "operations/ttml/rmsnorm_bw.h"
 #include "operations/ttml/rmsnorm_fw.h"
 #include "operations/ttml/sdpa_bw.h"
 #include "operations/ttml/sdpa_fw.h"
+#include "operations/ttml/silu_bw.h"
+#include "operations/ttml/softmax_backward.h"
 #include "operations/ttml/swiglu_elemwise_bw.h"
 #include "tt/runtime/debug.h"
 #include "tt/runtime/detail/ttnn/types/types.h"
@@ -665,6 +668,9 @@ void ProgramExecutor::runOperation(const ::tt::target::ttnn::Operation *op) {
   case ::tt::target::ttnn::OpType::SDPABackwardOp: {
     return operations::ttml::run(op->type_as_SDPABackwardOp(), getContext());
   }
+  case ::tt::target::ttnn::OpType::SoftmaxBackwardOp: {
+    return operations::ttml::run(op->type_as_SoftmaxBackwardOp(), getContext());
+  }
   case ::tt::target::ttnn::OpType::RMSNormForwardOp: {
     return operations::ttml::run(op->type_as_RMSNormForwardOp(), getContext());
   }
@@ -675,6 +681,10 @@ void ProgramExecutor::runOperation(const ::tt::target::ttnn::Operation *op) {
     return operations::ttml::run(op->type_as_LayerNormForwardOp(),
                                  getContext());
   }
+  case ::tt::target::ttnn::OpType::LayerNormBackwardOp: {
+    return operations::ttml::run(op->type_as_LayerNormBackwardOp(),
+                                 getContext());
+  }
   case ::tt::target::ttnn::OpType::CrossEntropyForwardOp: {
     return operations::ttml::run(op->type_as_CrossEntropyForwardOp(),
                                  getContext());
@@ -682,6 +692,9 @@ void ProgramExecutor::runOperation(const ::tt::target::ttnn::Operation *op) {
   case ::tt::target::ttnn::OpType::CrossEntropyBackwardOp: {
     return operations::ttml::run(op->type_as_CrossEntropyBackwardOp(),
                                  getContext());
+  }
+  case ::tt::target::ttnn::OpType::SiluBackwardOp: {
+    return operations::ttml::run(op->type_as_SiluBackwardOp(), getContext());
   }
   case ::tt::target::ttnn::OpType::SwigluElemwiseBackwardOp: {
     return operations::ttml::run(op->type_as_SwigluElemwiseBackwardOp(),

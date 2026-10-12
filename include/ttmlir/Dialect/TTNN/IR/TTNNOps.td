@@ -360,6 +360,14 @@ def TTNN_CeilOp : TTNN_ElementwiseUnaryOp<"ceil"> {
 
 def TTNN_SignOp: TTNN_ElementwiseUnaryOp<"sign"> {
     let summary = "Eltwise sign operation.";
+
+    let extraClassDeclaration = [{
+      wa::TTNNOperandsWorkarounds getOperandsWorkarounds() {
+        return wa::TTNNOperandsWorkaroundsFactory::
+            createIntegerToBFloat16OperandsWorkarounds(getInput().getType());
+      }
+    }];
+
     let description = [{
       Returns the sign of the `operand` element-wise and produces a `result`
       tensor.
@@ -398,7 +406,7 @@ def TTNN_ErfOp : TTNN_ElementwiseUnaryOp<"erf"> {
     let extraClassDeclaration = [{
       wa::TTNNOperandsWorkarounds getOperandsWorkarounds() {
         return wa::TTNNOperandsWorkaroundsFactory::
-            createErfOpOperandsWorkarounds(getInput().getType());
+            createIntegerToBFloat16OperandsWorkarounds(getInput().getType());
       }
     }];
 
@@ -430,6 +438,14 @@ def TTNN_GeluOp: TTNN_ElementwiseUnaryOp<"gelu"> {
 
 def TTNN_IsFiniteOp: TTNN_ElementwiseUnaryOp<"isfinite"> {
     let summary = "Eltwise isfinite op.";
+
+    let extraClassDeclaration = [{
+      wa::TTNNOperandsWorkarounds getOperandsWorkarounds() {
+        return wa::TTNNOperandsWorkaroundsFactory::
+            createIntegerToBFloat16OperandsWorkarounds(getInput().getType());
+      }
+    }];
+
     let description = [{
       Eltwise isfinite operation.
     }];
@@ -1394,6 +1410,34 @@ def TTNN_SoftmaxOp : TTNN_Op<"softmax", [TTNN_ComputeKernelConfigOpInterface]> {
               /*compute_config=*/nullptr);
       }]>
     ];
+
+    let hasVerifier = 1;
+}
+
+def TTNN_SoftmaxBackwardOp : TTNN_Op<"softmax_backward"> {
+    let summary = "Softmax backward (ttml).";
+    let description = [{
+      Computes the softmax gradient
+
+        grad_input = softmax_output *
+                     (grad - sum(softmax_output * grad, dim, keepdim=true))
+
+      using `ttml::metal::softmax_backward`. Operands and result must have the
+      same shape and element type (bfloat16 or float32), use TILE layout, and
+      `dimension` must select the last dimension.
+    }];
+
+    let arguments = (ins AnyRankedTensor:$softmax_output,
+                         AnyRankedTensor:$grad,
+                         SI32Attr:$dimension);
+    let results = (outs AnyRankedTensor:$result);
+
+    let extraClassDeclaration = [{
+      wa::TTNNOperandsWorkarounds getOperandsWorkarounds() {
+        return wa::TTNNOperandsWorkaroundsFactory::
+            createSoftmaxBackwardOpOperandsWorkarounds(this->getOperation());
+      }
+    }];
 
     let hasVerifier = 1;
 }
@@ -3018,6 +3062,40 @@ def TTNN_LayerNormForwardOp : TTNN_Op<"layernorm_fw",
     let hasVerifier = 1;
 }
 
+def TTNN_LayerNormBackwardOp : TTNN_Op<"layernorm_bw"> {
+    let summary = "Layer normalization backward (ttml).";
+    let description = [{
+      Training-oriented fused layer normalization backward pass, backed by
+      `ttml::metal::layernorm_bw`. Given the original input, affine scale,
+      forward mean and reciprocal standard deviation, and upstream gradient,
+      it returns the input, gamma, and beta gradients.
+
+      The backing kernel requires rank-4 tensors: `input` and `dL_dout` are
+      `(B, N, S, C)`, `gamma` is `(1, 1, 1, C)`, and `mean`/`rstd` are
+      `(B, N, S, 1)`. All inputs and outputs must be bfloat16, tiled, and
+      interleaved in DRAM; the workarounds pass enforces these requirements.
+    }];
+
+    let arguments = (ins AnyRankedTensor:$input,
+                         AnyRankedTensor:$gamma,
+                         AnyRankedTensor:$mean,
+                         AnyRankedTensor:$rstd,
+                         AnyRankedTensor:$dL_dout);
+
+    let results = (outs AnyRankedTensor:$dx,
+                        AnyRankedTensor:$dgamma,
+                        AnyRankedTensor:$dbeta);
+
+    let extraClassDeclaration = [{
+      wa::TTNNOperandsWorkarounds getOperandsWorkarounds() {
+        return wa::TTNNOperandsWorkaroundsFactory::
+            createLayerNormBackwardOpOperandsWorkarounds(this->getOperation());
+      }
+    }];
+
+    let hasVerifier = 1;
+}
+
 def TTNN_DitRMSNormUnaryFusedOp : TTNN_Op<"dit_rms_norm_unary_fused",
     [AttrSizedOperandSegments, TTNN_MemoryConfigOpInterface, TTNN_ComputeKernelConfigOpInterface]> {
     let summary = "Fused RMSNorm + unary activation op.";
@@ -3124,6 +3202,36 @@ def TTNN_CrossEntropyBackwardOp : TTNN_Op<"cross_entropy_bw"> {
       wa::TTNNOperandsWorkarounds getOperandsWorkarounds() {
         return wa::TTNNOperandsWorkaroundsFactory::
             createCrossEntropyBackwardOpOperandsWorkarounds();
+      }
+    }];
+
+    let hasVerifier = 1;
+}
+
+def TTNN_SiluBackwardOp : TTNN_Op<"silu_bw"> {
+    let summary = "SiLU backward pass (ttml).";
+    let description = [{
+      Training-oriented backward pass of the SiLU activation, backed by the
+      ttml metal op `ttml::metal::silu_bw`. Given the input `input` and
+      upstream gradient `grad_output`, the op computes
+
+        grad_input = grad_output * sigmoid(input) *
+                     (1 + input * (1 - sigmoid(input)))
+
+      The backing kernel requires both operands to be rank 4 bfloat16 tensors
+      with the same shape, in tiled, interleaved DRAM device memory. The result
+      has the shape of `input` and is also allocated in DRAM.
+    }];
+
+    let arguments = (ins AnyRankedTensor:$input,
+                         AnyRankedTensor:$grad_output);
+
+    let results = (outs AnyRankedTensor:$grad_input);
+
+    let extraClassDeclaration = [{
+      wa::TTNNOperandsWorkarounds getOperandsWorkarounds() {
+        return wa::TTNNOperandsWorkaroundsFactory::
+            createSiluBackwardOpOperandsWorkarounds(this->getOperation());
       }
     }];
 
@@ -4806,7 +4914,7 @@ def TTNN_IndexerScoreDsaOp : TTNN_Op<"indexer_score_dsa"> {
 
       For every query position `s` and key position `t`:
       ```
-      score[b, s, t] = sum_h relu(q[b, h, s, :] . k[b, t, :]) * weights[b, h, s]
+      score[b, s, t] = sum_h relu(q[b, h, s, :] . k[b, t, :]) * weights[b, 0, s, h]
       ```
       Causality is controlled by `chunk_start_idx`: key `t` is visible to query
       `s` iff `t <= chunk_start_idx + s`. Masked (future) positions are set to
@@ -4818,7 +4926,8 @@ def TTNN_IndexerScoreDsaOp : TTNN_Op<"indexer_score_dsa"> {
       Args:
           query (AnyRankedTensor): `[B x Hi x Sq x D]`.
           key (AnyRankedTensor): `[B x 1 x T x D]`.
-          weights (AnyRankedTensor): `[B x Hi x Sq x 1]` per-head gate scales.
+          weights (AnyRankedTensor): `[B x 1 x Sq x Hi]` per-head gate scales,
+              in the head-minor order the weights projection produces natively.
           chunk_start_idx (uint): Causal offset of the first query within the
               full key sequence. Defaults to `0`.
           cluster_axis (optional uint): Mesh axis carrying the query sequence

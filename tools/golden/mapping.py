@@ -1288,6 +1288,28 @@ def cross_entropy_bw_golden(
     return result
 
 
+def softmax_backward_golden(
+    softmax_output: GoldenMapTensor,
+    grad: GoldenMapTensor,
+    dimension: int = -1,
+    output_type_mlir: Type = None,
+    **kwargs,
+) -> GoldenMapTensor:
+    dimension = int(unpack_mlir_attr(dimension))
+    y = softmax_output.float()
+    dy = grad.float()
+    result = torch.mul(
+        y,
+        torch.sub(dy, torch.sum(torch.mul(y, dy), dim=dimension, keepdim=True)),
+    )
+    output_dtype = (
+        mlir_type_to_torch_dtype(output_type_mlir)
+        if output_type_mlir is not None
+        else softmax_output.dtype
+    )
+    return result.to(output_dtype)
+
+
 def swiglu_elemwise_bw_golden(
     input: GoldenMapTensor,
     gate: GoldenMapTensor,
@@ -1314,6 +1336,29 @@ def swiglu_elemwise_bw_golden(
         else input.dtype
     )
     return grad_input.to(output_dtype), grad_gate.to(output_dtype)
+
+
+def silu_bw_golden(
+    input: GoldenMapTensor,
+    grad_output: GoldenMapTensor,
+    output_type_mlir: Type = None,
+    **kwargs,
+) -> GoldenMapTensor:
+    x = input.float()
+    sigmoid = torch.sigmoid(x)
+    # silu'(x) = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
+    silu_grad = torch.mul(
+        sigmoid,
+        torch.add(torch.mul(x, torch.sub(1.0, sigmoid)), 1.0),
+    )
+    grad_input = torch.mul(grad_output.float(), silu_grad)
+
+    output_dtype = (
+        mlir_type_to_torch_dtype(output_type_mlir)
+        if output_type_mlir is not None
+        else input.dtype
+    )
+    return grad_input.to(output_dtype)
 
 
 def rms_norm_golden(
@@ -6689,11 +6734,34 @@ def ttcore_composite_golden(
             output_type_mlir=RankedTensorType(result_types[0]).element_type,
         )
 
+    if composite_name == "softmax_backward":
+        if not result_types:
+            raise ValueError("ttcore.composite golden requires result types.")
+        attrs = composite_attributes or {}
+        try:
+            dimension_attr = attrs["dimension"]
+        except KeyError:
+            dimension_attr = -1
+        return softmax_backward_golden(
+            *operand_tensors,
+            dimension=dimension_attr,
+            output_type_mlir=RankedTensorType(result_types[0]).element_type,
+        )
+
     if composite_name == "rmsnorm_bw":
         if not result_types:
             raise ValueError("ttcore.composite golden requires result types.")
 
         return rmsnorm_bw_golden(
+            *operand_tensors,
+            output_type_mlir=RankedTensorType(result_types[0]).element_type,
+        )
+
+    if composite_name == "silu_bw":
+        if not result_types:
+            raise ValueError("ttcore.composite golden requires result types.")
+
+        return silu_bw_golden(
             *operand_tensors,
             output_type_mlir=RankedTensorType(result_types[0]).element_type,
         )
@@ -6804,6 +6872,12 @@ def stablehlo_composite_golden(
             *operand_tensors,
             scaler=scaler_attr,
             output_type_mlir=result_type.element_type,
+        )
+    if composite_name == "tenstorrent.layernorm_bw":
+        result_types = list(decomposition_fn.type.results)
+        return layernorm_bw_golden(
+            *operand_tensors,
+            output_type_mlir=RankedTensorType(result_types[0]).element_type,
         )
 
     if len(decomposition_fn.body.blocks) != 1:
@@ -9002,6 +9076,36 @@ def layernorm_fw_golden(
     if return_mean_rstd:
         return output, mean.to(output_dtype), rstd.to(output_dtype)
     return (output,)
+
+
+def layernorm_bw_golden(
+    input: GoldenMapTensor,
+    gamma: GoldenMapTensor,
+    mean: GoldenMapTensor,
+    rstd: GoldenMapTensor,
+    dL_dout: GoldenMapTensor,
+    output_type_mlir: Type = None,
+    **kwargs,
+) -> Tuple[GoldenMapTensor, GoldenMapTensor, GoldenMapTensor]:
+    x_hat = torch.mul(torch.sub(input.float(), mean.float()), rstd.float())
+    grad = dL_dout.float()
+    dx_hat = torch.mul(grad, gamma.float())
+    centered_dx_hat = torch.sub(dx_hat, torch.mean(dx_hat, dim=-1, keepdim=True))
+    projected_dx_hat = torch.sub(
+        centered_dx_hat,
+        torch.mul(x_hat, torch.mean(torch.mul(dx_hat, x_hat), dim=-1, keepdim=True)),
+    )
+    dx = torch.mul(rstd.float(), projected_dx_hat)
+    reduction_dims = tuple(range(grad.ndim - 1))
+    dgamma = torch.sum(torch.mul(grad, x_hat), dim=reduction_dims, keepdim=True)
+    dbeta = torch.sum(grad, dim=reduction_dims, keepdim=True)
+
+    output_dtype = (
+        mlir_type_to_torch_dtype(output_type_mlir)
+        if output_type_mlir is not None
+        else input.dtype
+    )
+    return tuple(tensor.to(output_dtype) for tensor in (dx, dgamma, dbeta))
 
 
 def flash_mla_prefill_golden(

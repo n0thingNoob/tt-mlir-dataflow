@@ -261,6 +261,26 @@ TTNNOperandsWorkarounds TTNNOperandsWorkaroundsFactory::
       .addOutputOperandWorkaround(resultTiledBf16Workaround);
 }
 
+// Create workarounds for the ttml silu_bw op. The backing metal op requires
+// every operand and result to be bf16, tiled and DRAM-interleaved.
+TTNNOperandsWorkarounds
+TTNNOperandsWorkaroundsFactory::createSiluBackwardOpOperandsWorkarounds(
+    Operation *op) {
+  TTNNOperandWorkarounds tileDramInterleavedBf16;
+  tileDramInterleavedBf16.tensorLayoutWorkaround = Layout::Tile;
+  tileDramInterleavedBf16.tensorBufferTypeWorkaround = BufferType::DRAM;
+  tileDramInterleavedBf16.tensorMemoryLayoutWorkaround =
+      TensorMemoryLayoutAttr::get(op->getContext(),
+                                  TensorMemoryLayout::Interleaved);
+  tileDramInterleavedBf16.tensorDataTypeWorkaround = ttcore::DataType::BFloat16;
+
+  // Input, grad_output and grad_input.
+  return TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds()
+      .addInputOperandWorkaround(tileDramInterleavedBf16)
+      .addInputOperandWorkaround(tileDramInterleavedBf16)
+      .addOutputOperandWorkaround(tileDramInterleavedBf16);
+}
+
 // Create workarounds for the ttml swiglu_elemwise_bw op. The backing metal op
 // (ttml::metal::swiglu_elemwise_bw) TT_FATALs unless every tensor it touches is
 // bf16, tiled and interleaved. It places no requirement on the buffer type, so
@@ -783,14 +803,26 @@ TTNNOperandsWorkaroundsFactory::createTanhOpOperandsWorkarounds() {
       .addOutputOperandWorkaround(operandWorkaround);
 }
 
-// tt-metal's `ttnn.erf` SFPU kernel (LUT-based rational approximation
-// introduced in tt-metal #41850) treats each input lane as a floating-point
-// value. When called with an integer dtype the integer bit pattern is
-// reinterpreted as a float, producing NaN/Inf/garbage that the new LUT is
-// unable to saturate to ±1 in all cases, so the result no longer matches the
-// mathematical erf. Force a bf16 typecast around the op for integer inputs.
+// Several tt-metal unary SFPU kernels are implemented only for the float
+// datapath: they read each input lane as a floating-point value, so an integer
+// dtype has its bit pattern reinterpreted as a float and the result no longer
+// matches the mathematical definition of the op. Since tt-metal #56980 these
+// ops are rejected outright for integer inputs rather than returning a wrong
+// answer (`unary_op_supports_integer_dtype` in unary_device_operation.cpp).
+//
+// Force a bf16 typecast around the op for integer inputs. This is exact for
+// ops that do not depend on the magnitude of the input - `sign` only needs
+// which side of zero a value falls on, and `isfinite` is unconditionally true
+// for every integer - but it is *not* safe for ops that consume the magnitude,
+// because bf16 has only 7 mantissa bits and cannot represent most int32
+// values. Do not reuse this for such ops.
+//
+// Affected ops and their tt-metal issues:
+//   erf      - tt-metal #41850 (LUT-based rational approximation)
+//   sign     - trivially implementable on int32; see ABS_INT32 for precedent
+//   isfinite - meaningless on integers, should ideally be folded away
 TTNNOperandsWorkarounds
-TTNNOperandsWorkaroundsFactory::createErfOpOperandsWorkarounds(
+TTNNOperandsWorkaroundsFactory::createIntegerToBFloat16OperandsWorkarounds(
     mlir::RankedTensorType inputType) {
   TTNNOperandWorkarounds operandWorkaround;
   if (inputType.getElementType().isInteger()) {
@@ -1284,6 +1316,20 @@ TTNNOperandsWorkaroundsFactory::createSDPABackwardOpOperandsWorkarounds(
   return operandsWorkaround;
 }
 
+// The TTML softmax backward kernel supports BF16 and F32 and inherits the
+// complete output tensor spec from softmax_output. Force TILE layout while
+// preserving dtype, buffer type, and memory layout.
+TTNNOperandsWorkarounds
+TTNNOperandsWorkaroundsFactory::createSoftmaxBackwardOpOperandsWorkarounds(
+    Operation * /*op*/) {
+  TTNNOperandWorkarounds tiled;
+  tiled.tensorLayoutWorkaround = Layout::Tile;
+  return TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds()
+      .addInputOperandWorkaround(tiled)
+      .addInputOperandWorkaround(tiled)
+      .addOutputOperandWorkaround(tiled);
+}
+
 // Create workarounds for the ttml rmsnorm_fw op. The backing metal op
 // (ttml::metal::rmsnorm_fw) requires every tensor it touches to be bf16,
 // tiled and interleaved in DRAM.
@@ -1378,6 +1424,29 @@ TTNNOperandsWorkaroundsFactory::createLayerNormForwardOpOperandsWorkarounds(
         operandsWorkaround.addOutputOperandWorkaround(tileDramBf16);
   }
 
+  return operandsWorkaround;
+}
+
+TTNNOperandsWorkarounds
+TTNNOperandsWorkaroundsFactory::createLayerNormBackwardOpOperandsWorkarounds(
+    Operation *op) {
+  TTNNOperandWorkarounds tileDramBf16;
+  tileDramBf16.tensorLayoutWorkaround = Layout::Tile;
+  tileDramBf16.tensorBufferTypeWorkaround = BufferType::DRAM;
+  tileDramBf16.tensorMemoryLayoutWorkaround = TensorMemoryLayoutAttr::get(
+      op->getContext(), TensorMemoryLayout::Interleaved);
+  tileDramBf16.tensorDataTypeWorkaround = ttcore::DataType::BFloat16;
+
+  TTNNOperandsWorkarounds operandsWorkaround =
+      TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds();
+  for (unsigned i = 0; i < 5; ++i) {
+    operandsWorkaround =
+        operandsWorkaround.addInputOperandWorkaround(tileDramBf16);
+  }
+  for (unsigned i = 0; i < 3; ++i) {
+    operandsWorkaround =
+        operandsWorkaround.addOutputOperandWorkaround(tileDramBf16);
+  }
   return operandsWorkaround;
 }
 
