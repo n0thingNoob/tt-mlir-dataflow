@@ -133,6 +133,8 @@ public:
         /* iterator_types */ generic.getIteratorTypes(), generic.getThreads(),
         generic.getFabricConnectionConfigAttr(), generic.getNumRegions());
 
+    loopedGeneric->setDiscardableAttrs(generic->getDiscardableAttrDictionary());
+
     // Process the single region
     Region &region = generic.getRegion(0);
     Block *regionBlock = &region.front();

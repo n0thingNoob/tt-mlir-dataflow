@@ -8,24 +8,61 @@
 include "mlir/Pass/PassBase.td"
 
 def D2MSpatialPlanning : Pass<"d2m-spatial-planning", "::mlir::ModuleOp"> {
-  let summary = "Plan inter-generic spatial execution (framework only).";
+  let summary = "Analyze Generic dependencies and form spatial region candidates.";
   let description = [{
     Runs immediately after TTIRToD2M, before per-generic optimization. Builds
     a block-local SSA dependency DAG of top-level tensor d2m.generic ops,
     following dependencies through intervening operations such as views.
     Existing spatial regions and nested control flow are left untouched.
 
-    Group selection, core-range assignment and candidate evaluation are TODOs.
-    No candidate is selected yet, so the pass preserves the input IR. Future
-    selected plans will be materialized using the existing d2m.spatial op;
-    grid selection, fusion, blocking, allocation and lowering remain the
-    responsibility of the existing D2M passes.
+    Forms overlapping planning candidates from non-branching chains,
+    independent branches with shared dataflow context, and simple fork/join
+    structures. Independence requires the absence of transitive dependencies.
+    Candidates do not cross control-flow, spatial, or side-effect boundaries.
+    Fresh tensor allocations are local value definitions, not such boundaries.
+
+    By default, preserves the entire IR and reports candidates only.
+    With materialize, selects disjoint independent pairs deterministically,
+    falling back to singleton temporal groups, and moves the original generics
+    into executable d2m.spatial ops. Computation bodies remain unchanged.
+    Grid selection, allocation and lowering use the existing D2M passes.
+
+    The spatial compiler pipeline uses prepare-pipelines instead: supported
+    static 2D BF16 add/relu/neg and non-transposed matmul chains and simple
+    diamonds receive deterministic single-core stages. Matmul completes full
+    K panels per output tile; only its left input may be an internal edge. Exact inverse layout conversions on
+    internal edges are bypassed. Full intermediate tensors stay in producer
+    L1; no ring-buffer protocol or candidate optimization is introduced.
+    Unsupported candidates retain the independent-pair/singleton fallback.
+    d2m-materialize-spatial-pipelines runs after bufferization and one-tile
+    reblocking, before allocation. It verifies row-major traversal, exact
+    reblocking views and one completed output store per tile before forming a
+    buffer-form SpatialOp. Unproven groups become temporal singletons without
+    ready semaphores. Per-edge cumulative waits use >=: elementwise consumers
+    wait for a tile, matmul left inputs wait for a full row. Notifications
+    follow DMA write completion, after the complete K reduction. Allocation cannot spill selected buffers.
+    Failure to allocate legally is an error, not a silent DRAM fallback.
   }];
+  let options = [
+    Option<"dumpRegions", "dump-regions", "bool", "false",
+           "Print candidates, selected groups and emitted spatial ops to stderr">,
+    Option<"materialize", "materialize", "bool", "false",
+           "Select and materialize parallel pairs and temporal singletons">,
+    Option<"preparePipelines", "prepare-pipelines", "bool", "false",
+           "Prepare supported L1 pipelines for deferred buffer-form materialization">
+  ];
   let dependentDialects = ["::mlir::tt::d2m::D2MDialect"];
   let statistics = [
     Statistic<"numGenericNodes", "generic-nodes", "Generic DAG nodes">,
     Statistic<"numDependencyEdges", "dependency-edges", "Generic DAG SSA edges">
   ];
+}
+
+def D2MMaterializeSpatialPipelines : Pass<"d2m-materialize-spatial-pipelines", "::mlir::ModuleOp"> {
+  let summary = "Materialize prepared single-core stages and L1 tile synchronization.";
+  let options = [Option<"dumpRegions", "dump-regions", "bool", "false",
+                        "Print emitted spatial pipelines">];
+  let dependentDialects = ["::mlir::tt::d2m::D2MDialect"];
 }
 
 // Insert scratch buffers to d2m.generic ops (post-bufferization)

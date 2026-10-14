@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "ttmlir/Conversion/D2MToTTKernel/D2MToTTKernel.h"
+#include "ttmlir/Dialect/D2M/Utils/SpatialPipeline.h"
 
 #include "ttmlir/Asserts.h"
 #include "ttmlir/Dialect/D2M/Analysis/CBProducerConsumer.h"
@@ -3988,6 +3989,13 @@ public:
         op.getLoc(), ttkernel::L1AddrPtrType::get(rewriter.getContext(), 32),
         semaphoreAddr);
 
+    if (op->hasAttr(d2m::spatial_pipeline::wait)) {
+      Value count = rewriter.create<arith::IndexCastOp>(
+          op.getLoc(), rewriter.getI32Type(), adaptor.getValue());
+      rewriter.replaceOpWithNewOp<ttkernel::SemaphoreWaitMinOp>(
+          op, semaphorePtr, count);
+      return success();
+    }
     rewriter.replaceOpWithNewOp<ttkernel::SemaphoreWaitOp>(op, semaphorePtr,
                                                            op.getValue());
     if (op.getResetValue()) {

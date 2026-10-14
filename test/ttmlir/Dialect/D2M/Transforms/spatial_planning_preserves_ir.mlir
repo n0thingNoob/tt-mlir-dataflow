@@ -14,7 +14,7 @@ module {
     return
   }
 
-  // Independent branches must not receive invented groups or core ranges.
+  // Candidate discovery must not materialize groups or assign core ranges.
   func.func @independent(%a: tensor<64x64xf32>, %b: tensor<64x64xf32>) -> (tensor<64x64xf32>, tensor<64x64xf32>) {
     %0 = "ttir.add"(%a, %b) : (tensor<64x64xf32>, tensor<64x64xf32>) -> tensor<64x64xf32>
     %1 = "ttir.multiply"(%a, %b) : (tensor<64x64xf32>, tensor<64x64xf32>) -> tensor<64x64xf32>

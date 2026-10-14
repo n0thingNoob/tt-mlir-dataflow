@@ -355,6 +355,7 @@ public:
         generic.getFabricConnectionConfigAttr(),
         /*numRegions*/ 2);
 
+    newGeneric->setDiscardableAttrs(generic->getDiscardableAttrDictionary());
     Block *dmBlock = &newGeneric.getRegion(0).emplaceBlock();
     Block *computeBlock = &newGeneric.getRegion(1).emplaceBlock();
 
