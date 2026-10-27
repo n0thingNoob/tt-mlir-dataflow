@@ -513,6 +513,11 @@ def D2M_SpatialOp: D2M_Op<"spatial",
       // The edge feeding entry block argument `arg` of `region`, if any.
       SpatialEdgeAttr getIncomingEdge(unsigned region, unsigned arg);
 
+      // The value the producer side of `edge` writes: output `I` of the
+      // producer region's generic (a tensor before that generic is
+      // bufferized, the buffer after).
+      ::mlir::Value getEdgeSource(SpatialEdgeAttr edge);
+
       // Emit "edges are not yet supported by <passName>" on every spatial with
       // edges under `root` (inclusive); fails if there is one. Used by passes
       // that would otherwise lower an edge without synchronization.

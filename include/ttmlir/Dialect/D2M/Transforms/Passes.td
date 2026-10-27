@@ -1386,6 +1386,34 @@ def D2MHoistCBAllocs : Pass<"d2m-hoist-cb-allocs", "::mlir::ModuleOp"> {
   ];
 }
 
+def D2MLowerSpatialEdges : Pass<"d2m-lower-spatial-edges", "::mlir::ModuleOp"> {
+  let summary = "Synchronize d2m.spatial edges with local semaphores.";
+  let description = [{
+    Lowers every `#d2m.spatial_edge<P:I -> C:J>` of a d2m.spatial to a
+    whole-tensor handoff. Runs on split DM/compute threads after DMA lowering
+    (d2m-lower-dma-to-fully-indexed-form) and before d2m-normalize-thread-args.
+
+    Per edge:
+    - one `d2m.create_local_semaphore` (initial value 0) is created before the
+      spatial and appended to both generics' additionalArgs; the runtime
+      creates a local semaphore once per program over all cores that use it;
+    - every producer DM thread that writes the edge buffer increments the
+      semaphore on every consumer core after its last op (all of its edge
+      writes have been waited on by then);
+    - every consumer DM thread that reads the edge buffer waits, before
+      anything else, until the semaphore reaches
+      (producer cores) x (producer writing threads).
+
+    Lowered edges are removed from `edges`; the attribute is dropped once
+    empty. With `ttnn-mode` the pass does nothing (the TTNN lowering does not
+    support edges yet and reports them).
+  }];
+  let options = [
+    Option<"ttnnMode", "ttnn-mode", "bool", /*default=*/"false",
+           "Leave edges alone (TTNN lowering reports them as unsupported).">
+  ];
+}
+
 def D2MNormalizeThreadArgs : Pass<"d2m-normalize-thread-args", "::mlir::ModuleOp"> {
   let summary = "This pass normalizes thread arguments.";
   let description = [{

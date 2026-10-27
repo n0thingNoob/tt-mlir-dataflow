@@ -266,6 +266,12 @@ void createD2MBackendPipeline(OpPassManager &pm,
   }
   pm.addPass(d2m::createD2MLowerDMAToFullyIndexedForm(dmaOptions));
 
+  // Synchronize d2m.spatial edges (whole-tensor handoff) now that producer
+  // writes and consumer reads of each edge buffer are explicit DMA ops.
+  d2m::D2MLowerSpatialEdgesOptions spatialEdgesOptions;
+  { spatialEdgesOptions.ttnnMode = options.ttnnMode; }
+  pm.addPass(d2m::createD2MLowerSpatialEdges(spatialEdgesOptions));
+
   // Normalize thread argument access by inserting d2m.get_arg ops for any
   // remaining additional arguments and setting resolution_stage on
   // d2m.get_cb/d2m.get_arg so the D2MToTTKernel lowering pass can uniformly

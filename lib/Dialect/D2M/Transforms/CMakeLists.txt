@@ -44,6 +44,7 @@ add_mlir_dialect_library(MLIRD2MTransforms
         LowerLoadStoreOpsToDMA.cpp
         ExpandDMAReadCompositeView.cpp
         MarkSynchronizedBuffers.cpp
+        LowerSpatialEdges.cpp
         NormalizeThreadArgs.cpp
 
         ADDITIONAL_HEADER_DIRS

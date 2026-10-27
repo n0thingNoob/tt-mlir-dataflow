@@ -3674,13 +3674,9 @@ Value d2m::GenericOp::getOperandAlloc(Region &region, unsigned operandIndex) {
   return result;
 }
 
-// The value written by the producer side of `edge`: output `I` of the
-// producer region's generic (a tensor before that generic is bufferized, the
-// buffer after).
-static mlir::Value getSpatialEdgeSource(d2m::SpatialOp op,
-                                        d2m::SpatialEdgeAttr edge) {
+mlir::Value d2m::SpatialOp::getEdgeSource(SpatialEdgeAttr edge) {
   auto producer =
-      *op.getRegion(edge.getProducerRegion()).getOps<d2m::GenericOp>().begin();
+      *getRegion(edge.getProducerRegion()).getOps<GenericOp>().begin();
   return producer.getOutputs()[edge.getProducerOutput()];
 }
 
@@ -3696,7 +3692,7 @@ bufferizeSpatialEdges(d2m::SpatialOp op, mlir::RewriterBase &rewriter,
     return mlir::success();
   }
   for (auto edge : op.getEdgesAttr().getAsRange<d2m::SpatialEdgeAttr>()) {
-    Value buffer = getSpatialEdgeSource(op, edge);
+    Value buffer = op.getEdgeSource(edge);
     if (mlir::isa<mlir::TensorType>(buffer.getType())) {
       auto maybeBuffer =
           bufferization::getBuffer(rewriter, buffer, options, state);
@@ -3822,7 +3818,7 @@ d2m::SpatialOp::getBufferType(
     if (!edge) {
       return emitOpError("block argument without incoming edge");
     }
-    Value source = getSpatialEdgeSource(*this, edge);
+    Value source = getEdgeSource(edge);
     if (auto bufferType =
             mlir::dyn_cast<bufferization::BufferLikeType>(source.getType())) {
       return bufferType;

@@ -1,19 +1,10 @@
-// RUN: not ttmlir-opt --ttir-to-ttmetal-pipeline="ttnn-mode=false" %s -o /dev/null 2>&1 | FileCheck %s --check-prefix=PIPE
-// RUN: not ttmlir-opt --ttir-to-ttmetal-pipeline="ttnn-mode=true" %s -o /dev/null 2>&1 | FileCheck %s --check-prefix=PIPE
-// RUN: not ttmlir-opt --ttcore-register-device --ttcore-one-shot-bufferize --d2m-allocate %s -o /dev/null 2>&1 | FileCheck %s --check-prefix=ALLOC
-// RUN: not ttmlir-opt --ttcore-register-device --ttcore-one-shot-bufferize --d2m-lower-load-store-ops-to-dma %s -o /dev/null 2>&1 | FileCheck %s --check-prefix=DMA
 // RUN: not ttmlir-opt --ttcore-register-device --ttcore-one-shot-bufferize --convert-d2m-to-ttmetal %s -o /dev/null 2>&1 | FileCheck %s --check-prefix=METAL
 // RUN: not ttmlir-opt --ttcore-register-device --ttcore-one-shot-bufferize --convert-d2m-to-ttnn %s -o /dev/null 2>&1 | FileCheck %s --check-prefix=TTNN
 
-// A d2m.spatial with edges has no synchronization lowering yet. Every pass that
-// would otherwise allocate or lower an edge must fail with an explicit
-// diagnostic instead of emitting unsynchronized code. The full pipeline
-// carries the edge through GridSelection and bufferization and stops at
-// d2m-allocate.
+// Edges are synchronized by d2m-lower-spatial-edges (TTMetal only). An edge
+// that reaches the TTMetal or TTNN lowering unlowered must fail with an
+// explicit diagnostic instead of emitting unsynchronized code.
 
-// PIPE: error: 'd2m.spatial' op edges are not yet supported by d2m-allocate
-// ALLOC: error: 'd2m.spatial' op edges are not yet supported by d2m-allocate
-// DMA: error: 'd2m.spatial' op edges are not yet supported by d2m-lower-load-store-ops-to-dma
 // METAL: error: 'd2m.spatial' op edges are not yet supported by convert-d2m-to-ttmetal
 // TTNN: error: 'd2m.spatial' op edges are not yet supported by convert-d2m-to-ttnn
 

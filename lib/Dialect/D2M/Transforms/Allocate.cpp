@@ -268,6 +268,10 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
 
   MemorySpaces memSpaces;
   ttcore::MemorySpaceAttr L1Attr = nullptr;
+  // Buffers carried by d2m.spatial edges (producer generic outputs). The
+  // producer writes them with an explicit store and the consumer reads them
+  // remotely, so they are never aliased and always stay in L1.
+  llvm::DenseSet<Value> spatialEdgeBuffers;
   ttcore::MemorySpaceAttr DRAMAttr = nullptr;
 
   [[maybe_unused]] friend std::string to_string(const D2MAllocate &obj) {
@@ -298,11 +302,15 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
 
     ModuleOp moduleOp = getOperation();
 
-    // Edge buffers must be pinned to L1 on the producer cores (PR2a).
-    if (failed(d2m::SpatialOp::checkNoEdges(moduleOp, "d2m-allocate"))) {
-      signalPassFailure();
-      return;
-    }
+    moduleOp.walk([&](d2m::SpatialOp spatialOp) {
+      if (!spatialOp.hasEdges()) {
+        return;
+      }
+      for (auto edge :
+           spatialOp.getEdgesAttr().getAsRange<d2m::SpatialEdgeAttr>()) {
+        spatialEdgeBuffers.insert(spatialOp.getEdgeSource(edge));
+      }
+    });
 
     memSpaces = [this, moduleOp]() {
       ttcore::SystemDescAttr systemDesc =
@@ -935,6 +943,19 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
       }
     }
 
+    // Spatial edge buffers stay in L1 on the producer cores for the whole
+    // spatial: never spill them, even as intermediate generic outputs.
+    for (Value edgeBuffer : spatialEdgeBuffers) {
+      auto allocOp = edgeBuffer.getDefiningOp<memref::AllocOp>();
+      if (!allocOp || allocOp->getParentOfType<func::FuncOp>() != funcOp) {
+        continue;
+      }
+      if (ttcore::getMemorySpace(allocOp.getType()) != MemorySpace::DeviceL1) {
+        return allocOp.emitOpError("d2m.spatial edge buffer must be in L1");
+      }
+      analysis.memrefs[allocOp.getResult()].isMemspaceBound = true;
+    }
+
     if (TT_DEBUG_ENABLED()) {
       for ([[maybe_unused]] auto &[value, valueCtx] : analysis.memrefs) {
         TT_ALLOC_TRACE("\t{}:\t[{}, "
@@ -1447,6 +1468,9 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
   ///    are not broadcast or reduction.
   /// This is a common function shared by isAliasedLoad and isAliasedStore.
   bool canAliasOperand(d2m::GenericOp genericOp, Value genericOperand) const {
+    if (spatialEdgeBuffers.contains(genericOperand)) {
+      return false;
+    }
     if (!isPlacedOnGenericCores(genericOp, genericOperand)) {
       return false;
     }
