@@ -1,7 +1,7 @@
 # D2M Spatial Channels: Data Edges Between `d2m.spatial` Regions
 
-Status: design for PR1 (IR representation). PR2a/PR2b (synchronization and
-lowering) are planned below.
+Status: PR1 (IR representation) and PR2a (single-core synchronization and
+TTMetal lowering) implemented; PR2b (multi-core regions) planned.
 
 ## 1. Problem and scope
 
@@ -206,7 +206,7 @@ The source references below are to the LLVM checkout tt-mlir builds against
 | `SpatialYieldOp::verify` | If the parent spatial has edges, require the yield operands to be exactly the region generic's results, in order | Edge index `I` and yield operand `I` must name the same value |
 | `SpatialOpNormalizeUtil` | (1) Leave the spatial's own block arguments out of the rebuilt `ins`. (2) Prefix ops that use a block argument cannot exist (the verifier requires block arguments to be used only inside the region's generic), so hoisting stays valid. (3) `outs` and the result order are unchanged. Edges use `(region, output index)`, so they need no remapping. | Fixes the dominance error above. Keeps the edge numbering stable. |
 | GridSelection | No code change; it reaches the code above through `normalizeSpatialOpContainingGeneric`. A consumer input that is a block argument is classified as `Kind::Skip`, so it is not rewritten. If grid selection changes the type of an edge's producer output, the verifier reports the type mismatch after the pass. Making both ends agree is PR2b. | Fails explicitly, never silently |
-| Allocate, `d2m-lower-load-store-ops-to-dma`, D2MToTTMetal, D2MToTTNN | At the start of `runOnOperation`, call the new static `SpatialOp::checkNoEdges(root, passName)`, which emits "'d2m.spatial' op edges are not yet supported by <pass>" on every spatial with edges, and fail | Nothing downstream generates code for an edge before PR2. The helper lives on the op so the conversion libraries need no new link dependency. Every pass between the frontend and Allocate carries `edges` through unchanged; checked with the full pipeline in both TTNN and TTMetal modes. |
+| D2MToTTMetal, D2MToTTNN | Fail with "'d2m.spatial' op edges are not yet supported by <pass>" (`SpatialOp::checkNoEdges`) if an edge reaches them unlowered. PR1 also checked in Allocate and `d2m-lower-load-store-ops-to-dma`; PR2a lowers edges before both conversions and drops those two checks. | Never emit unsynchronized code |
 | d2m-jit builder (`tools/d2m-jit/_src/builder.py`) | None in PR1 | Python call sites stay compatible (§2.5). Creating edges from Python can come once the lowering exists. |
 
 ### 3.1 Builders
@@ -251,7 +251,7 @@ The aliasing interface is unchanged:
 - Cross-region ordering is set by the edge semantics (PR2a semaphores), not by
   SSA dominance. Nothing in the One-Shot framework is changed.
 
-### 3.3 Allocate, for PR2a
+### 3.3 Allocate (PR2a)
 
 The edge buffer is a spatial operand, so its live range already covers the
 whole spatial op, and PR1 reuses nothing. Allocate still needs these two
@@ -276,47 +276,48 @@ supported" diagnostic in PR1. In PR2a, TTMetal is the first target, and the
 merge stays as is: the edge synchronization is already ordinary
 semaphore / DMA ops inside the generics by then.
 
-## 4. Whole-tensor handoff protocol (PR2a; semantics only here)
+## 4. Whole-tensor handoff protocol (implemented in PR2a)
 
-For an edge `P:I -> C:J`, let the producer generic use `Np` cores and the
-consumer generic use `Nc` cores.
+For an edge `P:I -> C:J`, let the producer generic use `Np` cores and `Wp` DM
+threads that write the edge buffer.
 
-- **Semaphore.** One local (program) semaphore per edge, with initial value 0,
-  allocated on the consumer cores.
-  - It is a `d2m.create_local_semaphore` created before the spatial and passed
-    as an `additionalArg` to both generics, following
-    `D2MPreallocateMcastSemaphores`.
-  - Local rather than global: tt-metal writes program semaphores' initial
-    values as part of each program launch. Every enqueue, including trace
-    replay, therefore starts at 0 without an explicit reset. A
-    `create_global_semaphore` would persist across launches and need a
-    `reset_global_semaphore` each time. To verify on HW in PR2a: the replay
-    reset.
-  - **Open issue for PR2a.** The TTMetal runtime creates local semaphores per
-    kernel config with that kernel's core range set
-    (`runtime/lib/ttmetal/executor.cpp:381-382`). If the producer and consumer
-    kernels each create the "same" semaphore, they can get different ids.
-    PR2a must make one id valid on both ranges, for example by creating the
-    semaphore over producer ∪ consumer cores once and passing the id to both
-    kernels.
-- **Producer.** After each producer core has finished its last write of the
-  edge tensor, it increments the semaphore on every consumer core by 1, either
-  `Nc` unicast `semaphore_inc` ops or one multicast `semaphore_inc` over the
-  consumer rectangle.
-  - "Finished" means the last write to this core's shard of the edge buffer is
-    complete. For compute output, that is after the output CB has been
-    released to the DM thread. For a `remote_store` / DMA write, it is after
-    `dma_wait` or a write barrier.
-  - Only then is `semaphore_inc` issued. Known `main` bug: today the inc is
-    emitted before the wait (§6).
-- **Consumer.** Each consumer core runs `semaphore_wait sem, Np` before its
-  first read of the edge tensor. It then reads with the existing
-  `remote_load` from the producer cores' L1, using the edge memref's
-  layout / VGM.
-- **Order independence.** Waiting for all `Np` increments means the consumer
-  never needs to know the producer's iteration order or which shard it needs.
-  The protocol therefore holds for any operator.
+- **Semaphore.** One local (program) semaphore per edge, initial value 0: a
+  `d2m.create_local_semaphore` created before the spatial and appended to both
+  generics' `additionalArgs` (accessed in the threads through `d2m.get_arg`
+  after `d2m-normalize-thread-args`).
+  - Local rather than global: tt-metal writes a program's semaphore initial
+    values on every launch, so every enqueue starts at 0 without an explicit
+    reset. Checked on n150: 5 submits of the same program in one process all
+    pass with an exact-value wait.
+  - The TTMetal runtime used to create a local semaphore separately for every
+    kernel that referenced it, on that kernel's core range, so two kernels could
+    get different ids (`runtime/lib/ttmetal/arguments.h`, tt-metal
+    `ProgramImpl::create_semaphore` takes the lowest free id per core range).
+    PR2a changes the runtime to create each local semaphore once per program
+    over the union of the cores of all kernels that reference it. Without this
+    change a 3-region join (two semaphores on one consumer core) hangs on n150.
+- **Producer.** Every producer DM thread that DMA-writes the edge buffer
+  increments the semaphore of every consumer core by 1 after its last op.
+  - Allocate never aliases an edge buffer, so the producer always computes into
+    a stream buffer and stores it with an explicit DMA write; every such write
+    has its `dma_wait` before the end of the thread (the pass checks this).
+  - Unicast only (`d2m.semaphore_inc` has no multicast form), `Nc` increments
+    per writing thread.
+  - `semaphore_inc` core indices are virtual coordinates of the enclosing
+    generic (`d2m-generic-regions-to-funcs` maps them through the generic's
+    `virt_to_physical_map`). The pass therefore maps each consumer core's
+    logical coordinates through the producer grid's `physical_to_virt_map`.
+- **Consumer.** Every consumer DM thread that reads the edge buffer first waits
+  until the semaphore equals `Np * Wp`, then reads the producer cores' L1 with
+  the existing DMA (the edge memref's layout / VGM gives the producer cores).
+- **Order independence.** Waiting for all increments means the consumer never
+  needs to know the producer's iteration order. The protocol holds for any
+  operator.
 - **Regions without edges** start and run independently, as today.
+- **Pass position.** `d2m-lower-spatial-edges` runs after
+  `d2m-lower-dma-to-fully-indexed-form` (threads are split and every edge
+  read/write is an explicit DMA op) and before `d2m-normalize-thread-args`.
+  The passes after it only lower ops; none drops the inserted semaphore ops.
 
 ## 5. Verifier rules and tests
 
@@ -372,60 +373,57 @@ Regression tests:
   including `spatial_yield`) is checked line by line with `CHECK-NEXT` against
   the output of the binary built from `main` before the change.
 
-Downstream diagnostics: `spatial_channel_unsupported.mlir` runs the chain
-through the D2M pipeline up to Allocate and expects the Allocate error.
-`--d2m-lower-load-store-ops-to-dma` and the TTMetal / TTNN conversions on
-memref-form input expect their "not yet supported" errors.
+Downstream diagnostics: `spatial_channel_unsupported.mlir` runs the TTMetal /
+TTNN conversions on memref-form input with unlowered edges and expects their
+"not yet supported" errors. Since PR2a the TTMetal pipeline lowers edges
+(`spatial_channel_pipeline.mlir`), and in TTNN mode `d2m-lower-spatial-edges`
+does nothing so that D2MToTTNN still rejects them.
 
-## 6. PR2 plan
+## 6. PR2 plan and status
 
-**PR2a (one core per region, TTMetal):**
+**PR2a (one core per region, TTMetal): done.**
 
-- Allocate: pin edge buffers to L1 on the producer cores (§3.3).
-- New pass `d2m-lower-spatial-edges`, after Allocate and run directly before
-  the lowerings, with no pass in between that drops attributes or ops. Per
-  edge it:
-  1. allocates a local semaphore (§4) and checks the per-core budget (≤ 16
-     per program, shared with multicast semaphores);
-  2. inserts `semaphore_inc` on the producer after its final write and
-     barrier;
-  3. inserts `semaphore_wait` on the consumer before its first read of the
-     edge buffer;
-  4. removes the `edges` attribute once lowered, so the downstream "not yet
-     supported" checks no longer fire.
-- Validation: hand-written MLIR on n150, chain and diamond, PCC ≥ 0.999 vs
-  torch.
+- Allocate: edge buffers are never aliased and are bound to L1 (§3.3).
+- `d2m-lower-spatial-edges` (§4), with lit tests for a 1x1 chain, a 1x2 edge
+  (two increments, wait count 2), an off-origin producer (virtual
+  coordinates), `ttnn-mode`, and the "no DMA write" error.
+- Runtime: one id per local semaphore per program (§4).
+- Validation on n150, hand-written MLIR, 1x1 regions: chain (0,0)->(1,1), pair
+  (1,0)->(1,1), join (0,0),(0,1)->(1,1), chain3 (0,0)->(0,1)->(1,1). Every
+  output PCC >= 0.9999 vs torch, 5 submits per process, 2 seeds.
+- A diamond needs a producer generic with two outputs. Upstream D2M does not
+  lower multi-output compute in one generic yet (a GenericOp
+  canonicalization asserts, and DST register access fails), so the diamond is
+  covered at the IR level only (PR1 tests).
 
 **PR2b (multi-core regions):** GridSelection chooses consistent grids and block
 shapes for both ends of each edge, and propagates the producer's output type to
 the consumer block argument (R5 / R6 after selection).
 
-**Known upstream bugs.** Each one gets a small commit with a lit test in PR2.
-All four were checked on `main` (`f688ee694`) and are still present:
+**Known upstream bugs** (all four were present on `main` `f688ee694`):
 
 1. Offset placement.
-   - Allocate `canAliasOperand` (`Allocate.cpp:1442-1452`) aliases an L1
-     output without comparing the generic's grid VGM with the operand's VGM.
+   - Allocate `canAliasOperand` aliased an L1 operand without comparing the
+     generic's grid with the operand's VGM. **Fixed in PR2a** (an off-origin
+     region reading an origin operand now streams it; an edge consumer reads
+     the producer's L1).
    - GridSelection `optimizeToLayoutGrid` (`GridSelection.cpp:176-201`)
      returns early for an already-selected or 1x1 grid, so an output produced
      by `to_layout` in an off-origin region never gets the offset VGM.
-   - Reference: `feature/d2m-baseline-spatial-pipeline` (`Allocate.cpp`
-     ~1447-1480 and the `placeOutput` flag in `GridSelection.cpp`).
-2. DRAM bank map with spatial offset. `getMemoryMapImpl` (`Utils.cpp:696-697`,
-   738-748) composes the DRAM map with the offset-carrying forward map, so a
-   DRAM operand in an off-origin region selects the wrong bank. Reference:
-   `feature/d2m-batch2` `f8f250c3e` (`stripDramGridOriginOffset`).
-3. `semaphore_inc` before DMA wait.
-   - `LowerLoadStoreOpsToDMA.cpp:247-257` emits `SemaphoreIncOp` before the
-     `DMAWaitOp`.
-   - `DMAOptimizations.cpp:117` lets a write barrier sink past a
-     `semaphore_inc`.
-   - Reference: `feature/astraia-mha-spatial-v1` `94791b03a`.
-4. InsertComputeCB drops the semaphore. `eraseAliasedMarkers`
-   (`InsertComputeCB.cpp:600-616`) erases an aliased `remote_store` without
-   checking `getSemaphore()`, so the increment is silently lost. No reference
-   fix exists. Possible fixes: do not alias a store that has a semaphore, or
-   replace the marker with a bare `semaphore_inc`.
+     Deferred to PR2b: edge buffers come from `d2m.empty`, which gets the VGM.
+2. DRAM bank map with spatial offset (`getMemoryMapImpl`, `Utils.cpp:696-697`,
+   738-748). Deferred to PR2b: PR2a edges and test inputs are in L1.
+   Reference: `feature/d2m-batch2` `f8f250c3e`.
+3. `semaphore_inc` before DMA wait (`LowerLoadStoreOpsToDMA`) and a write
+   barrier sinking past `semaphore_inc` (`DMAOptimizations`). **Fixed in
+   PR2a.**
+4. InsertComputeCB dropped the semaphore of an aliased `remote_store`. **Fixed
+   in PR2a** by never aliasing a store that increments a semaphore (Allocate).
+
+**Found during PR2a, not fixed:** on this n150, any spatial region at logical
+core (2,2) hangs in a later program on that core, also without edges and also
+with the compiler from `main`; regions at (0,1), (1,0), (0,2), (2,0) and (1,1)
+work. Not investigated further; the PR2a validation avoids (2,2).
 
 ## 7. Hardware constraints PR2 must respect
 
