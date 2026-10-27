@@ -2421,6 +2421,17 @@ mlir::LogicalResult SpatialYieldOp::verify() {
            << "used outside of spatial op with pure tensor semantics";
   }
 
+  // Edges name a producer value by its generic output index, so with edges the
+  // yield must forward exactly the region generic's results, in order.
+  if (spatial.hasEdges()) {
+    auto generics = getOperation()->getBlock()->getOps<GenericOp>();
+    if (generics.empty() ||
+        !llvm::equal(getValues(), (*generics.begin())->getResults())) {
+      return emitOpError() << "in a d2m.spatial with edges must yield the "
+                              "region generic's results in order";
+    }
+  }
+
   return ::mlir::success();
 }
 

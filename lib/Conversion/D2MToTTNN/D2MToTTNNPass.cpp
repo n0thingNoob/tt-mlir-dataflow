@@ -44,6 +44,11 @@ struct ConvertD2MToTTNNPass final
   void runOnOperation() final {
     ModuleOp moduleOp = getOperation();
 
+    if (failed(d2m::SpatialOp::checkNoEdges(moduleOp, "convert-d2m-to-ttnn"))) {
+      signalPassFailure();
+      return;
+    }
+
     if (failed(d2m::utils::checkBackendDmCoreSupport(moduleOp, "D2MToTTNN"))) {
       signalPassFailure();
       return;

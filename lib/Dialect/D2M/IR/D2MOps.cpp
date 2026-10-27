@@ -30,6 +30,7 @@
 #include "mlir/IR/PatternMatch.h"
 
 #include "mlir/Dialect/Bufferization/IR/BufferizableOpInterface.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/IR/ValueRange.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -2303,6 +2304,167 @@ MutableArrayRef<OpOperand> d2m::GenericOp::getInputsAndOutputsMutable() {
 
   return success();
 }
+
+d2m::SpatialEdgeAttr d2m::SpatialOp::getIncomingEdge(unsigned region,
+                                                     unsigned arg) {
+  if (!getEdgesAttr()) {
+    return nullptr;
+  }
+  for (auto edge : getEdgesAttr().getAsRange<SpatialEdgeAttr>()) {
+    if (edge.getConsumerRegion() == region && edge.getConsumerArg() == arg) {
+      return edge;
+    }
+  }
+  return nullptr;
+}
+
+mlir::LogicalResult d2m::SpatialOp::checkNoEdges(mlir::Operation *root,
+                                                 llvm::StringRef passName) {
+  bool found = false;
+  root->walk([&](SpatialOp op) {
+    if (op.hasEdges()) {
+      op.emitOpError("edges are not yet supported by ") << passName;
+      found = true;
+    }
+  });
+  return mlir::failure(found);
+}
+
+// Verify `edges` and region block arguments. Runs after the per-region checks,
+// so every region holds exactly one generic. In tensor form (all outs are
+// tensors) consumer regions take edges as entry block arguments; bufferization
+// removes them and the consumer refers to the producer's buffer directly.
+static mlir::LogicalResult verifySpatialEdges(d2m::SpatialOp op) {
+  const unsigned numRegions = op.getNumRegions();
+  const bool tensorForm = llvm::all_of(op.getOutputs().getTypes(), [](Type t) {
+    return mlir::isa<RankedTensorType>(t);
+  });
+  llvm::SmallVector<d2m::GenericOp> generics;
+  for (Region &region : op.getRegions()) {
+    generics.push_back(*region.getOps<d2m::GenericOp>().begin());
+  }
+
+  llvm::SmallVector<d2m::SpatialEdgeAttr> edges;
+  if (op.getEdgesAttr()) {
+    edges =
+        llvm::to_vector(op.getEdgesAttr().getAsRange<d2m::SpatialEdgeAttr>());
+  }
+  llvm::DenseSet<std::pair<unsigned, unsigned>> seenSources, seenSinks;
+  llvm::SmallVector<llvm::SmallVector<unsigned>> successors(numRegions);
+  llvm::SmallVector<unsigned> inDegree(numRegions, 0);
+  for (d2m::SpatialEdgeAttr edge : edges) {
+    const unsigned p = edge.getProducerRegion(), i = edge.getProducerOutput();
+    const unsigned c = edge.getConsumerRegion(), j = edge.getConsumerArg();
+    if (p >= numRegions || c >= numRegions) {
+      return op.emitOpError("edge ")
+             << edge << " refers to a region out of range (" << numRegions
+             << " regions)";
+    }
+    if (p == c) {
+      return op.emitOpError("edge ")
+             << edge << " connects region " << p << " to itself";
+    }
+    d2m::GenericOp producer = generics[p];
+    d2m::GenericOp consumer = generics[c];
+    if (i >= producer.getOutputs().size()) {
+      return op.emitOpError("edge ")
+             << edge << ": producer generic in region " << p << " has "
+             << producer.getOutputs().size() << " outputs";
+    }
+    Block &consumerBlock = op.getRegion(c).front();
+    if (tensorForm && j >= consumerBlock.getNumArguments()) {
+      return op.emitOpError("edge ")
+             << edge << ": region " << c << " has "
+             << consumerBlock.getNumArguments() << " block arguments";
+    }
+    if (!seenSinks.insert({c, j}).second) {
+      return op.emitOpError("block argument ")
+             << j << " of region " << c << " has more than one incoming edge";
+    }
+    if (!seenSources.insert({p, i}).second) {
+      return op.emitOpError("output ")
+             << i << " of region " << p
+             << " feeds more than one edge; only one-to-one edges are "
+                "supported";
+    }
+    Value edgeBuffer = producer.getOutputs()[i];
+    if (!llvm::is_contained(op.getOutputs(), edgeBuffer)) {
+      return op.emitOpError("edge ")
+             << edge << ": producer output must be one of the spatial outs";
+    }
+    if (producer.getGrid().getShape() != consumer.getGrid().getShape()) {
+      return op.emitOpError("edge ")
+             << edge << ": producer grid [" << producer.getGrid().getShape()
+             << "] and consumer grid [" << consumer.getGrid().getShape()
+             << "] must match";
+    }
+    if (tensorForm &&
+        consumerBlock.getArgument(j).getType() != edgeBuffer.getType()) {
+      return op.emitOpError("edge ")
+             << edge << ": block argument type "
+             << consumerBlock.getArgument(j).getType()
+             << " does not match producer output type " << edgeBuffer.getType();
+    }
+    successors[p].push_back(c);
+    ++inDegree[c];
+  }
+
+  // Edges must form a DAG over regions (Kahn's algorithm).
+  llvm::SmallVector<unsigned> ready;
+  for (unsigned r = 0; r < numRegions; ++r) {
+    if (inDegree[r] == 0) {
+      ready.push_back(r);
+    }
+  }
+  unsigned visited = 0;
+  while (!ready.empty()) {
+    unsigned r = ready.pop_back_val();
+    ++visited;
+    for (unsigned s : successors[r]) {
+      if (--inDegree[s] == 0) {
+        ready.push_back(s);
+      }
+    }
+  }
+  if (visited != numRegions) {
+    return op.emitOpError("edges must not form a cycle between regions");
+  }
+
+  for (auto [c, region] : llvm::enumerate(op.getRegions())) {
+    d2m::GenericOp consumer = generics[c];
+    for (BlockArgument arg : region.front().getArguments()) {
+      if (!tensorForm) {
+        return op.emitOpError("region ")
+               << c << " has block arguments after bufferization";
+      }
+      if (!mlir::isa<RankedTensorType>(arg.getType())) {
+        return op.emitOpError("block argument ")
+               << arg.getArgNumber() << " of region " << c
+               << " must be a ranked tensor";
+      }
+      if (!op.getIncomingEdge(c, arg.getArgNumber())) {
+        return op.emitOpError("block argument ")
+               << arg.getArgNumber() << " of region " << c
+               << " has no incoming edge";
+      }
+      for (OpOperand &use : arg.getUses()) {
+        Operation *user = use.getOwner();
+        if (!consumer->isAncestor(user)) {
+          return op.emitOpError("block argument ")
+                 << arg.getArgNumber() << " of region " << c
+                 << " may only be used inside the region's d2m.generic";
+        }
+        if (user == consumer.getOperation() && consumer.isDpsInit(&use)) {
+          return op.emitOpError("block argument ")
+                 << arg.getArgNumber() << " of region " << c
+                 << " must not be an output of the region's d2m.generic";
+        }
+      }
+    }
+  }
+  return success();
+}
+
 // Spatialop verification
 ::mlir::LogicalResult d2m::SpatialOp::verify() {
   mlir::ArrayAttr gridRangesAttr = getGridRanges();
@@ -2384,6 +2546,11 @@ MutableArrayRef<OpOperand> d2m::GenericOp::getInputsAndOutputsMutable() {
     }
   }
 
+  if (hasEdges() || llvm::any_of(getRegions(), [](Region &region) {
+        return region.front().getNumArguments() != 0;
+      })) {
+    return verifySpatialEdges(*this);
+  }
   return success();
 }
 
@@ -3507,6 +3674,67 @@ Value d2m::GenericOp::getOperandAlloc(Region &region, unsigned operandIndex) {
   return result;
 }
 
+// The value written by the producer side of `edge`: output `I` of the
+// producer region's generic (a tensor before that generic is bufferized, the
+// buffer after).
+static mlir::Value getSpatialEdgeSource(d2m::SpatialOp op,
+                                        d2m::SpatialEdgeAttr edge) {
+  auto producer =
+      *op.getRegion(edge.getProducerRegion()).getOps<d2m::GenericOp>().begin();
+  return producer.getOutputs()[edge.getProducerOutput()];
+}
+
+// Replace every consumer block argument with the buffer its producer writes,
+// then drop the block arguments. Nested generics are bufferized before the
+// spatial (post-order walk), so consumer uses are normally
+// `to_buffer(%arg)`; those fold directly into the producer buffer.
+static mlir::LogicalResult
+bufferizeSpatialEdges(d2m::SpatialOp op, mlir::RewriterBase &rewriter,
+                      const mlir::bufferization::BufferizationOptions &options,
+                      mlir::bufferization::BufferizationState &state) {
+  if (!op.hasEdges()) {
+    return mlir::success();
+  }
+  for (auto edge : op.getEdgesAttr().getAsRange<d2m::SpatialEdgeAttr>()) {
+    Value buffer = getSpatialEdgeSource(op, edge);
+    if (mlir::isa<mlir::TensorType>(buffer.getType())) {
+      auto maybeBuffer =
+          bufferization::getBuffer(rewriter, buffer, options, state);
+      if (failed(maybeBuffer)) {
+        return maybeBuffer;
+      }
+      buffer = *maybeBuffer;
+    }
+    if (op->isAncestor(buffer.getParentRegion()->getParentOp())) {
+      return op.emitOpError("edge ")
+             << edge << ": edge buffer must be bufferized in place (the "
+             << "producer output must stay a buffer defined outside the "
+             << "spatial)";
+    }
+    Block &consumerBlock = op.getRegion(edge.getConsumerRegion()).front();
+    BlockArgument arg = consumerBlock.getArgument(edge.getConsumerArg());
+    Value asTensor;
+    for (OpOperand &use : llvm::make_early_inc_range(arg.getUses())) {
+      auto toBuffer = mlir::dyn_cast<bufferization::ToBufferOp>(use.getOwner());
+      if (toBuffer && toBuffer.getType() == buffer.getType()) {
+        rewriter.replaceOp(toBuffer, buffer);
+        continue;
+      }
+      if (!asTensor) {
+        OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPointToStart(&consumerBlock);
+        asTensor = rewriter.create<bufferization::ToTensorOp>(
+            arg.getLoc(), arg.getType(), buffer);
+      }
+      rewriter.modifyOpInPlace(use.getOwner(), [&] { use.set(asTensor); });
+    }
+  }
+  for (Region &region : op.getRegions()) {
+    region.front().eraseArguments(0, region.front().getNumArguments());
+  }
+  return mlir::success();
+}
+
 bool d2m::SpatialOp::bufferizesToMemoryRead(
     mlir::OpOperand &operand, const mlir::bufferization::AnalysisState &) {
   // If the operand is an input, it is bufferized to a memory read.
@@ -3552,9 +3780,12 @@ mlir::LogicalResult d2m::SpatialOp::bufferize(
     }
     bufferOutputs.push_back(*maybeValue);
   }
+  if (failed(bufferizeSpatialEdges(*this, rewriter, options, state))) {
+    return failure();
+  }
   auto bufferSpatial = rewriter.create<d2m::SpatialOp>(
       getLoc(), ValueRange(), bufferInputs, bufferOutputs, getGridRanges(),
-      getNumRegions());
+      getEdgesAttr(), getNumRegions());
   // NOLINTEND(clang-analyzer-core.StackAddressEscape)
   for (mlir::Region &region : bufferSpatial.getRegions()) {
     region.takeBody(getRegion(region.getRegionNumber()));
@@ -3579,20 +3810,35 @@ d2m::SpatialOp::getAliasingValues(mlir::OpOperand &,
   return result;
 }
 mlir::FailureOr<mlir::bufferization::BufferLikeType>
-d2m::SpatialOp::getBufferType(mlir::Value value,
-                              const mlir::bufferization::BufferizationOptions &,
-                              const mlir::bufferization::BufferizationState &,
-                              ::llvm::SmallVector<mlir::Value> &) {
-  // SpatialOp operands/results are tensors from outside or results; no block
-  // arguments on SpatialOp's regions.
+d2m::SpatialOp::getBufferType(
+    mlir::Value value, const mlir::bufferization::BufferizationOptions &options,
+    const mlir::bufferization::BufferizationState &state,
+    ::llvm::SmallVector<mlir::Value> &invocationStack) {
+  // A region block argument is the sink of an edge: it bufferizes to the
+  // buffer its producer writes.
+  if (auto arg = mlir::dyn_cast<BlockArgument>(value)) {
+    SpatialEdgeAttr edge = getIncomingEdge(
+        arg.getOwner()->getParent()->getRegionNumber(), arg.getArgNumber());
+    if (!edge) {
+      return emitOpError("block argument without incoming edge");
+    }
+    Value source = getSpatialEdgeSource(*this, edge);
+    if (auto bufferType =
+            mlir::dyn_cast<bufferization::BufferLikeType>(source.getType())) {
+      return bufferType;
+    }
+    return bufferization::getBufferType(source, options, state,
+                                        invocationStack);
+  }
+  // Otherwise: operands/results are tensors from outside or results.
   auto tensorType = mlir::cast<RankedTensorType>(value.getType());
   return ttcore::getBufferType(tensorType, /*isView=*/false);
 }
 
 bool d2m::SpatialOp::isWritable(mlir::Value value,
                                 const mlir::bufferization::AnalysisState &) {
-  // SpatialOp has no region block arguments; only outputs (OpResults) are
-  // writable.
+  // Only outputs (OpResults) are writable; region block arguments are edge
+  // sinks, which the consumer only reads.
   return mlir::isa<mlir::OpResult>(value);
 }
 

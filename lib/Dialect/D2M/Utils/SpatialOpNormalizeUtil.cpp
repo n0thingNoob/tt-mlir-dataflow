@@ -111,13 +111,19 @@ static void hoistNonGenericOpsAroundSpatial(d2m::SpatialOp spatialOp) {
 // Reassign d2m.spatial ins/outs from generics' operands; when result count
 // matches outs, update each spatial result's type from the corresponding out
 // value only when that out is a ranked tensor (spatial results are tensors;
-// outs may be memref).
+// outs may be memref). Generic inputs that are the spatial's own region block
+// arguments (edge sinks) are not visible outside the spatial and are skipped.
+// Edges index generic outputs per region, so they need no remapping here.
 static void rebuildSpatialOpInsOutsAndResultTypes(d2m::SpatialOp spatialOp) {
   llvm::SetVector<Value> inputs;
   llvm::SmallVector<Value> outputs;
   for (Region &region : spatialOp->getRegions()) {
     d2m::GenericOp genericOp = getSingleGenericOpFromSpatialRegion(region);
     for (Value input : genericOp.getInputs()) {
+      auto blockArg = mlir::dyn_cast<BlockArgument>(input);
+      if (blockArg && blockArg.getOwner()->getParentOp() == spatialOp) {
+        continue;
+      }
       inputs.insert(input);
     }
     for (Value output : genericOp.getOutputs()) {

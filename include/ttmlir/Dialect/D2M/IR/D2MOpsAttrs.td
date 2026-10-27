@@ -109,4 +109,27 @@ def D2M_TopKPlanAttr : AttrDef<D2M_Dialect, "TopKPlan", [], "::mlir::Attribute">
   let assemblyFormat = [{ `<` struct(params) `>` }];
 }
 
+def D2M_SpatialEdgeAttr : AttrDef<D2M_Dialect, "SpatialEdge", [], "::mlir::Attribute"> {
+  let mnemonic = "spatial_edge";
+  let summary = "Data edge between two regions of a d2m.spatial.";
+  let description = [{
+    `#d2m.spatial_edge<P:I -> C:J>`: output `I` (DPS init, equivalently result
+    `I` before bufferization) of the d2m.generic in region `P` feeds entry
+    block argument `J` of region `C`. The consumer reads the edge only after
+    the producer has written the whole tensor.
+  }];
+  let parameters = (ins
+    "unsigned":$producerRegion,
+    "unsigned":$producerOutput,
+    "unsigned":$consumerRegion,
+    "unsigned":$consumerArg
+  );
+
+  let assemblyFormat = [{
+    `<` $producerRegion `` `:` `` $producerOutput `->` $consumerRegion `` `:` `` $consumerArg `>`
+  }];
+}
+
+def D2M_SpatialEdgeArrayAttr : TypedArrayAttrBase<D2M_SpatialEdgeAttr, "">;
+
 #endif // TTMLIR_D2M_DIALECT_D2M_IR_D2MOPSATTRS_TD

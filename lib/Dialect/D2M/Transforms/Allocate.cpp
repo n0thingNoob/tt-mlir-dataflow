@@ -297,6 +297,12 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
 
     ModuleOp moduleOp = getOperation();
 
+    // Edge buffers must be pinned to L1 on the producer cores (PR2a).
+    if (failed(d2m::SpatialOp::checkNoEdges(moduleOp, "d2m-allocate"))) {
+      signalPassFailure();
+      return;
+    }
+
     memSpaces = [this, moduleOp]() {
       ttcore::SystemDescAttr systemDesc =
           ttcore::getCurrentScopeSystemDesc(moduleOp);

@@ -299,6 +299,12 @@ public:
       D2MLowerLoadStoreOpsToDMA>::D2MLowerLoadStoreOpsToDMABase;
 
   void runOnOperation() final {
+    // Edge reads/writes need semaphore synchronization (PR2a).
+    if (failed(d2m::SpatialOp::checkNoEdges(
+            getOperation(), "d2m-lower-load-store-ops-to-dma"))) {
+      signalPassFailure();
+      return;
+    }
     RewritePatternSet patterns(&getContext());
     patterns.add<D2MLowerRemoteLoadRewritePattern>(&getContext());
     patterns.add<D2MLowerRemoteStoreRewritePattern>(&getContext());

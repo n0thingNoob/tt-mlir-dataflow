@@ -469,11 +469,19 @@ def D2M_SpatialOp: D2M_Op<"spatial",
       device. Each region corresponds to one grid range in `grid_ranges` and contains
       exactly one d2m.generic op. Grid ranges must be non-overlapping and contained
       in the device.
+
+      Optional `edges` connect regions: `#d2m.spatial_edge<P:I -> C:J>` feeds
+      output `I` of region `P`'s generic into entry block argument `J` of region
+      `C`. The edge tensor is one of the spatial `outs`; the consumer reads it
+      only after the producer has written all of it. Regions without incoming
+      edges start immediately. Bufferization replaces consumer block arguments
+      with the producer's buffer and keeps `edges`.
     }];
 
     let arguments = (ins Variadic<AnyRankedTensorOrMemRef>:$inputs,
                          Variadic<AnyRankedTensorOrMemRef>:$outputs,
-                         TTCore_CoreRangeArrayAttr:$grid_ranges);
+                         TTCore_CoreRangeArrayAttr:$grid_ranges,
+                         OptionalAttr<D2M_SpatialEdgeArrayAttr>:$edges);
     let results = (outs Variadic<AnyRankedTensor>:$results);
     let regions = (region VariadicRegion<AnyRegion>:$regions);
 
@@ -484,11 +492,32 @@ def D2M_SpatialOp: D2M_Op<"spatial",
 
     let hasVerifier = 1;
 
+    let builders = [
+      // Signature before `edges` was added; builds a spatial without edges.
+      OpBuilder<(ins "::mlir::TypeRange":$results, "::mlir::ValueRange":$inputs,
+                     "::mlir::ValueRange":$outputs, "::mlir::ArrayAttr":$grid_ranges,
+                     "unsigned":$regionsCount), [{
+        build($_builder, $_state, results, inputs, outputs, grid_ranges,
+              /*edges=*/nullptr, regionsCount);
+      }]>
+    ];
+
     let extraClassDeclaration = [{
       // Required by DestinationStyleOpInterface
       MutableOperandRange getDpsInitsMutable() {
         return getOutputsMutable();
       }
+
+      bool hasEdges() { return getEdgesAttr() && !getEdgesAttr().empty(); }
+
+      // The edge feeding entry block argument `arg` of `region`, if any.
+      SpatialEdgeAttr getIncomingEdge(unsigned region, unsigned arg);
+
+      // Emit "edges are not yet supported by <passName>" on every spatial with
+      // edges under `root` (inclusive); fails if there is one. Used by passes
+      // that would otherwise lower an edge without synchronization.
+      static ::mlir::LogicalResult
+      checkNoEdges(::mlir::Operation *root, ::llvm::StringRef passName);
     }];
 }
 
