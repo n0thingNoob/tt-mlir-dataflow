@@ -28,6 +28,7 @@
 #include "types_generated.h"
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <unordered_map>
 
@@ -356,6 +357,56 @@ void MCQExecutor::execute(
                                             command->ref()->initial_value());
 }
 
+// A local semaphore is one program-scoped semaphore: every kernel that
+// references it (for example a d2m.spatial producer on one core range and its
+// consumer on another) must see the same semaphore id. Create each one once,
+// over the union of the cores of all kernels that reference it, and return
+// global id -> semaphore id.
+static std::unordered_map<std::uint32_t, std::uint32_t> createLocalSemaphores(
+    tt_metal::Program &program, const target::metal::ProgramDesc *programDesc,
+    const flatbuffers::Vector<target::metal::ArgRef> *argRefsType,
+    const flatbuffers::Vector<flatbuffers::Offset<void>> *argRefs,
+    const std::unordered_map<std::uint32_t, std::uint32_t> &initializer) {
+  std::map<std::uint32_t, tt::tt_metal::CoreRangeSet> coresBySemaphore;
+  for (const target::metal::KernelConfig *kernelConfig :
+       *programDesc->kernels()) {
+    tt::tt_metal::CoreRangeSet coreRangeSet =
+        common::toCoreRangeSet(kernelConfig->core_range_set());
+    for (const auto *args :
+         {kernelConfig->args()->ct_args(), kernelConfig->args()->crt_args(),
+          kernelConfig->args()->rt_args()}) {
+      if (!args) {
+        continue;
+      }
+      for (const auto *kernelArg : *args) {
+        if (kernelArg->arg_type() !=
+            target::metal::KernelArgType::KernelArgLocalSemaphore) {
+          continue;
+        }
+        std::uint32_t operandIdx =
+            kernelArg->arg_as_KernelArgLocalSemaphore()->operand_idx();
+        LOG_ASSERT(argRefsType->Get(operandIdx) ==
+                   target::metal::ArgRef::LocalSemaphoreRef);
+        const auto *ref =
+            reinterpret_cast<const target::metal::LocalSemaphoreRef *>(
+                argRefs->Get(operandIdx));
+        tt::tt_metal::CoreRangeSet &cores = coresBySemaphore[ref->global_id()];
+        cores = cores.merge(coreRangeSet);
+      }
+    }
+  }
+  std::unordered_map<std::uint32_t, std::uint32_t> semaphoreIds;
+  for (auto &[globalId, cores] : coresBySemaphore) {
+    LOG_ASSERT(initializer.find(globalId) != initializer.end(),
+               "Local semaphore id referenced by kernel args is no longer "
+               "alive or was never created ",
+               globalId);
+    semaphoreIds[globalId] =
+        tt_metal::CreateSemaphore(program, cores, initializer.at(globalId));
+  }
+  return semaphoreIds;
+}
+
 void MCQExecutor::execute(const target::metal::EnqueueProgramCommand *command,
                           const char *loc, const char *debugInfo) {
   ZoneScopedN("EnqueueProgramCommand");
@@ -366,6 +417,10 @@ void MCQExecutor::execute(const target::metal::EnqueueProgramCommand *command,
   auto deviceRange = distributed::MeshCoordinateRange(meshDevice->shape());
   for (auto deviceCoord : deviceRange) {
     tt_metal::Program program = tt_metal::CreateProgram();
+    std::unordered_map<std::uint32_t, std::uint32_t> localSemaphoreIds =
+        createLocalSemaphores(program, command->program(),
+                              command->arg_refs_type(), command->arg_refs(),
+                              local_semaphore_initializer);
     bool hasFabricConfiguredKernel = false;
     for (const target::metal::KernelConfig *kernelConfig :
          *command->program()->kernels()) {
@@ -378,8 +433,10 @@ void MCQExecutor::execute(const target::metal::EnqueueProgramCommand *command,
       tt::tt_metal::CoreRangeSet coreRangeSet =
           common::toCoreRangeSet(kernelConfig->core_range_set());
 
-      auto createSemaphore = [&](std::uint32_t initialValue) -> std::uint32_t {
-        return tt_metal::CreateSemaphore(program, coreRangeSet, initialValue);
+      // Called with a local semaphore's global id; the semaphore was created
+      // once for the whole program above.
+      auto createSemaphore = [&](std::uint32_t globalId) -> std::uint32_t {
+        return localSemaphoreIds.at(globalId);
       };
 
       tt_metal::KernelHandle handle = createKernel(
