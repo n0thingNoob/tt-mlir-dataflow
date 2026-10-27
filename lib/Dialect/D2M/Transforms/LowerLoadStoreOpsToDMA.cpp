@@ -244,6 +244,11 @@ public:
         rewriter.create<DMAWriteOp>(loc, localMemref, remoteMemref, gridIndices,
                                     startDevice, deviceMcastShape);
 
+    // Wait for DMA to complete.
+    rewriter.create<DMAWaitOp>(loc, dmaTx);
+
+    // Signal only after the write has completed, so a waiter that observes the
+    // increment also observes the data.
     if (remoteStore.getSemaphore()) {
       auto incr = rewriter.create<arith::ConstantIndexOp>(loc, 1);
       rewriter.create<SemaphoreIncOp>(loc, remoteStore.getSemaphore(), incr,
@@ -253,8 +258,6 @@ public:
 
     rewriter.eraseOp(remoteStore);
 
-    // Wait for DMA to complete.
-    rewriter.create<DMAWaitOp>(loc, dmaTx);
     // Pop the circular buffer to signal consumption.
     rewriter.create<PopOp>(loc, cb);
     return success();
@@ -299,12 +302,6 @@ public:
       D2MLowerLoadStoreOpsToDMA>::D2MLowerLoadStoreOpsToDMABase;
 
   void runOnOperation() final {
-    // Edge reads/writes need semaphore synchronization (PR2a).
-    if (failed(d2m::SpatialOp::checkNoEdges(
-            getOperation(), "d2m-lower-load-store-ops-to-dma"))) {
-      signalPassFailure();
-      return;
-    }
     RewritePatternSet patterns(&getContext());
     patterns.add<D2MLowerRemoteLoadRewritePattern>(&getContext());
     patterns.add<D2MLowerRemoteStoreRewritePattern>(&getContext());
