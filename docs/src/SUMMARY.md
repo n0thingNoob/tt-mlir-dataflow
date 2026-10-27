@@ -53,3 +53,4 @@
   - [Tensor Layout](./specs/tensor-layout.md)
   - [Device](./specs/device.md)
   - [TTNN Optimizer](./specs/ttnn-optimizer.md)
+  - [D2M Spatial Channels](./specs/d2m-spatial-channel.md)
