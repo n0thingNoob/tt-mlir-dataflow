@@ -8,6 +8,7 @@
 #include "ttmlir/Asserts.h"
 #include "ttmlir/Dialect/D2M/Analysis/Allocation/Planner.h"
 #include "ttmlir/Dialect/D2M/Analysis/Allocation/Utils.h"
+#include "ttmlir/Dialect/D2M/Utils/Utils.h"
 #include "ttmlir/Dialect/TTCore/IR/TTCore.h"
 #include "ttmlir/Dialect/TTIR/IR/TTIROps.h"
 #include "ttmlir/Utils.h"
@@ -1446,6 +1447,10 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
   ///    are not broadcast or reduction.
   /// This is a common function shared by isAliasedLoad and isAliasedStore.
   bool canAliasOperand(d2m::GenericOp genericOp, Value genericOperand) const {
+    if (!isPlacedOnGenericCores(genericOp, genericOperand)) {
+      return false;
+    }
+
     // Check if operand requires aliasing
     bool isOutput = llvm::find_if(genericOp.getOutputs(), [&](Value operand) {
                       return operand == genericOperand;
@@ -1495,6 +1500,45 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
     };
 
     return true;
+  }
+
+  // Whether the operand's shards live on the generic's own cores. Equal
+  // shapes do not imply that: a generic inside a d2m.spatial region may run on
+  // a core range other than the one its operand was allocated on (for example
+  // the consumer of a spatial edge), and then it must read the operand with a
+  // DMA instead of aliasing local L1. Compares the generic grid's
+  // virtual-to-physical map with the operand's virtual grid mapping (identity
+  // at the origin when either is absent).
+  static bool isPlacedOnGenericCores(d2m::GenericOp genericOp,
+                                     Value genericOperand) {
+    AffineMap genericMap = genericOp.getGrid().getVirtToPhysicalMap();
+    std::optional<AffineMap> operandMapping =
+        utils::getVirtualGridForwardMapping(genericOperand);
+    if (genericMap.isEmpty() && !operandMapping) {
+      return true;
+    }
+    ArrayRef<int64_t> gridShape = genericOp.getGrid().getShape();
+    if (gridShape.size() != 2) {
+      return false;
+    }
+    MLIRContext *ctx = genericOp.getContext();
+    AffineMap identity = AffineMap::getMultiDimIdentityMap(2, ctx).insertResult(
+        getAffineConstantExpr(0, ctx), 0);
+    AffineMap operandMap = identity;
+    if (operandMapping) {
+      auto operandMaps =
+          utils::getGridMapsFromVirtualGridMapping(genericOperand, gridShape);
+      if (!operandMaps) {
+        return false;
+      }
+      operandMap = operandMaps->first;
+    }
+    if (genericMap.isEmpty()) {
+      genericMap = identity;
+    } else if (genericMap.getNumResults() == 2) {
+      genericMap = genericMap.insertResult(getAffineConstantExpr(0, ctx), 0);
+    }
+    return simplifyAffineMap(genericMap) == simplifyAffineMap(operandMap);
   }
 
   bool isAliasedLoad(RemoteLoadOp loadOp) {
