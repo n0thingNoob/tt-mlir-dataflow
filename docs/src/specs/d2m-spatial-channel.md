@@ -206,7 +206,7 @@ The source references below are to the LLVM checkout tt-mlir builds against
 | `SpatialYieldOp::verify` | If the parent spatial has edges, require the yield operands to be exactly the region generic's results, in order | Edge index `I` and yield operand `I` must name the same value |
 | `SpatialOpNormalizeUtil` | (1) Leave the spatial's own block arguments out of the rebuilt `ins`. (2) Prefix ops that use a block argument cannot exist (the verifier requires block arguments to be used only inside the region's generic), so hoisting stays valid. (3) `outs` and the result order are unchanged. Edges use `(region, output index)`, so they need no remapping. | Fixes the dominance error above. Keeps the edge numbering stable. |
 | GridSelection | No code change; it reaches the code above through `normalizeSpatialOpContainingGeneric`. A consumer input that is a block argument is classified as `Kind::Skip`, so it is not rewritten. If grid selection changes the type of an edge's producer output, the verifier reports the type mismatch after the pass. Making both ends agree is PR2b. | Fails explicitly, never silently |
-| Allocate, `d2m-lower-load-store-ops-to-dma`, D2MToTTMetal, D2MToTTNN | Emit "d2m.spatial edges are not yet supported by <pass>" and fail, through one shared helper | Nothing downstream generates code for an edge before PR2 |
+| Allocate, `d2m-lower-load-store-ops-to-dma`, D2MToTTMetal, D2MToTTNN | At the start of `runOnOperation`, call the new static `SpatialOp::checkNoEdges(root, passName)`, which emits "'d2m.spatial' op edges are not yet supported by <pass>" on every spatial with edges, and fail | Nothing downstream generates code for an edge before PR2. The helper lives on the op so the conversion libraries need no new link dependency. Every pass between the frontend and Allocate carries `edges` through unchanged; checked with the full pipeline in both TTNN and TTMetal modes. |
 | d2m-jit builder (`tools/d2m-jit/_src/builder.py`) | None in PR1 | Python call sites stay compatible (§2.5). Creating edges from Python can come once the lowering exists. |
 
 ### 3.1 Builders
@@ -340,9 +340,10 @@ arguments.
 | R6 | Producer and consumer generic grids have the same shape. Block shapes then match because the types are equal (R5). | always (see note) | 1x1 producer, 2x2 consumer |
 | R7 | Producer output `I` is one of the spatial's `outs` (the edge buffer is a spatial `outs`) | always | producer writes a value not in `outs` |
 | R8 | A block argument is a ranked tensor, used only inside its region's generic and never as one of its DPS inits | tensor form | use by an op outside the generic; block arg as `outs` |
-| R9 | `spatial_yield` (when present) yields exactly the generic's results in order, if the spatial has edges | tensor form | yield in different order |
+| R9 | `spatial_yield` (when present) yields exactly the generic's results in order, if the spatial has edges (in `SpatialYieldOp::verify`) | tensor form | yield in different order |
+| R10 | No region block arguments once the spatial is in buffer form (some `outs` is a memref) | buffer form | memref spatial with a block argument |
 
-"Tensor form" means before bufferization. After bufferization the block
+"Tensor form" means every `outs` is a tensor; otherwise the spatial is in buffer form. After bufferization the block
 arguments are gone, so R3c, R4-missing, R5, R8 and R9 no longer apply. R1, R2,
 R3a, R3b, R4-duplicate, R4b, R6 and R7 still hold.
 
@@ -352,6 +353,8 @@ GridSelection changes a grid it also changes the operand types, so a
 selection that breaks R6 also breaks R5 and fails in the verifier right after
 `d2m-grid-selection`. PR2b makes GridSelection choose matching grids for both
 ends.
+
+Negative tests use `--verify-diagnostics`, one `// -----` case per rule (15 cases).
 
 Positive tests (`spatial_channel.mlir`):
 
