@@ -1548,9 +1548,12 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
   }
 
   bool isAliasedStore(RemoteStoreOp storeOp) {
+    // A store that increments a semaphore must stay a real store: an aliased
+    // store has no DMA to complete before the increment, and its marker is
+    // erased by d2m-insert-compute-cb.
     return canAliasOperand(storeOp->getParentOfType<d2m::GenericOp>(),
                            storeOp.getMemref()) &&
-           storeOp.getStartDevice().empty();
+           storeOp.getStartDevice().empty() && !storeOp.getSemaphore();
   }
 
   static void assignAddressAndAlignment(RewriterBase &rewriter,
