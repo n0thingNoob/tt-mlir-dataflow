@@ -664,6 +664,35 @@ getDramMapShapeSymbols(ttcore::DeviceAttr device, MemRefType memrefType,
   return symbols;
 }
 
+// A stored forward map may carry the core-grid origin of the generic that
+// produces the buffer (GridSelection's deriveVirtualGridAttrs adds the target
+// range offset, e.g. a spatial region placed at core (0, 4)). The placement of
+// DRAM shards on banks is a property of the buffer, not of the cores that
+// touch it: the host (createShardedBufferConfigForDRAMMemref) always places
+// shard i in bank i % numBanks starting from bank 0. Remove the origin offset
+// from the grid results so kernels address the same banks as the host. This is
+// an exact no-op when the map sends the virtual origin to the physical origin.
+static AffineMap stripDramGridOriginOffset(AffineMap forwardMap,
+                                           unsigned workerRank) {
+  if (forwardMap.isEmpty() || forwardMap.getNumSymbols() != 0 ||
+      forwardMap.getNumResults() < workerRank) {
+    return forwardMap;
+  }
+  SmallVector<int64_t> origin =
+      forwardMap.compose(SmallVector<int64_t>(forwardMap.getNumDims(), 0));
+  SmallVector<int64_t> negated;
+  bool hasOffset = false;
+  for (unsigned i = 0; i < workerRank; ++i) {
+    hasOffset |= origin[i] != 0;
+    negated.push_back(-origin[i]);
+  }
+  if (!hasOffset) {
+    return forwardMap;
+  }
+  return mlir::simplifyAffineMap(ttmlir::utils::applyOffsetsToAffineMapResults(
+      forwardMap, negated, /*startIndex=*/0));
+}
+
 // Core implementation of getMemoryMap. When storedForwardMap is provided, it
 // is used directly for core virtualization instead of re-deriving via
 // requiresVirtualGrid + createCoreVirtMaps.
@@ -675,6 +704,10 @@ getMemoryMapImpl(ttcore::DeviceAttr device, MemRefType memrefType,
   ttcore::MemorySpace memorySpace =
       mlir::cast<ttcore::MemorySpaceAttr>(memrefType.getMemorySpace())
           .getValue();
+  if (storedForwardMap && memorySpace == ttcore::MemorySpace::DeviceDRAM) {
+    storedForwardMap = stripDramGridOriginOffset(
+        *storedForwardMap, device.getWorkerGrid().getShape().size());
+  }
   AffineMap affineMap;
   if (auto layout =
           mlir::dyn_cast<MemRefLayoutAttrInterface>(memrefType.getLayout())) {
