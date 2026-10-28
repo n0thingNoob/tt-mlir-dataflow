@@ -69,6 +69,50 @@ module {
     return
   }
 
+  // Remote multicast semaphore_inc: the issuing core is outside the
+  // rectangle, so num_dests is the whole rectangle (h * w, not h * w - 1).
+  func.func private @mcast_inc() attributes {d2m.thread = #d2m.thread<datamovement, dm_core = 1>} {
+    %sem0 = d2m.get_arg(0) : !d2m.local_semaphore
+    %c1 = arith.constant 1 : index
+    %y  = arith.constant 4 : index
+    %x  = arith.constant 5 : index
+    %h  = arith.constant 2 : index
+    %w  = arith.constant 3 : index
+    d2m.semaphore_inc %sem0, %c1, core[%y, %x] mcast[%h, %w] : !d2m.local_semaphore
+    // CHECK-LABEL: func.func private @mcast_inc
+    // CHECK: %[[SEM:[0-9]+]] = ttkernel.get_semaphore
+    // CHECK: %[[AREA:[0-9]+]] = arith.muli
+    // CHECK-NEXT: %[[N:[0-9]+]] = arith.index_cast %[[AREA]] : index to i32
+    // CHECK-NOT: arith.subi
+    // CHECK: %[[NOC:[a-zA-Z0-9_]+]] = arith.constant 0 : i8
+    // CHECK: %[[MADDR:[0-9]+]] = ttkernel.get_noc_multicast_addr({{.*}}, {{.*}}, {{.*}}, {{.*}}, %[[SEM]], %[[NOC]])
+    // CHECK-NOT: ttkernel.noc_semaphore_set
+    // CHECK: ttkernel.noc_semaphore_inc_multicast(%[[MADDR]], %{{.*}}, %[[N]], %[[NOC]])
+    // CHECK-NOT: posted
+    return
+  }
+
+  // Multicast semaphore_inc on NOC1 flips the rectangle like semaphore_set.
+  func.func private @mcast_inc_noc1() attributes {d2m.thread = #d2m.thread<datamovement, dm_core = 0>} {
+    %sem0 = d2m.get_arg(0) : !d2m.local_semaphore
+    %c1 = arith.constant 1 : index
+    %y  = arith.constant 4 : index
+    %x  = arith.constant 5 : index
+    %h  = arith.constant 2 : index
+    %w  = arith.constant 3 : index
+    d2m.semaphore_inc %sem0, %c1, core[%y, %x] mcast[%h, %w] : !d2m.local_semaphore
+    // CHECK-LABEL: func.func private @mcast_inc_noc1
+    // CHECK: %[[SEM:[0-9]+]] = ttkernel.get_semaphore
+    // CHECK: %[[START_Y:[0-9]+]] = ttkernel.experimental.convert_logical_y_to_translated
+    // CHECK: %[[START_X:[0-9]+]] = ttkernel.experimental.convert_logical_x_to_translated
+    // CHECK: %[[END_Y:[0-9]+]] = ttkernel.experimental.convert_logical_y_to_translated
+    // CHECK: %[[END_X:[0-9]+]] = ttkernel.experimental.convert_logical_x_to_translated
+    // CHECK: %[[NOC:[a-zA-Z0-9_]+]] = arith.constant 1 : i8
+    // CHECK: %[[MADDR:[0-9]+]] = ttkernel.get_noc_multicast_addr(%[[END_X]], %[[END_Y]], %[[START_X]], %[[START_Y]], %[[SEM]], %[[NOC]])
+    // CHECK: ttkernel.noc_semaphore_inc_multicast(%[[MADDR]], %{{.*}}, %{{.*}}, %[[NOC]])
+    return
+  }
+
   // semaphore_wait without reset
   func.func private @wait_no_reset() attributes {d2m.thread = #d2m.thread<datamovement>} {
     %sem0 = d2m.get_arg(0) : !d2m.local_semaphore
