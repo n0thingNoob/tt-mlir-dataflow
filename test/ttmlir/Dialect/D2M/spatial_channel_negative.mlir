@@ -321,35 +321,35 @@ func.func @r5_type_mismatch(%in: tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>)
 
 // -----
 
-#l1 = #ttcore.metal_layout<logical_shape = 32x32, dim_alignments = 32x32, collapsed_intervals = dense<[[0, 1], [1, 2]]> : tensor<2x2xi64>, l1, sharded>
+#l1 = #ttcore.metal_layout<logical_shape = 64x64, dim_alignments = 32x32, collapsed_intervals = dense<[[0, 1], [1, 2]]> : tensor<2x2xi64>, l1, sharded>
 #map = affine_map<(d0, d1) -> (d0, d1)>
 #parallel = #ttcore.iterator_type<parallel>
 
-// R6 grid mismatch
-func.func @r6_grid_mismatch(%in: tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>) {
-  %e0 = d2m.empty() : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>
-  %e1 = d2m.empty() : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>
-  // expected-error @+1 {{edge #d2m.spatial_edge<0:0 -> 1:0>: producer grid [1, 1] and consumer grid [1, 2] must match}}
-  %r:2 = d2m.spatial {edges = [#d2m.spatial_edge<0:0 -> 1:0>], grid_ranges = [#ttcore.core_range<(0, 0), (0, 0)>, #ttcore.core_range<(1, 0), (1, 1)>]}
-      ins(%in : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>)
-      outs(%e0, %e1 : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>, tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>) {
+// R6 the producer writes the edge on grid 1x1, the consumer reads it on 2x2
+func.func @r6_edge_grid_mismatch(%in: tensor<1x1x2x2x!ttcore.tile<32x32, bf16>, #l1>) {
+  %e0 = d2m.empty() : tensor<1x1x2x2x!ttcore.tile<32x32, bf16>, #l1>
+  %e1 = d2m.empty() : tensor<2x2x1x1x!ttcore.tile<32x32, bf16>, #l1>
+  // expected-error @+1 {{edge #d2m.spatial_edge<0:0 -> 1:0>: producer writes it on grid [1, 1] but the consumer reads it on grid [2, 2]}}
+  %r:2 = d2m.spatial {edges = [#d2m.spatial_edge<0:0 -> 1:0>], grid_ranges = [#ttcore.core_range<(0, 0), (0, 0)>, #ttcore.core_range<(1, 0), (2, 1)>]}
+      ins(%in : tensor<1x1x2x2x!ttcore.tile<32x32, bf16>, #l1>)
+      outs(%e0, %e1 : tensor<1x1x2x2x!ttcore.tile<32x32, bf16>, #l1>, tensor<2x2x1x1x!ttcore.tile<32x32, bf16>, #l1>) {
         %g0 = d2m.generic {block_factors = [1, 1], grid = #ttcore.grid<1x1>, indexing_maps = [#map, #map], iterator_types = [#parallel, #parallel], threads = [#d2m.thread<unified>]}
-            ins(%in : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>)
-            outs(%e0 : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>) {
-          %t0 = tensor.empty() : tensor<1x1x!ttcore.tile<32x32, bf16>>
-          d2m.yield %t0 : (tensor<1x1x!ttcore.tile<32x32, bf16>>)
-        } : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>
-        d2m.spatial_yield %g0 : (tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>)
+            ins(%in : tensor<1x1x2x2x!ttcore.tile<32x32, bf16>, #l1>)
+            outs(%e0 : tensor<1x1x2x2x!ttcore.tile<32x32, bf16>, #l1>) {
+          %t0 = tensor.empty() : tensor<2x2x!ttcore.tile<32x32, bf16>>
+          d2m.yield %t0 : (tensor<2x2x!ttcore.tile<32x32, bf16>>)
+        } : tensor<1x1x2x2x!ttcore.tile<32x32, bf16>, #l1>
+        d2m.spatial_yield %g0 : (tensor<1x1x2x2x!ttcore.tile<32x32, bf16>, #l1>)
     }, {
-      ^bb0(%x: tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>):
-        %g1 = d2m.generic {block_factors = [1, 1], grid = #ttcore.grid<1x2>, indexing_maps = [#map, #map], iterator_types = [#parallel, #parallel], threads = [#d2m.thread<unified>]}
-            ins(%x : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>)
-            outs(%e1 : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>) {
+      ^bb0(%x: tensor<2x2x1x1x!ttcore.tile<32x32, bf16>, #l1>):
+        %g1 = d2m.generic {block_factors = [1, 1], grid = #ttcore.grid<2x2>, indexing_maps = [#map, #map], iterator_types = [#parallel, #parallel], threads = [#d2m.thread<unified>]}
+            ins(%x : tensor<2x2x1x1x!ttcore.tile<32x32, bf16>, #l1>)
+            outs(%e1 : tensor<2x2x1x1x!ttcore.tile<32x32, bf16>, #l1>) {
           %t0 = tensor.empty() : tensor<1x1x!ttcore.tile<32x32, bf16>>
           d2m.yield %t0 : (tensor<1x1x!ttcore.tile<32x32, bf16>>)
-        } : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>
-        d2m.spatial_yield %g1 : (tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>)
-    } : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>, tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>
+        } : tensor<2x2x1x1x!ttcore.tile<32x32, bf16>, #l1>
+        d2m.spatial_yield %g1 : (tensor<2x2x1x1x!ttcore.tile<32x32, bf16>, #l1>)
+    } : tensor<1x1x2x2x!ttcore.tile<32x32, bf16>, #l1>, tensor<2x2x1x1x!ttcore.tile<32x32, bf16>, #l1>
   return
 }
 

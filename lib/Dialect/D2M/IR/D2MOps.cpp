@@ -2365,7 +2365,6 @@ static mlir::LogicalResult verifySpatialEdges(d2m::SpatialOp op) {
              << edge << " connects region " << p << " to itself";
     }
     d2m::GenericOp producer = generics[p];
-    d2m::GenericOp consumer = generics[c];
     if (i >= producer.getOutputs().size()) {
       return op.emitOpError("edge ")
              << edge << ": producer generic in region " << p << " has "
@@ -2392,11 +2391,28 @@ static mlir::LogicalResult verifySpatialEdges(d2m::SpatialOp op) {
       return op.emitOpError("edge ")
              << edge << ": producer output must be one of the spatial outs";
     }
-    if (producer.getGrid().getShape() != consumer.getGrid().getShape()) {
-      return op.emitOpError("edge ")
-             << edge << ": producer grid [" << producer.getGrid().getShape()
-             << "] and consumer grid [" << consumer.getGrid().getShape()
-             << "] must match";
+    // The consumer reads the edge as the producer laid it out: both ends see
+    // the same shard grid. The two generics' grids may differ (e.g. a matmul
+    // consumer reading an MxK edge on an MxN grid).
+    if (tensorForm) {
+      auto producerType = mlir::cast<RankedTensorType>(edgeBuffer.getType());
+      auto argType = mlir::dyn_cast<RankedTensorType>(
+          consumerBlock.getArgument(j).getType());
+      auto producerLayout = mlir::dyn_cast_if_present<ttcore::MetalLayoutAttr>(
+          producerType.getEncoding());
+      auto argLayout = argType
+                           ? mlir::dyn_cast_if_present<ttcore::MetalLayoutAttr>(
+                                 argType.getEncoding())
+                           : nullptr;
+      if (producerLayout && argLayout &&
+          producerLayout.getGridShape(producerType) !=
+              argLayout.getGridShape(argType)) {
+        return op.emitOpError("edge ")
+               << edge << ": producer writes it on grid ["
+               << producerLayout.getGridShape(producerType)
+               << "] but the consumer reads it on grid ["
+               << argLayout.getGridShape(argType) << "]";
+      }
     }
     if (tensorForm &&
         consumerBlock.getArgument(j).getType() != edgeBuffer.getType()) {
