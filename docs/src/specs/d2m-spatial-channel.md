@@ -1,7 +1,8 @@
 # D2M Spatial Channels: Data Edges Between `d2m.spatial` Regions
 
-Status: PR1 (IR representation) and PR2a (single-core synchronization and
-TTMetal lowering) implemented; PR2b (multi-core regions) planned.
+Status: PR1 (IR representation), PR2a (synchronization and TTMetal lowering)
+and PR2b (multi-core regions: GridSelection lays out both ends of an edge
+alike) implemented.
 
 ## 1. Problem and scope
 
@@ -205,7 +206,7 @@ The source references below are to the LLVM checkout tt-mlir builds against
 | `SpatialOp::getAliasingValues` | Unchanged (empty) | §3.2 |
 | `SpatialYieldOp::verify` | If the parent spatial has edges, require the yield operands to be exactly the region generic's results, in order | Edge index `I` and yield operand `I` must name the same value |
 | `SpatialOpNormalizeUtil` | (1) Leave the spatial's own block arguments out of the rebuilt `ins`. (2) Prefix ops that use a block argument cannot exist (the verifier requires block arguments to be used only inside the region's generic), so hoisting stays valid. (3) `outs` and the result order are unchanged. Edges use `(region, output index)`, so they need no remapping. | Fixes the dominance error above. Keeps the edge numbering stable. |
-| GridSelection | No code change; it reaches the code above through `normalizeSpatialOpContainingGeneric`. A consumer input that is a block argument is classified as `Kind::Skip`, so it is not rewritten. If grid selection changes the type of an edge's producer output, the verifier reports the type mismatch after the pass. Making both ends agree is PR2b. | Fails explicitly, never silently |
+| GridSelection | PR1: no code change; it reaches the code above through `normalizeSpatialOpContainingGeneric`. PR2b: the producer decides an edge's layout and the consumer follows. `GridAnalysis` analyzes producers before consumers and pins a consumer's edge operand to the producer output's selected grid and padding. GridSelection gives that operand `Kind::SpatialEdge` and sets the block argument's type with the same `gridAdjustedType` call the producer's output goes through. If the consumer generic would need another grid for the edge, the pass fails ("resharding an edge is not supported"). | Both ends get the same type whatever order generics are rewritten in; a layout the consumer cannot read is an error, never a silent wrong read |
 | D2MToTTMetal, D2MToTTNN | Fail with "'d2m.spatial' op edges are not yet supported by <pass>" (`SpatialOp::checkNoEdges`) if an edge reaches them unlowered. PR1 also checked in Allocate and `d2m-lower-load-store-ops-to-dma`; PR2a lowers edges before both conversions and drops those two checks. | Never emit unsynchronized code |
 | d2m-jit builder (`tools/d2m-jit/_src/builder.py`) | None in PR1 | Python call sites stay compatible (§2.5). Creating edges from Python can come once the lowering exists. |
 
@@ -348,12 +349,12 @@ arguments.
 arguments are gone, so R3c, R4-missing, R5, R8 and R9 no longer apply. R1, R2,
 R3a, R3b, R4-duplicate, R4b, R6 and R7 still hold.
 
-Note on R6: the generic `grid` attribute exists at every stage. Hand-written
-IR, which is the only source of edges in PR1, has its grids fixed. When
-GridSelection changes a grid it also changes the operand types, so a
-selection that breaks R6 also breaks R5 and fails in the verifier right after
-`d2m-grid-selection`. PR2b makes GridSelection choose matching grids for both
-ends.
+Note on R6: the generic `grid` attribute exists at every stage. Since PR2b,
+GridSelection gives both ends of an edge the same type (R5). For an
+elementwise consumer that also makes the two generic grids equal; a consumer
+whose grid differs from its edge operand's (a matmul, for example) still fails
+R6 after `d2m-grid-selection`. Relaxing R6 to a per-operand check is left for
+later.
 
 Negative tests use `--verify-diagnostics`, one `// -----` case per rule (15 cases).
 
@@ -396,9 +397,21 @@ does nothing so that D2MToTTNN still rejects them.
   canonicalization asserts, and DST register access fails), so the diamond is
   covered at the IR level only (PR1 tests).
 
-**PR2b (multi-core regions):** GridSelection chooses consistent grids and block
-shapes for both ends of each edge, and propagates the producer's output type to
-the consumer block argument (R5 / R6 after selection).
+**PR2b (multi-core regions): done.**
+
+- PR2a's lowering, Allocate and runtime already handle multi-core regions: a
+  hand-selected 2x2 -> 2x2 chain ran correctly without changes.
+- GridSelection lays out both ends of an edge alike (§3, GridSelection row).
+  Lit: 2x2 chain to an offset region, 1x4 rows, a join, a consumer region
+  rewritten before its producer, and the grid-mismatch error.
+- Validation on n150, pre-selection input (grid 1x1, GridSelection picks
+  grids and VGMs): chain 2x2 (0,0) -> 2x2 (0,3); join 2x2 (0,0) and (3,0) ->
+  2x2 (0,4); chain3 of 1x4 rows (rows 0, 1, 3); the join with DRAM input and
+  DRAM consumer output. Every output PCC >= 0.9999 vs torch, 5 submits per
+  process, 2 seeds. PR2a's 1x1 graphs still pass with the PR2b compiler.
+- A `to_layout` result can feed only one generic when GridSelection resizes
+  it (upstream assert in `recordGenericConsumer`), so two regions that read
+  the same host input need one `to_layout` each.
 
 **Known upstream bugs** (all four were present on `main` `f688ee694`):
 
@@ -408,12 +421,16 @@ the consumer block argument (R5 / R6 after selection).
      region reading an origin operand now streams it; an edge consumer reads
      the producer's L1).
    - GridSelection `optimizeToLayoutGrid` (`GridSelection.cpp:176-201`)
-     returns early for an already-selected or 1x1 grid, so an output produced
-     by `to_layout` in an off-origin region never gets the offset VGM.
-     Deferred to PR2b: edge buffers come from `d2m.empty`, which gets the VGM.
-2. DRAM bank map with spatial offset (`getMemoryMapImpl`, `Utils.cpp:696-697`,
-   738-748). Deferred to PR2b: PR2a edges and test inputs are in L1.
-   Reference: `feature/d2m-batch2` `f8f250c3e`.
+     returns early for an already-selected or 1x1 grid, so a `to_layout`
+     input of an off-origin region stays on the origin cores. **Not fixed:**
+     since the Allocate fix the region streams it from there, so this costs an
+     extra transfer, not a wrong result (n150: a 1x1 region at (1,1) and a
+     2x2 region at (0,2) with such inputs, PCC 0.99999). Edge buffers come
+     from `d2m.empty`, which gets the VGM.
+2. DRAM bank map with spatial offset (`getMemoryMapImpl`). **Fixed in
+   PR2b** (same code as `feature/d2m-batch2` `f8f250c3e`): a 2x2 region at
+   (0,2) writing a DRAM output read back with PCC -0.01 before, 0.99999
+   after.
 3. `semaphore_inc` before DMA wait (`LowerLoadStoreOpsToDMA`) and a write
    barrier sinking past `semaphore_inc` (`DMAOptimizations`). **Fixed in
    PR2a.**
