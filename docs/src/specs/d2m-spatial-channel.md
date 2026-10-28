@@ -339,22 +339,25 @@ arguments.
 | R4 | Every consumer block argument has exactly one incoming edge (no missing, no duplicate) | tensor form for "missing"; always for "duplicate" | arg without edge; two edges into `1:0` |
 | R4b | One-to-one: a producer output feeds at most one edge (v1) | always | `0:0 -> 1:0` and `0:0 -> 2:0` |
 | R5 | Block argument type == producer generic output `I` type (shape, element type, layout) | tensor form | layout / shape mismatch |
-| R6 | Producer and consumer generic grids have the same shape. Block shapes then match because the types are equal (R5). | always (see note) | 1x1 producer, 2x2 consumer |
+| R6 | The consumer reads the edge on the grid the producer writes it on: the shard grid of the block argument's type equals that of the producer output `I`. The two generics' own grids may differ (see note). | tensor form | producer writes on 1x1, consumer reads on 2x2 |
 | R7 | Producer output `I` is one of the spatial's `outs` (the edge buffer is a spatial `outs`) | always | producer writes a value not in `outs` |
 | R8 | A block argument is a ranked tensor, used only inside its region's generic and never as one of its DPS inits | tensor form | use by an op outside the generic; block arg as `outs` |
 | R9 | `spatial_yield` (when present) yields exactly the generic's results in order, if the spatial has edges (in `SpatialYieldOp::verify`) | tensor form | yield in different order |
 | R10 | No region block arguments once the spatial is in buffer form (some `outs` is a memref) | buffer form | memref spatial with a block argument |
 
 "Tensor form" means every `outs` is a tensor; otherwise the spatial is in buffer form. After bufferization the block
-arguments are gone, so R3c, R4-missing, R5, R8 and R9 no longer apply. R1, R2,
-R3a, R3b, R4-duplicate, R4b, R6 and R7 still hold.
+arguments are gone, so R3c, R4-missing, R5, R6, R8 and R9 no longer apply (the
+consumer reads the producer's buffer itself). R1, R2, R3a, R3b, R4-duplicate,
+R4b and R7 still hold.
 
-Note on R6: the generic `grid` attribute exists at every stage. Since PR2b,
-GridSelection gives both ends of an edge the same type (R5). For an
-elementwise consumer that also makes the two generic grids equal; a consumer
-whose grid differs from its edge operand's (a matmul, for example) still fails
-R6 after `d2m-grid-selection`. Relaxing R6 to a per-operand check is left for
-later.
+Note on R6: until PR2b, R6 required the producer and consumer generics to
+have the same grid. That is stronger than the handoff needs: the lowering
+signals every consumer core from every producer core whatever the two grids
+are, and the consumer's DMA reads the producer's shards wherever they are. R6
+now compares the edge operand on both ends. It is implied by R5 (equal types)
+and checked first only for a clearer message. A matmul consumer is the case
+it admits: its generic grid follows its MxN output (2x4 in the test) while it
+reads the MxK edge on the producer's grid (2x2).
 
 Negative tests use `--verify-diagnostics`, one `// -----` case per rule (15 cases).
 
@@ -412,6 +415,16 @@ does nothing so that D2MToTTNN still rejects them.
 - A `to_layout` result can feed only one generic when GridSelection resizes
   it (upstream assert in `recordGenericConsumer`), so two regions that read
   the same host input need one `to_layout` each.
+- R6 compares the edge operand, not the generic grids (§5). Lit: a matmul
+  consumer on 2x4 reading a 2x2 edge. n150: `tanh(x)` on 2x2 at (0,0) ->
+  `a @ w` (64x128 @ 128x128) on 2x4 at (0,4), PCC 0.99999 for both outputs,
+  5 submits, 2 seeds.
+- Upstream, unrelated to edges: a matmul whose operand is multicast along a
+  single row or column prints an `emitc.expression` with a repeated operand,
+  which the parser rejects ("region entry argument is already in use"), so
+  `ttmlir-opt -o x.mlir` followed by `ttmlir-translate x.mlir` fails. A plain
+  `ttir.matmul` 64x128 @ 128x128 hits it on `main` too. Writing bytecode
+  (`--emit-bytecode`) avoids the textual round trip.
 
 **Known upstream bugs** (all four were present on `main` `f688ee694`):
 
