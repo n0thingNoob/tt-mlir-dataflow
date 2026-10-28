@@ -2534,6 +2534,13 @@ class D2M_SemaphoreUpdateOp<string mnemonic> : D2M_GenericRegionOp<mnemonic,
       ```mlir
       d2m.semaphore_set %sem0, %c1 core[%c2, %c2] mcast[%c4, %c4]
       ```
+
+      - Increment a remote mcast region of cores' semaphore value. The issuing
+        core must not lie inside the region (there is no loopback variant of
+        the NoC atomic), so every core of the region is a destination.
+      ```mlir
+      d2m.semaphore_inc %sem0, %c1 core[%c2, %c2] mcast[%c4, %c4]
+      ```
     }];
 
     let arguments = (ins AnyTypeOf<[D2M_LocalSemaphore, D2M_GlobalSemaphore]>:$semaphore, Index:$value,

@@ -373,7 +373,8 @@ computeCompositeInputGridInfos(d2m::CompositeViewOp compositeView,
 
 GenericGridAnalysisResult GridAnalysis::analyzeGenericOp(
     GenericOp genericOp,
-    const EffectiveTargetGridRange &effectiveTargetGridRange) {
+    const EffectiveTargetGridRange &effectiveTargetGridRange,
+    const llvm::DenseMap<unsigned, const OperandGridInfo *> &edgeSources) {
   GenericGridAnalysisResult result;
   result.effectiveTargetGridRange = effectiveTargetGridRange;
   ArrayRef<int64_t> targetGridShape = result.effectiveTargetGridRange.shape;
@@ -459,8 +460,18 @@ GenericGridAnalysisResult GridAnalysis::analyzeGenericOp(
     llvm::SmallVector<int64_t> physShape =
         utils::computePhysicalShape(operand, targetGrid, ttnnMode);
     physicalShapes.push_back(physShape);
-    auto optimalGrid =
-        utils::computeOptimalGrid(operandType, physShape, targetGrid);
+    llvm::SmallVector<int64_t> optimalGrid;
+    if (auto edge = edgeSources.find(operandIndex); edge != edgeSources.end()) {
+      // A spatial edge reads the producer's buffer as laid out: its grid is
+      // the producer's, never chosen here.
+      optimalGrid =
+          edge->second
+              ? edge->second->selectedGrid
+              : llvm::to_vector(operandLayout.getGridShape(operandType));
+    } else {
+      optimalGrid =
+          utils::computeOptimalGrid(operandType, physShape, targetGrid);
+    }
     optimalOperandGrids.push_back(optimalGrid);
 
     OperandGridInfo info;
@@ -532,9 +543,23 @@ GenericGridAnalysisResult GridAnalysis::analyzeGenericOp(
     }
   }
 
+  // Edge operands must get the producer output's type, padding included.
+  for (auto [operandIndex, source] : edgeSources) {
+    if (source) {
+      result.operandInfos[operandIndex].paddingTileShape =
+          source->paddingTileShape;
+    }
+  }
+
   // Normalize the operand grids for the generic operation.
   result.normalizedOperandGrids = normalizeOperandGridsForGeneric(
       genericOp, optimalOperandGrids, physicalShapes);
+  for (auto [operandIndex, source] : edgeSources) {
+    if (result.normalizedOperandGrids[operandIndex] !=
+        optimalOperandGrids[operandIndex]) {
+      result.mismatchedEdgeOperands.push_back(operandIndex);
+    }
+  }
 
   // Propagate normalized grids back to non-reinterpret ViewLayout operands
   // only. Other operand kinds use their independently computed optimal
@@ -591,9 +616,64 @@ EffectiveTargetGridRange getTargetGridRange(GenericOp genericOp,
   return targetGridRange;
 }
 
+std::optional<std::pair<GenericOp, unsigned>>
+GridAnalysis::getSpatialEdgeProducer(Value operand) {
+  auto arg = mlir::dyn_cast<BlockArgument>(operand);
+  if (!arg) {
+    return std::nullopt;
+  }
+  Region *region = arg.getOwner()->getParent();
+  auto spatialOp = mlir::dyn_cast<SpatialOp>(region->getParentOp());
+  if (!spatialOp) {
+    return std::nullopt;
+  }
+  SpatialEdgeAttr edge =
+      spatialOp.getIncomingEdge(region->getRegionNumber(), arg.getArgNumber());
+  if (!edge) {
+    return std::nullopt;
+  }
+  auto producer = *spatialOp.getRegion(edge.getProducerRegion())
+                       .getOps<GenericOp>()
+                       .begin();
+  return std::make_pair(producer, producer.getOutputs().getBeginOperandIndex() +
+                                      edge.getProducerOutput());
+}
+
+void GridAnalysis::analyzeAfterEdgeProducers(
+    GenericOp genericOp, const llvm::DenseSet<Operation *> &analyzable) {
+  if (results.contains(genericOp.getOperation())) {
+    return;
+  }
+  // Edges form a DAG (SpatialOp verifier), so this recursion terminates.
+  llvm::DenseMap<unsigned, const OperandGridInfo *> edgeSources;
+  for (auto [operandIndex, operand] :
+       llvm::enumerate(genericOp.getInputsAndOutputs())) {
+    auto edge = getSpatialEdgeProducer(operand);
+    if (!edge) {
+      continue;
+    }
+    auto [producer, producerOperandIndex] = *edge;
+    const OperandGridInfo *source = nullptr;
+    if (analyzable.contains(producer.getOperation())) {
+      analyzeAfterEdgeProducers(producer, analyzable);
+      source =
+          &results[producer.getOperation()]->operandInfos[producerOperandIndex];
+    }
+    edgeSources[operandIndex] = source;
+  }
+
+  EffectiveTargetGridRange targetGridRange =
+      d2m::getTargetGridRange(genericOp, deviceGridShape);
+  results[genericOp.getOperation()] =
+      std::make_unique<GenericGridAnalysisResult>(
+          analyzeGenericOp(genericOp, targetGridRange, edgeSources));
+}
+
 GridAnalysis::GridAnalysis(Operation *moduleOp,
                            ArrayRef<int64_t> deviceGridShape, bool ttnnMode)
     : deviceGridShape(deviceGridShape), ttnnMode(ttnnMode) {
+  llvm::SmallVector<GenericOp> generics;
+  llvm::DenseSet<Operation *> analyzable;
   moduleOp->walk([&](GenericOp genericOp) {
     // Skip explicit datamovement form — users manage grids manually.
     if (genericOp.isExplicitDatamovementForm()) {
@@ -602,14 +682,12 @@ GridAnalysis::GridAnalysis(Operation *moduleOp,
     if (genericOp->hasAttr("d2m.skip_grid_selection")) {
       return;
     }
-
-    EffectiveTargetGridRange targetGridRange =
-        d2m::getTargetGridRange(genericOp, deviceGridShape);
-    GenericGridAnalysisResult result =
-        analyzeGenericOp(genericOp, targetGridRange);
-    results[genericOp.getOperation()] =
-        std::make_unique<GenericGridAnalysisResult>(std::move(result));
+    generics.push_back(genericOp);
+    analyzable.insert(genericOp.getOperation());
   });
+  for (GenericOp genericOp : generics) {
+    analyzeAfterEdgeProducers(genericOp, analyzable);
+  }
 }
 
 const GenericGridAnalysisResult *

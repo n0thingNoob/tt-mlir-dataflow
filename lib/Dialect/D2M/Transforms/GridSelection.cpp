@@ -667,6 +667,15 @@ static void applyViewLayoutUpdate(const OperandGridInfo &info, bool ttnnMode,
   viewOp.erase();
 }
 
+// Give a d2m.spatial edge (a consumer region's block argument) the type its
+// producer's output gets: both start from the same type (SpatialOp verifier)
+// and the analysis pins this operand to the producer's grid and padding.
+static void applySpatialEdgeUpdate(const OperandGridInfo &info, bool ttnnMode) {
+  Value arg = info.getLiveOperand();
+  arg.setType(gridAdjustedType(
+      info, mlir::cast<RankedTensorType>(arg.getType()), ttnnMode));
+}
+
 // Recreate the d2m.generic with updated operands.
 // After updating ToLayout and ViewLayout ops, the generic's operands have
 // new types with the selected grids. The generic grid is still anchored by
@@ -722,6 +731,18 @@ static LogicalResult applyGridDecisions(d2m::GenericOp genericOp,
              "Expected 2D effective target grid shape");
   TT_assertv(effectiveTargetGridRange.offset.size() == 2u,
              "Expected 2D effective target grid offset");
+  if (!result.mismatchedEdgeOperands.empty()) {
+    unsigned operandIndex = result.mismatchedEdgeOperands.front();
+    return genericOp.emitOpError()
+           << "operand " << operandIndex
+           << " is a d2m.spatial edge laid out on grid "
+           << ttmlir::utils::formatIterable(
+                  result.operandInfos[operandIndex].selectedGrid, "x")
+           << " by its producer, but this generic needs grid "
+           << ttmlir::utils::formatIterable(
+                  result.normalizedOperandGrids[operandIndex], "x")
+           << "; resharding an edge is not supported";
+  }
   OpBuilder builder(genericOp->getContext());
 
   // Classify operands upfront: once apply* mutates IR, defining ops for
@@ -733,6 +754,7 @@ static LogicalResult applyGridDecisions(d2m::GenericOp genericOp,
     ToLayout,
     Mask,
     Empty,
+    SpatialEdge,
     Skip
   };
   llvm::SmallVector<Kind, 4> kinds;
@@ -742,7 +764,9 @@ static LogicalResult applyGridDecisions(d2m::GenericOp genericOp,
     // may have rewritten this producer (replaceAllUsesWith updated the operand
     // in place); reading it live reflects that. See OperandGridInfo.
     Value operand = info.getLiveOperand();
-    if (GridAnalysis::isTTNNOperand(operand)) {
+    if (GridAnalysis::getSpatialEdgeProducer(operand)) {
+      kinds.push_back(Kind::SpatialEdge);
+    } else if (GridAnalysis::isTTNNOperand(operand)) {
       kinds.push_back(Kind::TTNNTensor);
     } else if (auto view = operand.getDefiningOp<d2m::ViewLayoutOp>()) {
       // Reinterpret views are type casts only; their grid must match the
@@ -781,6 +805,9 @@ static LogicalResult applyGridDecisions(d2m::GenericOp genericOp,
       break;
     case Kind::Empty:
       applyEmptyOpUpdate(info, effectiveTargetGridRange, ttnnMode, builder);
+      break;
+    case Kind::SpatialEdge:
+      applySpatialEdgeUpdate(info, ttnnMode);
       break;
     case Kind::ViewLayout:
     case Kind::Skip:

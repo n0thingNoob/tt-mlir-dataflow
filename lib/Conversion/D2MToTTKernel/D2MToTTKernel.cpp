@@ -3925,9 +3925,6 @@ public:
       rewriter.replaceOpWithNewOp<ttkernel::NocSemaphoreIncOp>(op, nocAddr,
                                                                value, nocId);
     } else {
-      assert(!mlir::isa<d2m::SemaphoreIncOp>(op) &&
-             "d2m.semaphore_inc multicast is illegal.");
-
       auto [virtY, virtX] = getVirtualCoordsFromLogicalCoords(
           rewriter, op.getLoc(), chipDesc, op.getDstCoreIndex());
       // Get the logical multicast end coordinates from the logical start
@@ -3941,10 +3938,14 @@ public:
           op.getLoc(), op.getMcastShape()[0], op.getMcastShape()[1]);
       Value numDests = rewriter.create<arith::IndexCastOp>(
           op.getLoc(), rewriter.getI32Type(), numDestsIdx);
-      Value numDestsMinusOne = rewriter.create<arith::SubIOp>(
-          op.getLoc(), numDests,
-          rewriter.create<arith::ConstantOp>(op.getLoc(), rewriter.getI32Type(),
-                                             rewriter.getI32IntegerAttr(1)));
+      Value numDestsMinusOne;
+      if constexpr (std::is_same_v<ConcreteOp, d2m::SemaphoreSetOp>) {
+        numDestsMinusOne = rewriter.create<arith::SubIOp>(
+            op.getLoc(), numDests,
+            rewriter.create<arith::ConstantOp>(op.getLoc(),
+                                               rewriter.getI32Type(),
+                                               rewriter.getI32IntegerAttr(1)));
+      }
       FailureOr<int32_t> nocIdx = getKernelNocIndex(op.getOperation());
       if (failed(nocIdx)) {
         return rewriter.notifyMatchFailure(
@@ -3958,6 +3959,14 @@ public:
           op.getLoc(), virtX, virtY, virtMcastEndX, virtMcastEndY,
           semaphoreAddr, mcastNocId);
 
+      if constexpr (std::is_same_v<ConcreteOp, d2m::SemaphoreIncOp>) {
+        // The sender must lie outside the destination rectangle (tt-metal has
+        // no loopback variant of the atomic), so every core in it is a
+        // destination.
+        rewriter.replaceOpWithNewOp<ttkernel::NocSemaphoreIncMulticastOp>(
+            op, mcastAddr, value, numDests, mcastNocId, /*posted=*/nullptr);
+        return success();
+      }
       auto semaphorePtr = rewriter.create<ttkernel::CastToL1PtrOp>(
           op.getLoc(), ttkernel::L1AddrPtrType::get(rewriter.getContext(), 32),
           semaphoreAddr);

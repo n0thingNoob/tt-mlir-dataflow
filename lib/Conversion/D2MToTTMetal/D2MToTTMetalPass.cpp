@@ -86,6 +86,11 @@ struct ConvertD2MToTTMetal
     // merges those enqueue_program ops and then erases the spatial wrapper.
 
     ModuleOp moduleOp = getOperation();
+    if (failed(
+            d2m::SpatialOp::checkNoEdges(moduleOp, "convert-d2m-to-ttmetal"))) {
+      signalPassFailure();
+      return;
+    }
 
     if (failed(
             d2m::utils::checkBackendDmCoreSupport(moduleOp, "D2MToTTMetal"))) {

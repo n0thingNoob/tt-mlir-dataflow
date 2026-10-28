@@ -8,6 +8,7 @@
 #include "ttmlir/Asserts.h"
 #include "ttmlir/Dialect/D2M/Analysis/Allocation/Planner.h"
 #include "ttmlir/Dialect/D2M/Analysis/Allocation/Utils.h"
+#include "ttmlir/Dialect/D2M/Utils/Utils.h"
 #include "ttmlir/Dialect/TTCore/IR/TTCore.h"
 #include "ttmlir/Dialect/TTIR/IR/TTIROps.h"
 #include "ttmlir/Utils.h"
@@ -267,6 +268,10 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
 
   MemorySpaces memSpaces;
   ttcore::MemorySpaceAttr L1Attr = nullptr;
+  // Buffers carried by d2m.spatial edges (producer generic outputs). The
+  // producer writes them with an explicit store and the consumer reads them
+  // remotely, so they are never aliased and always stay in L1.
+  llvm::DenseSet<Value> spatialEdgeBuffers;
   ttcore::MemorySpaceAttr DRAMAttr = nullptr;
 
   [[maybe_unused]] friend std::string to_string(const D2MAllocate &obj) {
@@ -296,6 +301,16 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
     // Set some instance state:
 
     ModuleOp moduleOp = getOperation();
+
+    moduleOp.walk([&](d2m::SpatialOp spatialOp) {
+      if (!spatialOp.hasEdges()) {
+        return;
+      }
+      for (auto edge :
+           spatialOp.getEdgesAttr().getAsRange<d2m::SpatialEdgeAttr>()) {
+        spatialEdgeBuffers.insert(spatialOp.getEdgeSource(edge));
+      }
+    });
 
     memSpaces = [this, moduleOp]() {
       ttcore::SystemDescAttr systemDesc =
@@ -928,6 +943,19 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
       }
     }
 
+    // Spatial edge buffers stay in L1 on the producer cores for the whole
+    // spatial: never spill them, even as intermediate generic outputs.
+    for (Value edgeBuffer : spatialEdgeBuffers) {
+      auto allocOp = edgeBuffer.getDefiningOp<memref::AllocOp>();
+      if (!allocOp || allocOp->getParentOfType<func::FuncOp>() != funcOp) {
+        continue;
+      }
+      if (ttcore::getMemorySpace(allocOp.getType()) != MemorySpace::DeviceL1) {
+        return allocOp.emitOpError("d2m.spatial edge buffer must be in L1");
+      }
+      analysis.memrefs[allocOp.getResult()].isMemspaceBound = true;
+    }
+
     if (TT_DEBUG_ENABLED()) {
       for ([[maybe_unused]] auto &[value, valueCtx] : analysis.memrefs) {
         TT_ALLOC_TRACE("\t{}:\t[{}, "
@@ -1440,6 +1468,13 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
   ///    are not broadcast or reduction.
   /// This is a common function shared by isAliasedLoad and isAliasedStore.
   bool canAliasOperand(d2m::GenericOp genericOp, Value genericOperand) const {
+    if (spatialEdgeBuffers.contains(genericOperand)) {
+      return false;
+    }
+    if (!isPlacedOnGenericCores(genericOp, genericOperand)) {
+      return false;
+    }
+
     // Check if operand requires aliasing
     bool isOutput = llvm::find_if(genericOp.getOutputs(), [&](Value operand) {
                       return operand == genericOperand;
@@ -1491,6 +1526,45 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
     return true;
   }
 
+  // Whether the operand's shards live on the generic's own cores. Equal
+  // shapes do not imply that: a generic inside a d2m.spatial region may run on
+  // a core range other than the one its operand was allocated on (for example
+  // the consumer of a spatial edge), and then it must read the operand with a
+  // DMA instead of aliasing local L1. Compares the generic grid's
+  // virtual-to-physical map with the operand's virtual grid mapping (identity
+  // at the origin when either is absent).
+  static bool isPlacedOnGenericCores(d2m::GenericOp genericOp,
+                                     Value genericOperand) {
+    AffineMap genericMap = genericOp.getGrid().getVirtToPhysicalMap();
+    std::optional<AffineMap> operandMapping =
+        utils::getVirtualGridForwardMapping(genericOperand);
+    if (genericMap.isEmpty() && !operandMapping) {
+      return true;
+    }
+    ArrayRef<int64_t> gridShape = genericOp.getGrid().getShape();
+    if (gridShape.size() != 2) {
+      return false;
+    }
+    MLIRContext *ctx = genericOp.getContext();
+    AffineMap identity = AffineMap::getMultiDimIdentityMap(2, ctx).insertResult(
+        getAffineConstantExpr(0, ctx), 0);
+    AffineMap operandMap = identity;
+    if (operandMapping) {
+      auto operandMaps =
+          utils::getGridMapsFromVirtualGridMapping(genericOperand, gridShape);
+      if (!operandMaps) {
+        return false;
+      }
+      operandMap = operandMaps->first;
+    }
+    if (genericMap.isEmpty()) {
+      genericMap = identity;
+    } else if (genericMap.getNumResults() == 2) {
+      genericMap = genericMap.insertResult(getAffineConstantExpr(0, ctx), 0);
+    }
+    return simplifyAffineMap(genericMap) == simplifyAffineMap(operandMap);
+  }
+
   bool isAliasedLoad(RemoteLoadOp loadOp) {
     return canAliasOperand(loadOp->getParentOfType<d2m::GenericOp>(),
                            loadOp.getMemref()) &&
@@ -1498,9 +1572,12 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
   }
 
   bool isAliasedStore(RemoteStoreOp storeOp) {
+    // A store that increments a semaphore must stay a real store: an aliased
+    // store has no DMA to complete before the increment, and its marker is
+    // erased by d2m-insert-compute-cb.
     return canAliasOperand(storeOp->getParentOfType<d2m::GenericOp>(),
                            storeOp.getMemref()) &&
-           storeOp.getStartDevice().empty();
+           storeOp.getStartDevice().empty() && !storeOp.getSemaphore();
   }
 
   static void assignAddressAndAlignment(RewriterBase &rewriter,

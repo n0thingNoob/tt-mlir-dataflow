@@ -94,8 +94,7 @@ std::vector<std::uint32_t> processKernelArgs(
           "Local semaphore id referenced by kernel args is no longer alive "
           "or was never created ",
           logger::Buffer(local_sem_ref->global_id()));
-      argsVec.push_back(createSemaphoreFn(
-          localSemaphoresCache.at(local_sem_ref->global_id())));
+      argsVec.push_back(createSemaphoreFn(local_sem_ref->global_id()));
       break;
     }
     case target::metal::KernelArgType::KernelArgNamedArgument: {

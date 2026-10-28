@@ -10,9 +10,11 @@
 #include "ttmlir/Dialect/TTIR/IR/TTIROps.h"
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 
 #include <memory>
+#include <optional>
 
 namespace mlir::tt::d2m {
 
@@ -93,6 +95,9 @@ struct GenericGridAnalysisResult {
   // The effective target grid range for this generic: full device grid by
   // default, or the range scoped by an enclosing d2m.spatial region.
   EffectiveTargetGridRange effectiveTargetGridRange;
+  // Operands that are d2m.spatial edges (consumer region block arguments)
+  // whose normalized grid differs from the grid pinned by the producer.
+  llvm::SmallVector<unsigned> mismatchedEdgeOperands;
 };
 
 /// Determines where on the device grid a generic op is allowed to place its
@@ -121,11 +126,26 @@ struct GridAnalysis {
   /// ViewLayoutOp chains.
   static bool isTTNNOperand(Value operand);
 
+  /// If `operand` is a d2m.spatial edge (a consumer region's block argument),
+  /// return the producer region's generic and the operand index of the
+  /// producer output that feeds it.
+  static std::optional<std::pair<GenericOp, unsigned>>
+  getSpatialEdgeProducer(Value operand);
+
 private:
+  /// Analyze `genericOp` after the producers of its d2m.spatial edge operands,
+  /// whose selected output grids pin the grids of those operands.
+  void analyzeAfterEdgeProducers(GenericOp genericOp,
+                                 const llvm::DenseSet<Operation *> &analyzable);
+
   /// Analyze a single GenericOp and compute grid decisions for all operands.
-  GenericGridAnalysisResult
-  analyzeGenericOp(GenericOp genericOp,
-                   const EffectiveTargetGridRange &effectiveTargetGridRange);
+  /// Operands in `edgeSources` take the grid (and padding) of the given
+  /// producer output instead of their own optimal grid; a null source keeps
+  /// the operand's current grid.
+  GenericGridAnalysisResult analyzeGenericOp(
+      GenericOp genericOp,
+      const EffectiveTargetGridRange &effectiveTargetGridRange,
+      const llvm::DenseMap<unsigned, const OperandGridInfo *> &edgeSources);
 
   /// Normalize operand grids within a generic to ensure consistency across
   /// operands sharing loop dimensions. Physical shapes are required to ensure
