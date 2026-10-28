@@ -158,6 +158,55 @@ func.func @edge_consumer_region_first() {
 
 // -----
 
+// One 2x2 producer output feeds two 2x2 consumers: both follow its grid.
+#layout = #ttcore.metal_layout<logical_shape = 64x64, dim_alignments = 32x32, collapsed_intervals = dense<[[0, 1], [1, 2]]> : tensor<2x2xi64>, l1, sharded>
+#id2 = affine_map<(d0, d1) -> (d0, d1)>
+#parallel = #ttcore.iterator_type<parallel>
+// CHECK-LABEL: func.func @edge_fan_out
+func.func @edge_fan_out() {
+  %o0 = d2m.empty() : tensor<1x1x2x2x!ttcore.tile<32x32, f32>, #layout>
+  %o1 = d2m.empty() : tensor<1x1x2x2x!ttcore.tile<32x32, f32>, #layout>
+  %o2 = d2m.empty() : tensor<1x1x2x2x!ttcore.tile<32x32, f32>, #layout>
+  // CHECK: d2m.spatial {edges = [#d2m.spatial_edge<0:0 -> 1:0>, #d2m.spatial_edge<0:0 -> 2:0>]
+  // CHECK: d2m.generic {block_factors = [1, 1], grid = #ttcore.grid<2x2>,
+  // CHECK: ^bb0(%[[A1:.*]]: tensor<2x2x1x1x!ttcore.tile<32x32, f32>, #layout>):
+  // CHECK-NEXT: d2m.generic {block_factors = [1, 1], grid = #ttcore.grid<2x2, virt_to_physical_map = (d0, d1) -> (0, d0, d1 + 3), physical_to_virt_map = (d0, d1) -> (0, d0, d1 - 3)>,
+  // CHECK-NEXT: ins(%[[A1]] : tensor<2x2x1x1x!ttcore.tile<32x32, f32>, #layout>)
+  // CHECK: ^bb0(%[[A2:.*]]: tensor<2x2x1x1x!ttcore.tile<32x32, f32>, #layout>):
+  // CHECK-NEXT: d2m.generic {block_factors = [1, 1], grid = #ttcore.grid<2x2, virt_to_physical_map = (d0, d1) -> (0, d0 + 3, d1), physical_to_virt_map = (d0, d1) -> (0, d0 - 3, d1)>,
+  // CHECK-NEXT: ins(%[[A2]] : tensor<2x2x1x1x!ttcore.tile<32x32, f32>, #layout>)
+  // CHECK: } : tensor<2x2x1x1x!ttcore.tile<32x32, f32>, #layout>, tensor<2x2x1x1x!ttcore.tile<32x32, f32>, #layout>, tensor<2x2x1x1x!ttcore.tile<32x32, f32>, #layout>
+  %r:3 = d2m.spatial {edges = [#d2m.spatial_edge<0:0 -> 1:0>, #d2m.spatial_edge<0:0 -> 2:0>], grid_ranges = [#ttcore.core_range<(0, 0), (1, 1)>, #ttcore.core_range<(0, 3), (1, 4)>, #ttcore.core_range<(3, 0), (4, 1)>]}
+      ins() outs(%o0, %o1, %o2 : tensor<1x1x2x2x!ttcore.tile<32x32, f32>, #layout>, tensor<1x1x2x2x!ttcore.tile<32x32, f32>, #layout>, tensor<1x1x2x2x!ttcore.tile<32x32, f32>, #layout>) {
+      ^region0:
+        %g = d2m.generic {block_factors = [1, 1], grid = #ttcore.grid<1x1>, indexing_maps = [#id2], iterator_types = [#parallel, #parallel], threads = [#d2m.thread<unified>]}
+            ins() outs(%o0 : tensor<1x1x2x2x!ttcore.tile<32x32, f32>, #layout>) {
+          %b = tensor.empty() : tensor<2x2x!ttcore.tile<32x32, f32>>
+          d2m.yield %b : (tensor<2x2x!ttcore.tile<32x32, f32>>)
+        } : tensor<1x1x2x2x!ttcore.tile<32x32, f32>, #layout>
+        d2m.spatial_yield %g : (tensor<1x1x2x2x!ttcore.tile<32x32, f32>, #layout>)
+    }, {
+      ^region1(%a0: tensor<1x1x2x2x!ttcore.tile<32x32, f32>, #layout>):
+        %g = d2m.generic {block_factors = [1, 1], grid = #ttcore.grid<1x1>, indexing_maps = [#id2, #id2], iterator_types = [#parallel, #parallel], threads = [#d2m.thread<unified>]}
+            ins(%a0 : tensor<1x1x2x2x!ttcore.tile<32x32, f32>, #layout>) outs(%o1 : tensor<1x1x2x2x!ttcore.tile<32x32, f32>, #layout>) {
+          %b = tensor.empty() : tensor<2x2x!ttcore.tile<32x32, f32>>
+          d2m.yield %b : (tensor<2x2x!ttcore.tile<32x32, f32>>)
+        } : tensor<1x1x2x2x!ttcore.tile<32x32, f32>, #layout>
+        d2m.spatial_yield %g : (tensor<1x1x2x2x!ttcore.tile<32x32, f32>, #layout>)
+    }, {
+      ^region2(%a0: tensor<1x1x2x2x!ttcore.tile<32x32, f32>, #layout>):
+        %g = d2m.generic {block_factors = [1, 1], grid = #ttcore.grid<1x1>, indexing_maps = [#id2, #id2], iterator_types = [#parallel, #parallel], threads = [#d2m.thread<unified>]}
+            ins(%a0 : tensor<1x1x2x2x!ttcore.tile<32x32, f32>, #layout>) outs(%o2 : tensor<1x1x2x2x!ttcore.tile<32x32, f32>, #layout>) {
+          %b = tensor.empty() : tensor<2x2x!ttcore.tile<32x32, f32>>
+          d2m.yield %b : (tensor<2x2x!ttcore.tile<32x32, f32>>)
+        } : tensor<1x1x2x2x!ttcore.tile<32x32, f32>, #layout>
+        d2m.spatial_yield %g : (tensor<1x1x2x2x!ttcore.tile<32x32, f32>, #layout>)
+  } : tensor<1x1x2x2x!ttcore.tile<32x32, f32>, #layout>, tensor<1x1x2x2x!ttcore.tile<32x32, f32>, #layout>, tensor<1x1x2x2x!ttcore.tile<32x32, f32>, #layout>
+  return
+}
+
+// -----
+
 // Matmul consumer: A (0,0)-(1,1) writes the 64x128 edge on its 2x2 grid; the
 // matmul in B (0,4)-(1,7) has a 2x4 grid (its 64x128 output) and reads the edge
 // as its MxK operand on that same 2x2 grid.

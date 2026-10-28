@@ -2349,7 +2349,8 @@ static mlir::LogicalResult verifySpatialEdges(d2m::SpatialOp op) {
     edges =
         llvm::to_vector(op.getEdgesAttr().getAsRange<d2m::SpatialEdgeAttr>());
   }
-  llvm::DenseSet<std::pair<unsigned, unsigned>> seenSources, seenSinks;
+  llvm::DenseSet<std::pair<unsigned, unsigned>> seenSinks;
+  llvm::DenseSet<std::tuple<unsigned, unsigned, unsigned>> seenSources;
   llvm::SmallVector<llvm::SmallVector<unsigned>> successors(numRegions);
   llvm::SmallVector<unsigned> inDegree(numRegions, 0);
   for (d2m::SpatialEdgeAttr edge : edges) {
@@ -2380,11 +2381,12 @@ static mlir::LogicalResult verifySpatialEdges(d2m::SpatialOp op) {
       return op.emitOpError("block argument ")
              << j << " of region " << c << " has more than one incoming edge";
     }
-    if (!seenSources.insert({p, i}).second) {
+    // One output may feed several regions, but a region reads it through one
+    // block argument.
+    if (!seenSources.insert({p, i, c}).second) {
       return op.emitOpError("output ")
-             << i << " of region " << p
-             << " feeds more than one edge; only one-to-one edges are "
-                "supported";
+             << i << " of region " << p << " feeds region " << c
+             << " more than once; reuse one block argument";
     }
     Value edgeBuffer = producer.getOutputs()[i];
     if (!llvm::is_contained(op.getOutputs(), edgeBuffer)) {

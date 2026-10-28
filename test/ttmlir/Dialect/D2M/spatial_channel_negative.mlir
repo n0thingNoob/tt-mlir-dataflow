@@ -247,15 +247,14 @@ func.func @r4_two_edges_into_one_argument(%in: tensor<1x1x1x1x!ttcore.tile<32x32
 #map = affine_map<(d0, d1) -> (d0, d1)>
 #parallel = #ttcore.iterator_type<parallel>
 
-// R4b fan-out from one output
-func.func @r4b_fan_out_from_one_output(%in: tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>) {
+// R4b: one output may feed several regions, but not one region twice
+func.func @r4b_one_output_twice_into_one_region(%in: tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>) {
   %e0 = d2m.empty() : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>
   %e1 = d2m.empty() : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>
-  %e2 = d2m.empty() : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>
-  // expected-error @+1 {{output 0 of region 0 feeds more than one edge; only one-to-one edges are supported}}
-  %r:3 = d2m.spatial {edges = [#d2m.spatial_edge<0:0 -> 1:0>, #d2m.spatial_edge<0:0 -> 2:0>], grid_ranges = [#ttcore.core_range<(0, 0), (0, 0)>, #ttcore.core_range<(0, 1), (0, 1)>, #ttcore.core_range<(0, 2), (0, 2)>]}
+  // expected-error @+1 {{output 0 of region 0 feeds region 1 more than once; reuse one block argument}}
+  %r:2 = d2m.spatial {edges = [#d2m.spatial_edge<0:0 -> 1:0>, #d2m.spatial_edge<0:0 -> 1:1>], grid_ranges = [#ttcore.core_range<(0, 0), (0, 0)>, #ttcore.core_range<(0, 1), (0, 1)>]}
       ins(%in : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>)
-      outs(%e0, %e1, %e2 : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>, tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>, tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>) {
+      outs(%e0, %e1 : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>, tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>) {
         %g0 = d2m.generic {block_factors = [1, 1], grid = #ttcore.grid<1x1>, indexing_maps = [#map, #map], iterator_types = [#parallel, #parallel], threads = [#d2m.thread<unified>]}
             ins(%in : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>)
             outs(%e0 : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>) {
@@ -264,24 +263,15 @@ func.func @r4b_fan_out_from_one_output(%in: tensor<1x1x1x1x!ttcore.tile<32x32, b
         } : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>
         d2m.spatial_yield %g0 : (tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>)
     }, {
-      ^bb0(%x: tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>):
-        %g1 = d2m.generic {block_factors = [1, 1], grid = #ttcore.grid<1x1>, indexing_maps = [#map, #map], iterator_types = [#parallel, #parallel], threads = [#d2m.thread<unified>]}
-            ins(%x : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>)
+      ^bb0(%x: tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>, %y: tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>):
+        %g1 = d2m.generic {block_factors = [1, 1], grid = #ttcore.grid<1x1>, indexing_maps = [#map, #map, #map], iterator_types = [#parallel, #parallel], threads = [#d2m.thread<unified>]}
+            ins(%x, %y : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>, tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>)
             outs(%e1 : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>) {
           %t0 = tensor.empty() : tensor<1x1x!ttcore.tile<32x32, bf16>>
           d2m.yield %t0 : (tensor<1x1x!ttcore.tile<32x32, bf16>>)
         } : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>
         d2m.spatial_yield %g1 : (tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>)
-    }, {
-      ^bb0(%z: tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>):
-        %g2 = d2m.generic {block_factors = [1, 1], grid = #ttcore.grid<1x1>, indexing_maps = [#map, #map], iterator_types = [#parallel, #parallel], threads = [#d2m.thread<unified>]}
-            ins(%z : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>)
-            outs(%e2 : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>) {
-          %t0 = tensor.empty() : tensor<1x1x!ttcore.tile<32x32, bf16>>
-          d2m.yield %t0 : (tensor<1x1x!ttcore.tile<32x32, bf16>>)
-        } : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>
-        d2m.spatial_yield %g2 : (tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>)
-    } : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>, tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>, tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>
+    } : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>, tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>
   return
 }
 

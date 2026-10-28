@@ -153,3 +153,71 @@ module {
     return %r#3 : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>
   }
 }
+
+// -----
+
+#l1 = #ttcore.metal_layout<logical_shape = 32x32, dim_alignments = 32x32, collapsed_intervals = dense<[[0, 1], [1, 2]]> : tensor<2x2xi64>, l1, sharded>
+#map = affine_map<(d0, d1) -> (d0, d1)>
+#parallel = #ttcore.iterator_type<parallel>
+
+// The same diamond with a single-output A: A:0 feeds both B and C (fan-out).
+// Bufferization hands both consumers A's one buffer.
+// CHECK-LABEL: func.func @diamond_fan_out
+// CHECK: d2m.spatial {edges = [#d2m.spatial_edge<0:0 -> 1:0>, #d2m.spatial_edge<0:0 -> 2:0>, #d2m.spatial_edge<1:0 -> 2:1>]
+// CHECK: ^bb0(%[[X:.*]]: tensor
+// CHECK-NEXT: d2m.generic
+// CHECK-NEXT: ins(%[[X]] :
+// CHECK: ^bb0(%[[Y:.*]]: tensor<{{.*}}>, %[[Z:.*]]: tensor<{{.*}}>):
+// CHECK-NEXT: d2m.generic
+// CHECK-NEXT: ins(%[[Y]], %[[Z]] :
+// GS-LABEL: func.func @diamond_fan_out
+// GS: d2m.spatial {edges = [#d2m.spatial_edge<0:0 -> 1:0>, #d2m.spatial_edge<0:0 -> 2:0>, #d2m.spatial_edge<1:0 -> 2:1>]
+// BUF-LABEL: func.func @diamond_fan_out
+// BUF: %[[A0:.*]] = memref.alloc()
+// BUF: %[[B0:.*]] = memref.alloc()
+// BUF: %[[C0:.*]] = memref.alloc()
+// BUF: d2m.spatial {edges = [#d2m.spatial_edge<0:0 -> 1:0>, #d2m.spatial_edge<0:0 -> 2:0>, #d2m.spatial_edge<1:0 -> 2:1>]
+// BUF: outs(%[[A0]] :
+// BUF: ins(%[[A0]] :
+// BUF-NEXT: outs(%[[B0]] :
+// BUF: ins(%[[A0]], %[[B0]] :
+// BUF-NEXT: outs(%[[C0]] :
+module {
+  func.func @diamond_fan_out(%in: tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>) -> tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1> {
+    %a0 = d2m.empty() : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>
+    %b0 = d2m.empty() : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>
+    %c0 = d2m.empty() : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>
+    %r:3 = d2m.spatial {edges = [#d2m.spatial_edge<0:0 -> 1:0>, #d2m.spatial_edge<0:0 -> 2:0>, #d2m.spatial_edge<1:0 -> 2:1>],
+                        grid_ranges = [#ttcore.core_range<(0, 0), (0, 0)>, #ttcore.core_range<(0, 1), (0, 1)>, #ttcore.core_range<(0, 2), (0, 2)>]}
+        ins(%in : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>)
+        outs(%a0, %b0, %c0 : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>, tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>, tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>) {
+      ^A:
+        %ga = d2m.generic {block_factors = [1, 1], grid = #ttcore.grid<1x1>, indexing_maps = [#map, #map], iterator_types = [#parallel, #parallel], threads = [#d2m.thread<unified>]}
+            ins(%in : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>)
+            outs(%a0 : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>) {
+          %t = tensor.empty() : tensor<1x1x!ttcore.tile<32x32, bf16>>
+          d2m.yield %t : (tensor<1x1x!ttcore.tile<32x32, bf16>>)
+        } : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>
+        d2m.spatial_yield %ga : (tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>)
+    }, {
+      ^B(%x: tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>):
+        %gb = d2m.generic {block_factors = [1, 1], grid = #ttcore.grid<1x1>, indexing_maps = [#map, #map], iterator_types = [#parallel, #parallel], threads = [#d2m.thread<unified>]}
+            ins(%x : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>)
+            outs(%b0 : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>) {
+          %t = tensor.empty() : tensor<1x1x!ttcore.tile<32x32, bf16>>
+          d2m.yield %t : (tensor<1x1x!ttcore.tile<32x32, bf16>>)
+        } : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>
+        d2m.spatial_yield %gb : (tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>)
+    }, {
+      ^C(%y: tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>, %z: tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>):
+        %gc = d2m.generic {block_factors = [1, 1], grid = #ttcore.grid<1x1>, indexing_maps = [#map, #map, #map], iterator_types = [#parallel, #parallel], threads = [#d2m.thread<unified>]}
+            ins(%y, %z : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>, tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>)
+            outs(%c0 : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>) {
+          %t = tensor.empty() : tensor<1x1x!ttcore.tile<32x32, bf16>>
+          d2m.yield %t : (tensor<1x1x!ttcore.tile<32x32, bf16>>)
+        } : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>
+        d2m.spatial_yield %gc : (tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>)
+    } : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>, tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>, tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>
+    return %r#2 : tensor<1x1x1x1x!ttcore.tile<32x32, bf16>, #l1>
+  }
+}
