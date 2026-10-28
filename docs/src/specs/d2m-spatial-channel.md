@@ -1,8 +1,8 @@
 # D2M Spatial Channels: Data Edges Between `d2m.spatial` Regions
 
-Status: PR1 (IR representation), PR2a (synchronization and TTMetal lowering)
-and PR2b (multi-core regions: GridSelection lays out both ends of an edge
-alike) implemented.
+Status: PR1 (IR representation), PR2a (synchronization and TTMetal lowering),
+PR2b (multi-core regions: GridSelection lays out both ends of an edge alike)
+and edge fan-out with multicast signalling implemented.
 
 ## 1. Problem and scope
 
@@ -48,7 +48,7 @@ says which producer result feeds it.
 | In scope | Out of scope (later) |
 |---|---|
 | Whole-tensor handoff: the consumer reads only after the producer has written the entire tensor | Tile-level pipelining (credits, depth, ring buffers) |
-| One-to-one edges: one producer result feeds at most one consumer argument | Fan-out / multicast (1 → N) |
+| Fan-out: one producer result may feed several consumer regions (one block argument each); the producer signals each consumer region with one multicast increment | Pushing data to the consumers (multicast writes) and resharding on an edge |
 | Edges written by hand or by a frontend | Automatic mapping (deciding which ops go in which region) |
 | Representation, verification, normalization and bufferization (PR1) | Semaphores and lowering (PR2a), multi-core layout matching (PR2b) |
 
@@ -111,8 +111,19 @@ Region 0 computes `exp(in)` into `%e`, and region 1 reads `%e` and computes
 
 ### 2.3 Three-region diamond
 
-Region A writes two tensors. One goes to B. The other goes directly to C, which
-also reads B's result. The edges stay one-to-one because A has two outputs.
+Region A's result goes to B and directly to C, which also reads B's result.
+With fan-out (§4), A has a single output that feeds two edges:
+
+```mlir
+edges = [#d2m.spatial_edge<0:0 -> 1:0>,   // A -> B
+         #d2m.spatial_edge<0:0 -> 2:0>,   // A -> C (same output)
+         #d2m.spatial_edge<1:0 -> 2:1>]   // B -> C
+```
+
+This form lowers and runs on n150 (§6). The form below, where A writes two
+tensors so that every output feeds one edge, is also valid IR, but D2M does
+not lower a generic with two computed outputs yet, so it is covered at the IR
+level only.
 
 ```mlir
 %a0 = d2m.empty() : !T   // A -> B
@@ -282,10 +293,12 @@ semaphore / DMA ops inside the generics by then.
 For an edge `P:I -> C:J`, let the producer generic use `Np` cores and `Wp` DM
 threads that write the edge buffer.
 
-- **Semaphore.** One local (program) semaphore per edge, initial value 0: a
-  `d2m.create_local_semaphore` created before the spatial and appended to both
-  generics' `additionalArgs` (accessed in the threads through `d2m.get_arg`
-  after `d2m-normalize-thread-args`).
+- **Semaphore.** One local (program) semaphore per producer output, initial
+  value 0, shared by all edges that leave it: a `d2m.create_local_semaphore`
+  created before the spatial and appended to the producer's and every
+  consumer's `additionalArgs` (accessed in the threads through `d2m.get_arg`
+  after `d2m-normalize-thread-args`). One per output rather than per edge keeps
+  the producer cores' semaphore count independent of the fan-out.
   - Local rather than global: tt-metal writes a program's semaphore initial
     values on every launch, so every enqueue starts at 0 without an explicit
     reset. Checked on n150: 5 submits of the same program in one process all
@@ -298,16 +311,26 @@ threads that write the edge buffer.
     over the union of the cores of all kernels that reference it. Without this
     change a 3-region join (two semaphores on one consumer core) hangs on n150.
 - **Producer.** Every producer DM thread that DMA-writes the edge buffer
-  increments the semaphore of every consumer core by 1 after its last op.
+  increments the semaphore of every consumer core (of every consumer region)
+  by 1 after its last op.
   - Allocate never aliases an edge buffer, so the producer always computes into
     a stream buffer and stores it with an explicit DMA write; every such write
     has its `dma_wait` before the end of the thread (the pass checks this).
-  - Unicast only (`d2m.semaphore_inc` has no multicast form), `Nc` increments
-    per writing thread.
+  - When a consumer region's cores fill their bounding box (more than one
+    core), one multicast `d2m.semaphore_inc ... mcast[h, w]` per writing thread
+    covers the box; otherwise one unicast increment per consumer core. The
+    multicast lowers to tt-metal `noc_semaphore_inc_multicast` with
+    `num_dests = h * w`: the NoC atomic has no loopback variant, so the sender
+    is outside the box and every core in it is a destination (the multicast
+    `semaphore_set` and DMA write lowerings use `h * w - 1` because their
+    sender is inside). The pass reports a producer core inside a consumer's
+    box as an error; `d2m.spatial` documents disjoint ranges but its verifier
+    does not check them (§8).
   - `semaphore_inc` core indices are virtual coordinates of the enclosing
     generic (`d2m-generic-regions-to-funcs` maps them through the generic's
-    `virt_to_physical_map`). The pass therefore maps each consumer core's
-    logical coordinates through the producer grid's `physical_to_virt_map`.
+    `virt_to_physical_map`; a multicast keeps its shape). The pass therefore
+    maps each consumer core's (or the box corner's) logical coordinates
+    through the producer grid's `physical_to_virt_map`.
 - **Consumer.** Every consumer DM thread that reads the edge buffer first waits
   until the semaphore equals `Np * Wp`, then reads the producer cores' L1 with
   the existing DMA (the edge memref's layout / VGM gives the producer cores).
@@ -337,7 +360,7 @@ arguments.
 | R3b | `I` < number of producer generic outputs | always | `0:3 -> 1:0` |
 | R3c | `J` < number of consumer block arguments | tensor form | `0:0 -> 1:2` |
 | R4 | Every consumer block argument has exactly one incoming edge (no missing, no duplicate) | tensor form for "missing"; always for "duplicate" | arg without edge; two edges into `1:0` |
-| R4b | One-to-one: a producer output feeds at most one edge (v1) | always | `0:0 -> 1:0` and `0:0 -> 2:0` |
+| R4b | A producer output feeds a given consumer region at most once (it may feed several regions) | always | `0:0 -> 1:0` and `0:0 -> 1:1` |
 | R5 | Block argument type == producer generic output `I` type (shape, element type, layout) | tensor form | layout / shape mismatch |
 | R6 | The consumer reads the edge on the grid the producer writes it on: the shard grid of the block argument's type equals that of the producer output `I`. The two generics' own grids may differ (see note). | tensor form | producer writes on 1x1, consumer reads on 2x2 |
 | R7 | Producer output `I` is one of the spatial's `outs` (the edge buffer is a spatial `outs`) | always | producer writes a value not in `outs` |
@@ -363,8 +386,9 @@ Negative tests use `--verify-diagnostics`, one `// -----` case per rule (15 case
 
 Positive tests (`spatial_channel.mlir`):
 
-- Round-trip of the 2-region chain and the 3-region diamond (parse, verify,
-  print, re-parse).
+- Round-trip of the 2-region chain and the 3-region diamond in both forms
+  (two-output A, and single-output A with fan-out), parse, verify, print,
+  re-parse; the fan-out diamond bufferizes to one buffer read by B and C.
 - `--d2m-grid-selection` keeps `edges` and the block arguments and does not
   put block arguments into `ins`.
 - One-Shot Bufferize: consumer generics read the producer's memref, the
@@ -395,10 +419,11 @@ does nothing so that D2MToTTNN still rejects them.
 - Validation on n150, hand-written MLIR, 1x1 regions: chain (0,0)->(1,1), pair
   (1,0)->(1,1), join (0,0),(0,1)->(1,1), chain3 (0,0)->(0,1)->(1,1). Every
   output PCC >= 0.9999 vs torch, 5 submits per process, 2 seeds.
-- A diamond needs a producer generic with two outputs. Upstream D2M does not
-  lower multi-output compute in one generic yet (a GenericOp
-  canonicalization asserts, and DST register access fails), so the diamond is
-  covered at the IR level only (PR1 tests).
+- With one-to-one edges a diamond needed a producer generic with two
+  outputs. Upstream D2M does not lower multi-output compute in one generic yet
+  (a GenericOp canonicalization asserts, and DST register access fails), so
+  the diamond stayed at the IR level until fan-out (below) made a
+  single-output form possible.
 
 **PR2b (multi-core regions): done.**
 
@@ -425,6 +450,27 @@ does nothing so that D2MToTTNN still rejects them.
   `ttmlir-opt -o x.mlir` followed by `ttmlir-translate x.mlir` fails. A plain
   `ttir.matmul` 64x128 @ 128x128 hits it on `main` too. Writing bytecode
   (`--emit-bytecode`) avoids the textual round trip.
+
+**Edge multicast and fan-out: done.**
+
+- `d2m.semaphore_inc` with `mcast` lowers to `noc_semaphore_inc_multicast`
+  (it asserted before); `d2m-lower-spatial-edges` signals each consumer box
+  with one multicast increment (§4).
+- Fan-out: R4b is now "(producer, output, consumer) unique"; the pass gives
+  each producer output one semaphore. Bufferization, GridSelection and
+  Allocate needed no change (lit: the fan-out diamond, two consumers
+  following a 2x2 producer, a fan-out grid mismatch, the lowering of a 2x2
+  multicast plus a 1x1 unicast consumer).
+- Validation on n150, pre-selection input, every output PCC >= 0.9999 vs
+  torch, 5 submits per process, 2 seeds:
+  - fan-out: `tanh` 2x2 (0,0) -> `exp` 2x2 (0,3) and `tanh` 2x2 (3,0);
+  - the single-output diamond: A (0,0) -> B (0,3), A and B -> C (3,0) `add`
+    (first diamond run on silicon);
+  - fan-out into an elementwise 2x2 consumer and a 2x4 matmul consumer;
+  - the PR2a and PR2b graphs, now with multicast signals (`num_dests` 4 for
+    2x2 and 1x4 consumers, 8 for the 2x4 matmul; writers on NoC 0 and NoC 1).
+- An edge whose consumer is a single row or column multicasts along it and
+  hits the emitc text round-trip bug below; compile with `--emit-bytecode`.
 
 **Known upstream bugs** (all four were present on `main` `f688ee694`):
 
@@ -459,8 +505,9 @@ work. Not investigated further; the PR2a validation avoids (2,2).
 
 - 32 CBs per core. The merged program concatenates every region's CBs, which
   `SpatialOpRewriter` already checks against `num_cbs`.
-- 16 local semaphores per core per program. This caps the edges into one
-  consumer range, together with the semaphores that multicast loads use.
+- 16 local semaphores per core per program. This caps the producer outputs
+  read by one consumer range (one semaphore per output, whatever the fan-out),
+  together with the semaphores that multicast loads use.
 - Two RISCs on the same core must not write on the same NoC at the same time.
 - At most one multicast load per DM thread.
 - Multi-source linked multicast times out: issue a write barrier before
@@ -469,8 +516,9 @@ work. Not investigated further; the PR2a validation avoids (2,2).
 ## 8. Open questions for review
 
 1. The verifier on `main` does not check that `grid_ranges` are disjoint (the
-   op description says they must be). PR1 leaves this alone. A separate small
-   commit could add it.
+   op description says they must be). PR1 leaves this alone; since the
+   multicast signal, `d2m-lower-spatial-edges` rejects a producer core inside
+   a consumer's range. A separate small commit could add the general check.
 2. Edge index `I` refers to the producer generic's DPS output `I` in both
    forms. The alternative, a flat `outs` index, would need remapping whenever
    normalization rebuilds `outs`, so it was rejected.
