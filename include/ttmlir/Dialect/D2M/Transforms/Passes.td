@@ -10,7 +10,7 @@ include "mlir/Pass/PassBase.td"
 def D2MSpatialPlanning : Pass<"d2m-spatial-planning", "::mlir::ModuleOp"> {
   let summary = "Plan inter-generic spatial execution (framework only).";
   let description = [{
-    Runs immediately after TTIRToD2M, before per-generic optimization. Builds
+    Runs after MaterializeViewReturns, right before GridSelection. Builds
     a block-local SSA dependency DAG of top-level tensor d2m.generic ops,
     following dependencies through intervening operations such as views.
     Existing spatial regions and nested control flow are left untouched.
@@ -26,6 +26,48 @@ def D2MSpatialPlanning : Pass<"d2m-spatial-planning", "::mlir::ModuleOp"> {
     Statistic<"numGenericNodes", "generic-nodes", "Generic DAG nodes">,
     Statistic<"numDependencyEdges", "dependency-edges", "Generic DAG SSA edges">
   ];
+}
+
+def D2MMaterializeSpatialGroups : Pass<"d2m-materialize-spatial-groups", "::mlir::ModuleOp"> {
+  let summary = "Wrap groups of d2m.generic ops in d2m.spatial ops with edges.";
+  let description = [{
+    Takes a grouping that is already decided and builds the spatial ops; it
+    does not choose groups. A top-level tensor `d2m.generic` joins group `N`
+    when it carries `d2m.spatial_group = N : i64`, and then also needs
+    `d2m.spatial_range = #ttcore.core_range<...>`, the cores its region runs
+    on. Generics without the attribute are left as they are; with no
+    attribute in the module the IR does not change.
+
+    For each group, in block order:
+
+    - The ranges must lie in the worker grid, be pairwise disjoint and avoid
+      every core listed in `exclude-cores`.
+    - The group must be convex: no generic outside it lies on a path between
+      two members.
+    - A member input that reads another member becomes an edge (a region
+      block argument plus a `#d2m.spatial_edge`). The value may pass through
+      `d2m.to_layout` ops (typically a round trip through a host tensor) and
+      `d2m.mask` ops that fold to their input; both ends must have the same
+      type, or types that differ only in `collapsed_intervals` (logical rank
+      <= 2, same device shape), in which case the consumer operand takes the
+      producer's type. Anything else (a view, a tilize, a real mask, a grid
+      or shard change) is an error.
+    - Every member output becomes a fresh `d2m.empty` (spatial `outs`), so
+      edge buffers have the form `d2m-lower-spatial-edges` expects.
+    - An input `d2m.to_layout` that also feeds another generic is copied, one
+      per member (GridSelection's `recordGenericConsumer` resizes a
+      `to_layout` for exactly one consumer).
+    - Uses outside the group read the spatial results. Ops that depend on
+      them and sat between the members move after the spatial.
+
+    Runs after `d2m-materialize-view-returns` and before
+    `d2m-grid-selection`, so it sees the generics GridSelection sees.
+  }];
+  let options = [
+    ListOption<"excludeCores", "exclude-cores", "int64_t",
+               "Logical cores (y, x pairs) that no region may contain.">
+  ];
+  let dependentDialects = ["::mlir::tt::d2m::D2MDialect"];
 }
 
 // Insert scratch buffers to d2m.generic ops (post-bufferization)

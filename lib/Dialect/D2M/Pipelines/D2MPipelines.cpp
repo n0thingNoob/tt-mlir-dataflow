@@ -110,9 +110,6 @@ void createD2MFrontendPipeline(OpPassManager &pm,
     toD2MOptions.enableMulticastInference = options.enableMulticastInference;
   }
   pm.addPass(tt::createTTIRToD2MPass(toD2MOptions));
-  if (options.executionStrategy == D2MExecutionStrategy::Spatial) {
-    pm.addPass(d2m::createD2MSpatialPlanning());
-  }
   pm.addPass(d2m::createD2MScalarizeConstTensors());
   d2m::D2MGridSelectionOptions gridOptOptions;
   {
@@ -121,6 +118,18 @@ void createD2MFrontendPipeline(OpPassManager &pm,
     gridOptOptions.ttnnMode = options.ttnnMode;
   }
   pm.addPass(d2m::createD2MMaterializeViewReturns());
+  // Spatial grouping runs here rather than right after TTIRToD2M so that it
+  // sees the generics GridSelection sees: ScalarizeConstTensors removes
+  // splat-fill generics and MaterializeViewReturns adds view copies.
+  if (options.executionStrategy == D2MExecutionStrategy::Spatial) {
+    pm.addPass(d2m::createD2MSpatialPlanning());
+    d2m::D2MMaterializeSpatialGroupsOptions groupOptions;
+    groupOptions.excludeCores =
+        options.spatialExcludeCores.empty()
+            ? SmallVector<int64_t>{2, 2}
+            : llvm::to_vector(options.spatialExcludeCores);
+    pm.addPass(d2m::createD2MMaterializeSpatialGroups(groupOptions));
+  }
   pm.addPass(d2m::createD2MGridSelection(gridOptOptions));
   pm.addPass(d2m::createD2MBuildTopkChain());
   pm.addPass(createCanonicalizerPassWithOptions(options));

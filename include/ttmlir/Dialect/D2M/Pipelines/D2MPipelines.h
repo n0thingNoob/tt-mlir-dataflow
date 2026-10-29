@@ -24,8 +24,15 @@ struct D2MPipelineOptions : public PassPipelineOptions<D2MPipelineOptions> {
           clEnumValN(D2MExecutionStrategy::Temporal, "temporal",
                      "Use the existing D2M pipeline"),
           clEnumValN(D2MExecutionStrategy::Spatial, "spatial",
-                     "Enable spatial planning (currently preserves the IR)")),
+                     "Group generics into d2m.spatial ops (groups given by "
+                     "d2m.spatial_group attributes)")),
       llvm::cl::init(D2MExecutionStrategy::Temporal)};
+
+  ListOption<int64_t> spatialExcludeCores{
+      *this, "spatial-exclude-cores",
+      llvm::cl::desc("Logical cores (y, x pairs) that no spatial region may "
+                     "contain. Unset means (2, 2), which hangs on the n150 "
+                     "used for validation.")};
 
   ListOption<int64_t> meshShape{
       *this, "mesh-shape", llvm::cl::desc("Set the multi-device mesh shape.")};

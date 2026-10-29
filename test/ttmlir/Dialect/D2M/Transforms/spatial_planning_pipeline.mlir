@@ -14,10 +14,16 @@
 // RUN: not ttmlir-opt %s --d2m-fe-pipeline="execution-strategy=invalid" 2>&1 | FileCheck %s --check-prefix=INVALID
 // RUN: not ttmlir-opt %s --d2m-fe-pipeline="execution-strategy=auto" 2>&1 | FileCheck %s --check-prefix=AUTO
 
-// Planning must run immediately after conversion, before any D2M optimization.
+// Planning and group materialization run right before grid selection, after
+// the passes that still add or remove generics (ScalarizeConstTensors drops
+// splat fills, MaterializeViewReturns adds view copies), so the groups name
+// the generics GridSelection sees.
 // PIPELINE: ttir-to-d2m
-// PIPELINE-NEXT: d2m-spatial-planning,
 // PIPELINE-NEXT: d2m-scalarize-const-tensors,
+// PIPELINE-NEXT: d2m-materialize-view-returns,
+// PIPELINE-NEXT: d2m-spatial-planning,
+// PIPELINE-NEXT: d2m-materialize-spatial-groups{exclude-cores={2,2}},
+// PIPELINE-NEXT: d2m-grid-selection
 // TEMPORAL: ttir-to-d2m
 // INVALID: Cannot find option named 'invalid'
 // AUTO: Cannot find option named 'auto'

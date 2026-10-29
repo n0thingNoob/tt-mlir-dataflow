@@ -1,0 +1,457 @@
+// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#include "ttmlir/Dialect/D2M/Transforms/Passes.h"
+
+#include "ttmlir/Dialect/D2M/IR/D2MGenericRegionOps.h"
+#include "ttmlir/Dialect/D2M/IR/D2MOps.h"
+#include "ttmlir/Dialect/TTCore/IR/Utils.h"
+
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/Builders.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/SetVector.h"
+
+namespace mlir::tt::d2m {
+#define GEN_PASS_DEF_D2MMATERIALIZESPATIALGROUPS
+#include "ttmlir/Dialect/D2M/Transforms/Passes.h.inc"
+
+namespace {
+
+constexpr StringLiteral kGroupAttr = "d2m.spatial_group";
+constexpr StringLiteral kRangeAttr = "d2m.spatial_range";
+
+// True when `a` and `b` describe the same physical L1 tensor: equal device
+// shape and element type, and layouts that differ at most in
+// collapsed_intervals. For logical rank <= 2 the collapse is the identity
+// either way, so the to_layout between them only reinterprets metadata (see
+// canUseReinterpretLayoutView in LowerToLayout/Plan.cpp).
+static bool samePhysicalLayout(Type a, Type b) {
+  if (a == b) {
+    return true;
+  }
+  auto ta = mlir::dyn_cast<RankedTensorType>(a);
+  auto tb = mlir::dyn_cast<RankedTensorType>(b);
+  if (!ta || !tb || ta.getShape() != tb.getShape() ||
+      ta.getElementType() != tb.getElementType()) {
+    return false;
+  }
+  auto la = mlir::dyn_cast_or_null<ttcore::MetalLayoutAttr>(ta.getEncoding());
+  auto lb = mlir::dyn_cast_or_null<ttcore::MetalLayoutAttr>(tb.getEncoding());
+  return la && lb && la.getLogicalShape().size() <= 2 &&
+         la.getLogicalShape() == lb.getLogicalShape() &&
+         la.getDimAlignments() == lb.getDimAlignments() &&
+         la.getMemorySpace() == lb.getMemorySpace() &&
+         la.getMemoryLayout() == lb.getMemoryLayout();
+}
+
+// A mask whose fold returns its input (no maskable padding) is a no-op.
+static bool isNoOpMask(MaskOp mask) {
+  SmallVector<OpFoldResult> folded;
+  if (failed(mask->fold(folded)) || folded.size() != 1) {
+    return false;
+  }
+  return mlir::dyn_cast_if_present<Value>(folded.front()) == mask.getInput();
+}
+
+// Follow `v` back through to_layout / no-op mask ops to the generic that
+// produced it. Returns null if the chain contains anything else or does not
+// start at a generic. Only these chains can become an edge.
+static OpResult traceFoldableChain(Value v) {
+  while (true) {
+    Operation *def = v.getDefiningOp();
+    if (!def) {
+      return nullptr;
+    }
+    if (mlir::isa<GenericOp>(def)) {
+      return mlir::cast<OpResult>(v);
+    }
+    if (auto toLayout = mlir::dyn_cast<ToLayoutOp>(def)) {
+      v = toLayout.getInput();
+      continue;
+    }
+    if (auto mask = mlir::dyn_cast<MaskOp>(def); mask && isNoOpMask(mask)) {
+      v = mask.getInput();
+      continue;
+    }
+    return nullptr;
+  }
+}
+
+// Generics that `v` depends on through region-free ops (same walk as
+// SpatialPlanning's buildGenericDAG).
+static llvm::SetVector<Operation *> producerGenerics(Value v, Block &block) {
+  llvm::SetVector<Operation *> producers;
+  llvm::DenseSet<Operation *> visited;
+  SmallVector<Value> worklist{v};
+  while (!worklist.empty()) {
+    Operation *def = worklist.pop_back_val().getDefiningOp();
+    if (!def || def->getBlock() != &block || !visited.insert(def).second) {
+      continue;
+    }
+    if (mlir::isa<GenericOp>(def)) {
+      producers.insert(def);
+      continue;
+    }
+    if (def->getNumRegions() == 0) {
+      llvm::append_range(worklist, def->getOperands());
+    }
+  }
+  return producers;
+}
+
+static bool containsCore(ttcore::CoreRangeAttr r, int64_t y, int64_t x) {
+  return r.getStartCoord().getY() <= y && y <= r.getEndCoord().getY() &&
+         r.getStartCoord().getX() <= x && x <= r.getEndCoord().getX();
+}
+
+static bool overlaps(ttcore::CoreRangeAttr a, ttcore::CoreRangeAttr b) {
+  return a.getStartCoord().getY() <= b.getEndCoord().getY() &&
+         b.getStartCoord().getY() <= a.getEndCoord().getY() &&
+         a.getStartCoord().getX() <= b.getEndCoord().getX() &&
+         b.getStartCoord().getX() <= a.getEndCoord().getX();
+}
+
+struct Group {
+  int64_t id;
+  // Members in block order (this is also the region order).
+  SmallVector<GenericOp> members;
+};
+
+class D2MMaterializeSpatialGroupsPass
+    : public impl::D2MMaterializeSpatialGroupsBase<
+          D2MMaterializeSpatialGroupsPass> {
+public:
+  using impl::D2MMaterializeSpatialGroupsBase<
+      D2MMaterializeSpatialGroupsPass>::D2MMaterializeSpatialGroupsBase;
+
+  void runOnOperation() final {
+    WalkResult result = getOperation().walk([&](func::FuncOp func) {
+      for (Block &block : func.getBody()) {
+        llvm::MapVector<int64_t, Group> groups;
+        for (GenericOp generic : block.getOps<GenericOp>()) {
+          auto id = generic->getAttrOfType<IntegerAttr>(kGroupAttr);
+          if (!id) {
+            continue;
+          }
+          Group &group = groups[id.getInt()];
+          group.id = id.getInt();
+          group.members.push_back(generic);
+        }
+        for (auto &[id, group] : groups) {
+          if (failed(materialize(group, block))) {
+            return WalkResult::interrupt();
+          }
+        }
+      }
+      return WalkResult::advance();
+    });
+    if (result.wasInterrupted()) {
+      signalPassFailure();
+    }
+  }
+
+private:
+  LogicalResult checkRanges(Group &group,
+                            SmallVectorImpl<ttcore::CoreRangeAttr> &ranges);
+  LogicalResult materialize(Group &group, Block &block);
+};
+
+LogicalResult D2MMaterializeSpatialGroupsPass::checkRanges(
+    Group &group, SmallVectorImpl<ttcore::CoreRangeAttr> &ranges) {
+  ttcore::DeviceAttr device = ttcore::lookupDevice(group.members.front());
+  ArrayRef<int64_t> workerGrid = device.getWorkerGrid().getShape();
+  for (GenericOp generic : group.members) {
+    if (generic.getNumResults() == 0 ||
+        generic.getNumResults() != generic.getOutputs().size()) {
+      return generic.emitOpError("spatial group member must be in tensor "
+                                 "form and return each of its outputs");
+    }
+    auto range = generic->getAttrOfType<ttcore::CoreRangeAttr>(kRangeAttr);
+    if (!range) {
+      return generic.emitOpError("spatial group member needs a '")
+             << kRangeAttr << "' core range";
+    }
+    if (range.getStartCoord().getY() < 0 || range.getStartCoord().getX() < 0 ||
+        range.getEndCoord().getY() >= workerGrid[0] ||
+        range.getEndCoord().getX() >= workerGrid[1] ||
+        range.getStartCoord().getY() > range.getEndCoord().getY() ||
+        range.getStartCoord().getX() > range.getEndCoord().getX()) {
+      return generic.emitOpError("core range ")
+             << range << " is empty or outside the worker grid";
+    }
+    for (size_t i = 0; i + 1 < excludeCores.size(); i += 2) {
+      if (containsCore(range, excludeCores[i], excludeCores[i + 1])) {
+        return generic.emitOpError("core range ")
+               << range << " contains excluded core (" << excludeCores[i]
+               << ", " << excludeCores[i + 1] << ")";
+      }
+    }
+    for (auto [i, other] : llvm::enumerate(ranges)) {
+      if (overlaps(range, other)) {
+        return generic.emitOpError("core range ")
+               << range << " overlaps " << other << " of group member " << i;
+      }
+    }
+    ranges.push_back(range);
+  }
+  return success();
+}
+
+LogicalResult D2MMaterializeSpatialGroupsPass::materialize(Group &group,
+                                                           Block &block) {
+  // An earlier group may have moved some members after its spatial.
+  llvm::sort(group.members,
+             [](GenericOp a, GenericOp b) { return a->isBeforeInBlock(b); });
+  SmallVector<ttcore::CoreRangeAttr> ranges;
+  if (failed(checkRanges(group, ranges))) {
+    return failure();
+  }
+
+  llvm::DenseMap<Operation *, unsigned> memberIndex;
+  for (auto [i, generic] : llvm::enumerate(group.members)) {
+    memberIndex[generic] = i;
+  }
+
+  // Convexity: no generic outside the group may lie on a path between two
+  // members. Members are in block order, so walk the generics between the
+  // first and the last member and propagate "reachable from a member".
+  {
+    llvm::DenseSet<Operation *> reachable(group.members.begin(),
+                                          group.members.end());
+    for (Operation &op :
+         llvm::make_range(group.members.front()->getIterator(),
+                          std::next(group.members.back()->getIterator()))) {
+      auto generic = mlir::dyn_cast<GenericOp>(&op);
+      if (!generic) {
+        continue;
+      }
+      SmallVector<Value> operands(generic->getOperands());
+      bool fromMember = false;
+      bool fromOutsidePath = false;
+      for (Value operand : operands) {
+        for (Operation *p : producerGenerics(operand, block)) {
+          if (!reachable.contains(p)) {
+            continue;
+          }
+          fromMember = true;
+          fromOutsidePath |= !memberIndex.contains(p);
+        }
+      }
+      if (memberIndex.contains(generic) && fromOutsidePath) {
+        return generic.emitOpError("spatial group ")
+               << group.id << " is not convex: a generic outside the group "
+               << "lies on a path into this member";
+      }
+      if (fromMember) {
+        reachable.insert(generic);
+      }
+    }
+  }
+
+  // Classify every member input: an edge from another member (through a
+  // foldable to_layout / no-op mask chain) or a value from outside.
+  struct EdgeUse {
+    unsigned operandIndex;
+    unsigned producer;
+    unsigned producerResult;
+  };
+  SmallVector<SmallVector<EdgeUse>> edgeUses(group.members.size());
+  for (auto [c, generic] : llvm::enumerate(group.members)) {
+    for (OpOperand &operand : generic.getInputsMutable()) {
+      bool readsMember =
+          llvm::any_of(producerGenerics(operand.get(), block),
+                       [&](Operation *p) { return memberIndex.contains(p); });
+      if (!readsMember) {
+        continue;
+      }
+      OpResult src = traceFoldableChain(operand.get());
+      if (!src || !memberIndex.contains(src.getOwner())) {
+        return generic.emitOpError("input ")
+               << operand.getOperandNumber()
+               << " reads another member of spatial group " << group.id
+               << " through ops that cannot be an edge (only to_layout and "
+                  "no-op mask are folded)";
+      }
+      if (!samePhysicalLayout(src.getType(), operand.get().getType())) {
+        return generic.emitOpError("input ")
+               << operand.getOperandNumber()
+               << " needs a layout change from its producer in spatial group "
+               << group.id << "; resharding an edge is not supported";
+      }
+      edgeUses[c].push_back({operand.getOperandNumber(),
+                             memberIndex[src.getOwner()],
+                             src.getResultNumber()});
+    }
+  }
+
+  MLIRContext *ctx = &getContext();
+  OpBuilder builder(ctx);
+  // Values whose defining chain may become dead once the members stop using
+  // them (folded edge chains and replaced output inits).
+  llvm::SetVector<Operation *> maybeDead;
+  auto noteMaybeDead = [&](Value v) {
+    if (Operation *def = v.getDefiningOp()) {
+      maybeDead.insert(def);
+    }
+  };
+  GenericOp last = group.members.back();
+  builder.setInsertionPoint(last);
+
+  // Fresh L1 outputs. An edge buffer must be a d2m.empty on the producer's
+  // cores; the other outputs get the same form that canonicalization would
+  // give them.
+  for (GenericOp generic : group.members) {
+    for (OpOperand &init : generic.getOutputsMutable()) {
+      Value fresh = builder.create<EmptyOp>(
+          generic.getLoc(), init.get().getType(), nullptr, nullptr);
+      Value old = init.get();
+      old.replaceUsesWithIf(fresh, [&](OpOperand &use) {
+        return generic->isAncestor(use.getOwner());
+      });
+      noteMaybeDead(old);
+    }
+  }
+
+  // A to_layout that GridSelection may resize can feed only one generic
+  // (recordGenericConsumer): give each member its own copy.
+  for (GenericOp generic : group.members) {
+    for (OpOperand &operand : generic.getInputsMutable()) {
+      auto toLayout = operand.get().getDefiningOp<ToLayoutOp>();
+      if (!toLayout || toLayout->getBlock() != &block) {
+        continue;
+      }
+      bool shared = llvm::any_of(toLayout->getUsers(), [&](Operation *user) {
+        return !generic->isAncestor(user);
+      });
+      if (!shared ||
+          llvm::any_of(edgeUses[memberIndex[generic]], [&](EdgeUse &e) {
+            return e.operandIndex == operand.getOperandNumber();
+          })) {
+        continue;
+      }
+      Value init = builder.create<EmptyOp>(
+          toLayout.getLoc(), toLayout.getOutput().getType(), nullptr, nullptr);
+      auto copy = builder.create<ToLayoutOp>(toLayout.getLoc(),
+                                             toLayout.getInput(), init);
+      Value old = operand.get();
+      old.replaceUsesWithIf(copy.getResult(0), [&](OpOperand &use) {
+        return generic->isAncestor(use.getOwner());
+      });
+    }
+  }
+
+  // Build the spatial after the last member.
+  SmallVector<Type> resultTypes;
+  SmallVector<Value> outputs;
+  llvm::SetVector<Value> inputs;
+  for (auto [c, generic] : llvm::enumerate(group.members)) {
+    llvm::append_range(resultTypes, generic->getResultTypes());
+    llvm::append_range(outputs, generic.getOutputs());
+    for (OpOperand &operand : generic.getInputsMutable()) {
+      if (llvm::none_of(edgeUses[c], [&](EdgeUse &e) {
+            return e.operandIndex == operand.getOperandNumber();
+          })) {
+        inputs.insert(operand.get());
+      }
+    }
+  }
+  builder.setInsertionPointAfter(last);
+  SmallVector<Attribute> gridRanges(ranges.begin(), ranges.end());
+  SmallVector<Attribute> edges;
+  auto spatial = builder.create<SpatialOp>(
+      last.getLoc(), resultTypes, inputs.getArrayRef(), outputs,
+      builder.getArrayAttr(gridRanges), /*edges=*/nullptr,
+      group.members.size());
+
+  // Spatial result index of each member's first result.
+  SmallVector<unsigned> resultBase;
+  unsigned base = 0;
+  for (GenericOp generic : group.members) {
+    resultBase.push_back(base);
+    base += generic.getNumResults();
+  }
+
+  for (unsigned c = 0; c < group.members.size(); ++c) {
+    GenericOp generic = group.members[c];
+    Block *body = builder.createBlock(&spatial->getRegion(c));
+    // One block argument per (producer, result) read by this region.
+    llvm::MapVector<std::pair<unsigned, unsigned>, BlockArgument> args;
+    for (EdgeUse &use : edgeUses[c]) {
+      auto key = std::make_pair(use.producer, use.producerResult);
+      OpOperand &operand = generic->getOpOperand(use.operandIndex);
+      Type edgeType =
+          group.members[use.producer]->getResult(use.producerResult).getType();
+      auto [it, inserted] = args.try_emplace(key, nullptr);
+      if (inserted) {
+        it->second = body->addArgument(edgeType, generic.getLoc());
+        edges.push_back(SpatialEdgeAttr::get(ctx, use.producer,
+                                             use.producerResult, c,
+                                             it->second.getArgNumber()));
+      }
+      // Retype a collapsed_intervals-only difference to the producer's type
+      // (R5 needs equal types on both ends).
+      Value old = operand.get();
+      old.replaceUsesWithIf(it->second, [&](OpOperand &u) {
+        return generic->isAncestor(u.getOwner());
+      });
+      noteMaybeDead(old);
+    }
+    generic->moveBefore(body, body->end());
+    builder.setInsertionPointToEnd(body);
+    builder.create<SpatialYieldOp>(generic.getLoc(), generic->getResults());
+  }
+  if (!edges.empty()) {
+    spatial.setEdgesAttr(builder.getArrayAttr(edges));
+  }
+
+  // Uses outside the spatial now read its results.
+  for (auto [c, generic] : llvm::enumerate(group.members)) {
+    for (OpResult r : generic->getResults()) {
+      r.replaceUsesWithIf(
+          spatial->getResult(resultBase[c] + r.getResultNumber()),
+          [&](OpOperand &u) { return !spatial->isAncestor(u.getOwner()); });
+    }
+    generic->removeAttr(kGroupAttr);
+    generic->removeAttr(kRangeAttr);
+  }
+
+  // Erase what the fold left dead, then move every op before the spatial
+  // that depends on a spatial result to after it (convexity guarantees that
+  // no member needs them).
+  while (!maybeDead.empty()) {
+    Operation *def = maybeDead.pop_back_val();
+    if (!def->use_empty() || !mlir::isa<ToLayoutOp, MaskOp, EmptyOp>(def)) {
+      continue;
+    }
+    for (Value operand : def->getOperands()) {
+      noteMaybeDead(operand);
+    }
+    def->erase();
+  }
+  llvm::DenseSet<Operation *> moved{spatial};
+  Operation *tail = spatial;
+  SmallVector<Operation *> toMove;
+  for (Operation &op : block) {
+    if (&op == spatial.getOperation()) {
+      break;
+    }
+    bool dependsOnSpatial = llvm::any_of(op.getOperands(), [&](Value v) {
+      return v.getDefiningOp() && moved.contains(v.getDefiningOp());
+    });
+    if (dependsOnSpatial) {
+      moved.insert(&op);
+      toMove.push_back(&op);
+    }
+  }
+  for (Operation *op : toMove) {
+    op->moveAfter(tail);
+    tail = op;
+  }
+  return success();
+}
+
+} // namespace
+} // namespace mlir::tt::d2m
