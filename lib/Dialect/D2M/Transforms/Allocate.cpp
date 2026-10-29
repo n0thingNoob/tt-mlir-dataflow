@@ -268,7 +268,7 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
 
   MemorySpaces memSpaces;
   ttcore::MemorySpaceAttr L1Attr = nullptr;
-  // Buffers carried by d2m.spatial edges (producer generic outputs). The
+  // Buffers carried by d2m.spatial edges (SpatialOp::getEdgeBuffer). The
   // producer writes them with an explicit store and the consumer reads them
   // remotely, so they are never aliased and always stay in L1.
   llvm::DenseSet<Value> spatialEdgeBuffers;
@@ -308,7 +308,7 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
       }
       for (auto edge :
            spatialOp.getEdgesAttr().getAsRange<d2m::SpatialEdgeAttr>()) {
-        spatialEdgeBuffers.insert(spatialOp.getEdgeSource(edge));
+        spatialEdgeBuffers.insert(spatialOp.getEdgeBuffer(edge));
       }
     });
 
@@ -1550,7 +1550,9 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
   ///    are not broadcast or reduction.
   /// This is a common function shared by isAliasedLoad and isAliasedStore.
   bool canAliasOperand(d2m::GenericOp genericOp, Value genericOperand) const {
-    if (spatialEdgeBuffers.contains(genericOperand)) {
+    // A reblocked generic accesses the edge buffer through a view of it.
+    if (spatialEdgeBuffers.contains(
+            d2m::SpatialOp::stripViews(genericOperand))) {
       return false;
     }
     if (!isPlacedOnGenericCores(genericOp, genericOperand)) {
