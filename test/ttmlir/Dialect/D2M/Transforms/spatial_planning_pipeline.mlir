@@ -21,8 +21,8 @@
 // PIPELINE: ttir-to-d2m
 // PIPELINE-NEXT: d2m-scalarize-const-tensors,
 // PIPELINE-NEXT: d2m-materialize-view-returns,
-// PIPELINE-NEXT: d2m-spatial-planning{exclude-cores={2,2} max-cbs=32 max-semaphores=16 policy=greedy remarks=false  ttnn-mode=false},
-// PIPELINE-NEXT: d2m-materialize-spatial-groups{exclude-cores={2,2}},
+// PIPELINE-NEXT: d2m-spatial-planning{ max-cbs=32 max-semaphores=16 policy=greedy remarks=false  ttnn-mode=false},
+// PIPELINE-NEXT: d2m-materialize-spatial-groups{},
 // PIPELINE-NEXT: d2m-grid-selection
 // TEMPORAL: ttir-to-d2m
 // INVALID: Cannot find option named 'invalid'

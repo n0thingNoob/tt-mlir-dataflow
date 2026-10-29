@@ -10,9 +10,9 @@
 // CHECK: %[[S0:.*]] = "ttmetal.create_local_semaphore"() <{initial_value = 0 : ui32}>
 // CHECK: %[[S1:.*]] = "ttmetal.create_local_semaphore"() <{initial_value = 0 : ui32}>
 // CHECK: "ttmetal.enqueue_program"({{.*}}%[[S0]]{{.*}}%[[S0]], %[[S1]]{{.*}}%[[S1]]
-// CHECK-SAME: core_range<0x3, 4x4>
+// CHECK-SAME: core_range<0x0, 4x4>
+// CHECK-SAME: core_range<0x4, 4x4>
 // CHECK-SAME: core_range<4x0, 4x4>
-// CHECK-SAME: core_range<4x4, 4x4>
 // CHECK-NOT: d2m.spatial
 func.func @reblocked_chain(%x: tensor<256x512xbf16>) -> tensor<256x512xbf16> {
   %0 = "ttir.exp"(%x) : (tensor<256x512xbf16>) -> tensor<256x512xbf16>
