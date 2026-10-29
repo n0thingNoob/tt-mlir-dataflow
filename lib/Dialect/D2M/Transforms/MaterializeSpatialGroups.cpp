@@ -195,6 +195,12 @@ LogicalResult D2MMaterializeSpatialGroupsPass::materialize(Group &group,
                << " through ops that cannot be an edge (only to_layout and "
                   "no-op mask are folded)";
       }
+      if (!isL1Layout(src.getType()) || !isL1Layout(operand.get().getType())) {
+        return generic.emitOpError("input ")
+               << operand.getOperandNumber() << " reads another member of "
+               << "spatial group " << group.id
+               << " outside L1; an edge buffer must stay in L1";
+      }
       if (!samePhysicalLayout(src.getType(), operand.get().getType())) {
         return generic.emitOpError("input ")
                << operand.getOperandNumber()

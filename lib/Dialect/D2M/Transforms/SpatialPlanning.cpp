@@ -395,6 +395,10 @@ std::string D2MSpatialPlanningPass::tryAdd(Group &group, unsigned node,
       return "input " + std::to_string(operand.getOperandNumber()) +
              " reads the group through ops that cannot be an edge";
     }
+    if (!isL1Layout(src.getType()) || !isL1Layout(operand.get().getType())) {
+      return "input " + std::to_string(operand.getOperandNumber()) +
+             " is not an L1 tensor at both ends (an edge stays in L1)";
+    }
     if (!samePhysicalLayout(src.getType(), operand.get().getType())) {
       return "input " + std::to_string(operand.getOperandNumber()) +
              " needs a layout change from its producer";

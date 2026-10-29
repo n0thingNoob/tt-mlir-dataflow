@@ -23,6 +23,11 @@ inline constexpr llvm::StringLiteral kSpatialRangeAttr = "d2m.spatial_range";
 // identity, so a to_layout between them only reinterprets metadata).
 bool samePhysicalLayout(Type a, Type b);
 
+// True when `t` is a device tensor laid out in L1. An edge buffer stays in the
+// producer's L1 for the whole spatial (d2m-allocate enforces it), so both ends
+// of an edge must be L1 tensors.
+bool isL1Layout(Type t);
+
 // Follows `v` back through d2m.to_layout ops and d2m.mask ops that fold to
 // their input, to the generic result it carries. Returns null if the chain
 // contains anything else or does not start at a generic. Only such chains can

@@ -27,6 +27,14 @@ bool samePhysicalLayout(Type a, Type b) {
          la.getMemoryLayout() == lb.getMemoryLayout();
 }
 
+bool isL1Layout(Type t) {
+  auto tensor = mlir::dyn_cast<RankedTensorType>(t);
+  auto layout = tensor ? mlir::dyn_cast_or_null<ttcore::MetalLayoutAttr>(
+                             tensor.getEncoding())
+                       : nullptr;
+  return layout && layout.getMemorySpace() == ttcore::MemorySpace::DeviceL1;
+}
+
 // A mask whose fold returns its input (no maskable padding) is a no-op.
 static bool isNoOpMask(MaskOp mask) {
   SmallVector<OpFoldResult> folded;
