@@ -4,6 +4,12 @@
 
 #include "ttmlir/Dialect/D2M/Transforms/Passes.h"
 
+#include "ttmlir/Dialect/D2M/Analysis/GridAnalysis.h"
+#include "ttmlir/Dialect/D2M/IR/D2MGenericRegionOps.h"
+#include "ttmlir/Dialect/D2M/Utils/SpatialGroupUtils.h"
+#include "ttmlir/Dialect/TTCore/IR/Utils.h"
+
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Transforms/RegionUtils.h"
 #include "llvm/ADT/DenseMap.h"
@@ -12,6 +18,7 @@
 #include "llvm/ADT/SmallVector.h"
 
 #include <optional>
+#include <string>
 
 namespace mlir::tt::d2m {
 #define GEN_PASS_DEF_D2MSPATIALPLANNING
@@ -68,40 +75,59 @@ static GenericDAG buildGenericDAG(Block &block) {
   return dag;
 }
 
-// A candidate group of generics, before physical core ranges are assigned.
-struct GenericGroup {
+// What one generic costs inside a spatial, estimated before GridSelection.
+struct NodeCost {
+  // Region shape: the grid GridSelection picks for the generic's output when
+  // the whole device is the target. With exactly this range as the target,
+  // GridSelection picks the same grid, so every edge keeps the layout the
+  // default flow uses between these two generics.
+  SmallVector<int64_t, 2> grid;
+  // One CB per input and output operand (measured on the S1 programs: the
+  // lowered program of every compute generic has exactly that many).
+  int64_t cbs = 0;
+  // Local semaphores the generic uses by itself: a matmul multicasts its
+  // operands with up to two semaphores per operand. Edges add their own.
+  int64_t semaphores = 0;
+};
+
+// One edge candidate: result `result` of member `producer` read by member
+// `consumer` (indices into a group's member list).
+struct Edge {
+  unsigned producer;
+  unsigned result;
+  unsigned consumer;
+};
+
+// A group under construction with a placed core range per member.
+struct Group {
   SmallVector<unsigned> nodes;
+  SmallVector<ttcore::CoreRangeAttr> ranges;
+  SmallVector<Edge> edges;
+  // occupied[y][x]
+  SmallVector<SmallVector<bool>> occupied;
 };
 
-// A group with a physical core range assigned to each member.
-struct PlacedGenericGroup {
-  GenericGroup group;
-  // One physical core range per generic, matching group.nodes in order.
-  SmallVector<ttcore::CoreRangeAttr> coreRanges;
-};
-
-struct SpatialPlan {
-  SmallVector<PlacedGenericGroup> groups;
-};
-
-static SmallVector<GenericGroup> selectGroups(const GenericDAG &) {
-  // TODO (spatial-planning): Select legal inter-generic groups. Account for
-  // dependency paths and side-effect/control-flow boundaries before moving ops.
-  return {};
-}
-
-static std::optional<SpatialPlan> assignCoreRanges(const GenericDAG &,
-                                                   ArrayRef<GenericGroup>) {
-  // TODO (spatial-planning): Assign disjoint, device-bounded physical core
-  // ranges. Leave per-generic grids and block factors to the existing passes.
-  return std::nullopt;
-}
-
-static std::optional<SpatialPlan> evaluateCandidate(const GenericDAG &,
-                                                    const SpatialPlan &) {
-  // TODO (spatial-planning): Evaluate candidates and select a plan. Search and
-  // cost modeling belong here, including future automatic strategy selection.
-  return std::nullopt;
+// Largest number of local semaphores on one core of the group: a member's
+// own semaphores, plus one per output that feeds an edge (shared by all its
+// consumers) and one per producer output it reads through an edge.
+static int64_t maxSemaphoresPerCore(ArrayRef<unsigned> nodes,
+                                    ArrayRef<Edge> edges,
+                                    ArrayRef<NodeCost> costs) {
+  int64_t most = 0;
+  for (unsigned i = 0; i < nodes.size(); ++i) {
+    llvm::SmallSetVector<std::pair<unsigned, unsigned>, 4> outs, ins;
+    for (const Edge &e : edges) {
+      if (e.producer == i) {
+        outs.insert({e.producer, e.result});
+      }
+      if (e.consumer == i) {
+        ins.insert({e.producer, e.result});
+      }
+    }
+    most = std::max<int64_t>(most, costs[nodes[i]].semaphores + outs.size() +
+                                       ins.size());
+  }
+  return most;
 }
 
 class D2MSpatialPlanningPass
@@ -111,33 +137,281 @@ public:
       D2MSpatialPlanningPass>::D2MSpatialPlanningBase;
 
   void runOnOperation() final {
-    for (func::FuncOp func : getOperation().getOps<func::FuncOp>()) {
+    ModuleOp module = getOperation();
+    std::optional<GridAnalysis> gridAnalysis;
+    bool greedy = policy == "greedy" && !ttnnMode;
+    if (greedy) {
+      deviceGrid = llvm::to_vector(
+          ttcore::lookupDevice(module).getWorkerGrid().getShape());
+      gridAnalysis.emplace(module, deviceGrid, ttnnMode);
+    }
+    for (func::FuncOp func : module.getOps<func::FuncOp>()) {
       for (Block &block : func.getBody()) {
         GenericDAG dag = buildGenericDAG(block);
         numGenericNodes += dag.size();
         for (const GenericDAGNode &node : dag) {
           numDependencyEdges += node.predecessors.size();
         }
-        auto groups = selectGroups(dag);
-        if (groups.empty()) {
-          continue;
+        if (greedy) {
+          planBlock(dag, block, *gridAnalysis);
         }
-        auto candidate = assignCoreRanges(dag, groups);
-        if (!candidate || !evaluateCandidate(dag, *candidate)) {
-          continue;
-        }
-        // TODO (spatial-planning): Materialize a selected plan as d2m.spatial,
-        // preserving SSA uses, DPS outputs and spatial yields. Until
-        // implemented, fail explicitly if a future policy starts returning
-        // selected plans.
-        func.emitOpError("spatial plan materialization is not implemented");
-        signalPassFailure();
-        return;
+        nextGenericIndex += dag.size();
       }
     }
-    markAllAnalysesPreserved();
+    if (!greedy) {
+      markAllAnalysesPreserved();
+    }
   }
+
+private:
+  std::optional<NodeCost>
+  costOf(GenericOp generic, const GridAnalysis &gridAnalysis, std::string &why);
+  std::string tryAdd(Group &group, unsigned node, const GenericDAG &dag,
+                     Block &block, ArrayRef<NodeCost> costs);
+  bool place(Group &group, ArrayRef<int64_t> grid);
+  void planBlock(const GenericDAG &dag, Block &block,
+                 const GridAnalysis &gridAnalysis);
+  Group emptyGroup();
+
+  SmallVector<int64_t> deviceGrid;
+  int64_t nextGenericIndex = 0;
+  int64_t nextGroupId = 0;
 };
+
+std::optional<NodeCost> D2MSpatialPlanningPass::costOf(
+    GenericOp generic, const GridAnalysis &gridAnalysis, std::string &why) {
+  if (generic->hasAttr(kSpatialGroupAttr)) {
+    why = "it already has a group";
+    return std::nullopt;
+  }
+  if (generic.getInputs().empty()) {
+    why = "it has no inputs (a fill stays outside, as an input)";
+    return std::nullopt;
+  }
+  if (generic.getOutputs().size() != 1 || generic.getNumResults() != 1) {
+    why = "it does not have exactly one output";
+    return std::nullopt;
+  }
+  const GenericGridAnalysisResult *result = gridAnalysis.lookup(generic);
+  unsigned out = generic.getInputs().size();
+  if (!result || result->normalizedOperandGrids.size() <= out) {
+    why = "GridAnalysis has no grid for it";
+    return std::nullopt;
+  }
+  ArrayRef<int64_t> grid = result->normalizedOperandGrids[out];
+  if (grid.size() != 2 || grid[0] > deviceGrid[0] || grid[1] > deviceGrid[1]) {
+    why = "its grid is not a 2D grid inside the device";
+    return std::nullopt;
+  }
+  NodeCost cost;
+  cost.grid.assign(grid.begin(), grid.end());
+  cost.cbs = generic->getNumOperands();
+  bool matmul = false;
+  generic->walk([&](Operation *op) {
+    matmul |= mlir::isa<TileMatmulOp, TileMatmulBlockOp>(op);
+  });
+  cost.semaphores = matmul ? 4 : 0;
+  return cost;
+}
+
+Group D2MSpatialPlanningPass::emptyGroup() {
+  Group group;
+  group.occupied.assign(deviceGrid[0], SmallVector<bool>(deviceGrid[1], false));
+  for (size_t i = 0; i + 1 < excludeCores.size(); i += 2) {
+    int64_t y = excludeCores[i], x = excludeCores[i + 1];
+    if (y >= 0 && y < deviceGrid[0] && x >= 0 && x < deviceGrid[1]) {
+      group.occupied[y][x] = true;
+    }
+  }
+  return group;
+}
+
+// First fit, row-major, of a grid-shaped rectangle into the free cores.
+bool D2MSpatialPlanningPass::place(Group &group, ArrayRef<int64_t> grid) {
+  int64_t h = grid[0], w = grid[1];
+  for (int64_t y = 0; y + h <= deviceGrid[0]; ++y) {
+    for (int64_t x = 0; x + w <= deviceGrid[1]; ++x) {
+      bool free = true;
+      for (int64_t dy = 0; dy < h && free; ++dy) {
+        for (int64_t dx = 0; dx < w && free; ++dx) {
+          free = !group.occupied[y + dy][x + dx];
+        }
+      }
+      if (!free) {
+        continue;
+      }
+      for (int64_t dy = 0; dy < h; ++dy) {
+        for (int64_t dx = 0; dx < w; ++dx) {
+          group.occupied[y + dy][x + dx] = true;
+        }
+      }
+      MLIRContext *ctx = &getContext();
+      group.ranges.push_back(ttcore::CoreRangeAttr::get(
+          ctx, ttcore::CoreCoordAttr::get(ctx, y, x),
+          ttcore::CoreCoordAttr::get(ctx, y + h - 1, x + w - 1)));
+      return true;
+    }
+  }
+  return false;
+}
+
+// Adds `node` to `group` if the group stays convex, every connection to the
+// group can be an edge and the budgets hold; otherwise returns why not and
+// leaves the group unchanged.
+std::string D2MSpatialPlanningPass::tryAdd(Group &group, unsigned node,
+                                           const GenericDAG &dag, Block &block,
+                                           ArrayRef<NodeCost> costs) {
+  GenericOp generic = dag[node].generic;
+  llvm::DenseMap<Operation *, unsigned> member;
+  for (auto [i, n] : llvm::enumerate(group.nodes)) {
+    member[dag[n].generic] = i;
+  }
+
+  SmallVector<Edge> edges(group.edges);
+  for (OpOperand &operand : generic.getInputsMutable()) {
+    bool readsMember =
+        llvm::any_of(producerGenerics(operand.get(), block),
+                     [&](Operation *p) { return member.contains(p); });
+    if (!readsMember) {
+      continue;
+    }
+    OpResult src = traceEdgeSource(operand.get());
+    if (!src || !member.contains(src.getOwner())) {
+      return "input " + std::to_string(operand.getOperandNumber()) +
+             " reads the group through ops that cannot be an edge";
+    }
+    if (!samePhysicalLayout(src.getType(), operand.get().getType())) {
+      return "input " + std::to_string(operand.getOperandNumber()) +
+             " needs a layout change from its producer";
+    }
+    Edge edge{member[src.getOwner()], src.getResultNumber(),
+              static_cast<unsigned>(group.nodes.size())};
+    if (llvm::none_of(edges, [&](const Edge &e) {
+          return e.producer == edge.producer && e.result == edge.result &&
+                 e.consumer == edge.consumer;
+        })) {
+      edges.push_back(edge);
+    }
+  }
+
+  SmallVector<unsigned> nodes(group.nodes);
+  nodes.push_back(node);
+  int64_t cbs = 0;
+  for (unsigned n : nodes) {
+    cbs += costs[n].cbs;
+  }
+  if (cbs > maxCbs) {
+    return "the spatial would need " + std::to_string(cbs) + " CBs (limit " +
+           std::to_string(maxCbs) + ")";
+  }
+  int64_t sems = maxSemaphoresPerCore(nodes, edges, costs);
+  if (sems > maxSemaphores) {
+    return "a core would need " + std::to_string(sems) +
+           " local semaphores (limit " + std::to_string(maxSemaphores) + ")";
+  }
+
+  Group trial = group;
+  if (!place(trial, costs[node].grid)) {
+    return "no free " + std::to_string(costs[node].grid[0]) + "x" +
+           std::to_string(costs[node].grid[1]) + " core range is left";
+  }
+  trial.nodes = std::move(nodes);
+  trial.edges = std::move(edges);
+  group = std::move(trial);
+  return "";
+}
+
+void D2MSpatialPlanningPass::planBlock(const GenericDAG &dag, Block &block,
+                                       const GridAnalysis &gridAnalysis) {
+  SmallVector<NodeCost> costs(dag.size());
+  SmallVector<bool> eligible(dag.size(), false);
+  for (auto [i, node] : llvm::enumerate(dag)) {
+    std::string why;
+    if (llvm::is_contained(skipGenerics, nextGenericIndex + int64_t(i))) {
+      why = "it is in skip-generics";
+    } else if (auto cost = costOf(node.generic, gridAnalysis, why)) {
+      costs[i] = *cost;
+      eligible[i] = true;
+    }
+    if (!eligible[i] && remarks) {
+      node.generic->emitRemark("generic #")
+          << nextGenericIndex + int64_t(i) << " is not grouped: " << why;
+    }
+  }
+
+  auto genericName = [&](unsigned n) {
+    return "#" + std::to_string(nextGenericIndex + n);
+  };
+  auto close = [&](Group &group) {
+    if (group.nodes.size() >= 2) {
+      int64_t id = nextGroupId++;
+      Builder b(&getContext());
+      std::string names;
+      int64_t cores = 0, cbs = 0;
+      for (auto [n, range] : llvm::zip(group.nodes, group.ranges)) {
+        GenericOp generic = dag[n].generic;
+        generic->setAttr(kSpatialGroupAttr, b.getI64IntegerAttr(id));
+        generic->setAttr(kSpatialRangeAttr, range);
+        names += " " + genericName(n);
+        cores += costs[n].grid[0] * costs[n].grid[1];
+        cbs += costs[n].cbs;
+      }
+      if (remarks) {
+        dag[group.nodes.front()].generic->emitRemark("spatial group ")
+            << id << ": generics" << names << ", " << group.edges.size()
+            << " edges, " << cores << " cores, " << cbs << " CBs, "
+            << maxSemaphoresPerCore(group.nodes, group.edges, costs)
+            << " semaphores per core at most";
+      }
+    }
+    group = emptyGroup();
+  };
+
+  Group group = emptyGroup();
+  // Generics outside the group that depend on one of its members.
+  llvm::DenseSet<unsigned> tainted;
+  for (unsigned i = 0; i < dag.size(); ++i) {
+    bool fromGroup = llvm::any_of(dag[i].predecessors, [&](unsigned p) {
+      return llvm::is_contained(group.nodes, p) || tainted.contains(p);
+    });
+    if (!eligible[i]) {
+      if (fromGroup) {
+        tainted.insert(i);
+      }
+      continue;
+    }
+    std::string why;
+    if (!group.nodes.empty()) {
+      auto taintedPred = llvm::find_if(
+          dag[i].predecessors, [&](unsigned p) { return tainted.contains(p); });
+      why = taintedPred != dag[i].predecessors.end()
+                ? "not convex: it reads generic " + genericName(*taintedPred) +
+                      ", which is outside the group and reads it"
+                : tryAdd(group, i, dag, block, costs);
+      if (why.empty()) {
+        continue;
+      }
+      if (remarks) {
+        dag[i].generic->emitRemark("generic ")
+            << genericName(i) << " starts a new group: " << why;
+      }
+      close(group);
+      tainted.clear();
+    }
+    group.nodes.push_back(i);
+    if (!place(group, costs[i].grid)) {
+      group.nodes.clear();
+      group = emptyGroup();
+      if (remarks) {
+        dag[i].generic->emitRemark("generic ")
+            << genericName(i) << " is not grouped: its " << costs[i].grid[0]
+            << "x" << costs[i].grid[1]
+            << " grid does not fit around the excluded cores";
+      }
+    }
+  }
+  close(group);
+}
 
 } // namespace
 } // namespace mlir::tt::d2m

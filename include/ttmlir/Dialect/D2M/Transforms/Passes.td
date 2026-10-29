@@ -8,20 +8,57 @@
 include "mlir/Pass/PassBase.td"
 
 def D2MSpatialPlanning : Pass<"d2m-spatial-planning", "::mlir::ModuleOp"> {
-  let summary = "Plan inter-generic spatial execution (framework only).";
+  let summary = "Plan inter-generic spatial execution (choose spatial groups).";
   let description = [{
-    Runs after MaterializeViewReturns, right before GridSelection. Builds
-    a block-local SSA dependency DAG of top-level tensor d2m.generic ops,
+    Runs after MaterializeViewReturns, right before GridSelection. Builds a
+    block-local SSA dependency DAG of top-level tensor d2m.generic ops,
     following dependencies through intervening operations such as views.
-    Existing spatial regions and nested control flow are left untouched.
 
-    Group selection, core-range assignment and candidate evaluation are TODOs.
-    No candidate is selected yet, so the pass preserves the input IR. Future
-    selected plans will be materialized using the existing d2m.spatial op;
-    grid selection, fusion, blocking, allocation and lowering remain the
-    responsibility of the existing D2M passes.
+    With `policy=none` (the default) the pass only builds the DAG and
+    preserves the IR. With `policy=greedy` it walks the generics of each block
+    in order and grows one group at a time; a generic joins the current group
+    when all of these hold, otherwise the group is closed and the generic
+    starts the next one:
+
+    - the group stays convex (no generic outside it lies between members);
+    - every connection to a member can be a spatial edge (the same check as
+      d2m-materialize-spatial-groups: only to_layout and no-op mask in
+      between, same physical layout at both ends);
+    - the spatial needs at most `max-cbs` CBs in total (one per generic
+      operand; CBs are numbered across the whole spatial when it is lowered);
+    - no core needs more than `max-semaphores` local semaphores (4 for a
+      matmul's multicasts, plus one per edge leaving or entering the region);
+    - a core range for the generic is still free. Its shape is the grid
+      GridAnalysis selects for the generic's output with the whole device as
+      the target, so GridSelection picks the same grid inside the range and
+      every edge keeps the layout the default flow uses. Ranges are placed
+      first fit, row-major, around `exclude-cores`.
+
+    Generics without inputs (fills), with more than one output, listed in
+    `skip-generics` (indices of top-level tensor generics in module order) or
+    already in a group are left out. Groups of one generic are dropped. The
+    result is `d2m.spatial_group` / `d2m.spatial_range` attributes, which
+    d2m-materialize-spatial-groups turns into d2m.spatial ops. `remarks`
+    reports every group and every cut.
   }];
-  let dependentDialects = ["::mlir::tt::d2m::D2MDialect"];
+  let options = [
+    Option<"policy", "policy", "std::string", /*default=*/"\"none\"",
+           "Grouping policy: none (preserve the IR) or greedy.">,
+    ListOption<"excludeCores", "exclude-cores", "int64_t",
+               "Logical cores (y, x pairs) that no region may contain.">,
+    ListOption<"skipGenerics", "skip-generics", "int64_t",
+               "Indices (module order) of generics that must not be grouped.">,
+    Option<"maxCbs", "max-cbs", "int64_t", /*default=*/"32",
+           "CBs available to one spatial (the per-core hardware count).">,
+    Option<"maxSemaphores", "max-semaphores", "int64_t", /*default=*/"16",
+           "Local semaphores available per core.">,
+    Option<"remarks", "remarks", "bool", /*default=*/"false",
+           "Emit a remark for every group and every cut.">,
+    Option<"ttnnMode", "ttnn-mode", "bool", /*default=*/"false",
+           "TTNN mode: spatial edges are not lowered there, so do not group.">
+  ];
+  let dependentDialects = ["::mlir::tt::d2m::D2MDialect",
+                           "::mlir::bufferization::BufferizationDialect"];
   let statistics = [
     Statistic<"numGenericNodes", "generic-nodes", "Generic DAG nodes">,
     Statistic<"numDependencyEdges", "dependency-edges", "Generic DAG SSA edges">

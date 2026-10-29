@@ -28,6 +28,16 @@ struct D2MPipelineOptions : public PassPipelineOptions<D2MPipelineOptions> {
                      "d2m.spatial_group attributes)")),
       llvm::cl::init(D2MExecutionStrategy::Temporal)};
 
+  ListOption<int64_t> spatialSkipGenerics{
+      *this, "spatial-skip-generics",
+      llvm::cl::desc("Indices (module order) of top-level generics that "
+                     "spatial planning must not group.")};
+
+  Option<bool> spatialRemarks{
+      *this, "spatial-remarks",
+      llvm::cl::desc("Report every spatial group and cut as a remark."),
+      llvm::cl::init(false)};
+
   ListOption<int64_t> spatialExcludeCores{
       *this, "spatial-exclude-cores",
       llvm::cl::desc("Logical cores (y, x pairs) that no spatial region may "

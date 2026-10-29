@@ -6,6 +6,7 @@
 
 #include "ttmlir/Dialect/D2M/IR/D2MGenericRegionOps.h"
 #include "ttmlir/Dialect/D2M/IR/D2MOps.h"
+#include "ttmlir/Dialect/D2M/Utils/SpatialGroupUtils.h"
 #include "ttmlir/Dialect/TTCore/IR/Utils.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -19,88 +20,6 @@ namespace mlir::tt::d2m {
 #include "ttmlir/Dialect/D2M/Transforms/Passes.h.inc"
 
 namespace {
-
-constexpr StringLiteral kGroupAttr = "d2m.spatial_group";
-constexpr StringLiteral kRangeAttr = "d2m.spatial_range";
-
-// True when `a` and `b` describe the same physical L1 tensor: equal device
-// shape and element type, and layouts that differ at most in
-// collapsed_intervals. For logical rank <= 2 the collapse is the identity
-// either way, so the to_layout between them only reinterprets metadata (see
-// canUseReinterpretLayoutView in LowerToLayout/Plan.cpp).
-static bool samePhysicalLayout(Type a, Type b) {
-  if (a == b) {
-    return true;
-  }
-  auto ta = mlir::dyn_cast<RankedTensorType>(a);
-  auto tb = mlir::dyn_cast<RankedTensorType>(b);
-  if (!ta || !tb || ta.getShape() != tb.getShape() ||
-      ta.getElementType() != tb.getElementType()) {
-    return false;
-  }
-  auto la = mlir::dyn_cast_or_null<ttcore::MetalLayoutAttr>(ta.getEncoding());
-  auto lb = mlir::dyn_cast_or_null<ttcore::MetalLayoutAttr>(tb.getEncoding());
-  return la && lb && la.getLogicalShape().size() <= 2 &&
-         la.getLogicalShape() == lb.getLogicalShape() &&
-         la.getDimAlignments() == lb.getDimAlignments() &&
-         la.getMemorySpace() == lb.getMemorySpace() &&
-         la.getMemoryLayout() == lb.getMemoryLayout();
-}
-
-// A mask whose fold returns its input (no maskable padding) is a no-op.
-static bool isNoOpMask(MaskOp mask) {
-  SmallVector<OpFoldResult> folded;
-  if (failed(mask->fold(folded)) || folded.size() != 1) {
-    return false;
-  }
-  return mlir::dyn_cast_if_present<Value>(folded.front()) == mask.getInput();
-}
-
-// Follow `v` back through to_layout / no-op mask ops to the generic that
-// produced it. Returns null if the chain contains anything else or does not
-// start at a generic. Only these chains can become an edge.
-static OpResult traceFoldableChain(Value v) {
-  while (true) {
-    Operation *def = v.getDefiningOp();
-    if (!def) {
-      return nullptr;
-    }
-    if (mlir::isa<GenericOp>(def)) {
-      return mlir::cast<OpResult>(v);
-    }
-    if (auto toLayout = mlir::dyn_cast<ToLayoutOp>(def)) {
-      v = toLayout.getInput();
-      continue;
-    }
-    if (auto mask = mlir::dyn_cast<MaskOp>(def); mask && isNoOpMask(mask)) {
-      v = mask.getInput();
-      continue;
-    }
-    return nullptr;
-  }
-}
-
-// Generics that `v` depends on through region-free ops (same walk as
-// SpatialPlanning's buildGenericDAG).
-static llvm::SetVector<Operation *> producerGenerics(Value v, Block &block) {
-  llvm::SetVector<Operation *> producers;
-  llvm::DenseSet<Operation *> visited;
-  SmallVector<Value> worklist{v};
-  while (!worklist.empty()) {
-    Operation *def = worklist.pop_back_val().getDefiningOp();
-    if (!def || def->getBlock() != &block || !visited.insert(def).second) {
-      continue;
-    }
-    if (mlir::isa<GenericOp>(def)) {
-      producers.insert(def);
-      continue;
-    }
-    if (def->getNumRegions() == 0) {
-      llvm::append_range(worklist, def->getOperands());
-    }
-  }
-  return producers;
-}
 
 static bool containsCore(ttcore::CoreRangeAttr r, int64_t y, int64_t x) {
   return r.getStartCoord().getY() <= y && y <= r.getEndCoord().getY() &&
@@ -132,7 +51,7 @@ public:
       for (Block &block : func.getBody()) {
         llvm::MapVector<int64_t, Group> groups;
         for (GenericOp generic : block.getOps<GenericOp>()) {
-          auto id = generic->getAttrOfType<IntegerAttr>(kGroupAttr);
+          auto id = generic->getAttrOfType<IntegerAttr>(kSpatialGroupAttr);
           if (!id) {
             continue;
           }
@@ -169,10 +88,11 @@ LogicalResult D2MMaterializeSpatialGroupsPass::checkRanges(
       return generic.emitOpError("spatial group member must be in tensor "
                                  "form and return each of its outputs");
     }
-    auto range = generic->getAttrOfType<ttcore::CoreRangeAttr>(kRangeAttr);
+    auto range =
+        generic->getAttrOfType<ttcore::CoreRangeAttr>(kSpatialRangeAttr);
     if (!range) {
       return generic.emitOpError("spatial group member needs a '")
-             << kRangeAttr << "' core range";
+             << kSpatialRangeAttr << "' core range";
     }
     if (range.getStartCoord().getY() < 0 || range.getStartCoord().getX() < 0 ||
         range.getEndCoord().getY() >= workerGrid[0] ||
@@ -267,7 +187,7 @@ LogicalResult D2MMaterializeSpatialGroupsPass::materialize(Group &group,
       if (!readsMember) {
         continue;
       }
-      OpResult src = traceFoldableChain(operand.get());
+      OpResult src = traceEdgeSource(operand.get());
       if (!src || !memberIndex.contains(src.getOwner())) {
         return generic.emitOpError("input ")
                << operand.getOperandNumber()
@@ -414,8 +334,8 @@ LogicalResult D2MMaterializeSpatialGroupsPass::materialize(Group &group,
           spatial->getResult(resultBase[c] + r.getResultNumber()),
           [&](OpOperand &u) { return !spatial->isAncestor(u.getOwner()); });
     }
-    generic->removeAttr(kGroupAttr);
-    generic->removeAttr(kRangeAttr);
+    generic->removeAttr(kSpatialGroupAttr);
+    generic->removeAttr(kSpatialRangeAttr);
   }
 
   // Erase what the fold left dead, then move every op before the spatial
