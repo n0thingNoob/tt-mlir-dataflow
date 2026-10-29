@@ -514,8 +514,12 @@ void MCQExecutor::execute(const target::metal::EnqueueProgramCommand *command,
         continue;
       }
 
+      // A CB placed per program (e.g. one region of a spatial program) carries
+      // its own core range; otherwise use the buffer's CB config.
       tt::tt_metal::CoreRangeSet coreRangeSet = common::toCoreRangeSet(
-          metalBuffer->circular_buffer_config()->core_range_set());
+          cbRef->core_range_set()
+              ? cbRef->core_range_set()
+              : metalBuffer->circular_buffer_config()->core_range_set());
       tt_metal::CircularBufferConfig config =
           createCircularBufferConfig(cbRef, meshBuffers);
       tt_metal::CreateCircularBuffer(program, coreRangeSet, config);
