@@ -17,6 +17,7 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 
+#include <memory>
 #include <optional>
 #include <string>
 
@@ -102,6 +103,13 @@ struct Edge {
 struct Group {
   SmallVector<unsigned> nodes;
   SmallVector<ttcore::CoreRangeAttr> ranges;
+  // Region shape of each member: its output grid when GridAnalysis targets
+  // targets[target] (0 = the whole device, NodeCost::grid). All members use
+  // one target, so two members connected by an edge split the dimensions
+  // they share the same way, as in the default flow, and the edge keeps one
+  // layout at both ends. Shrinking a single member breaks that.
+  SmallVector<SmallVector<int64_t, 2>> grids;
+  unsigned target = 0;
   SmallVector<Edge> edges;
   // occupied[y][x]
   SmallVector<SmallVector<bool>> occupied;
@@ -138,12 +146,41 @@ public:
 
   void runOnOperation() final {
     ModuleOp module = getOperation();
-    std::optional<GridAnalysis> gridAnalysis;
     bool greedy = policy == "greedy" && !ttnnMode;
     if (greedy) {
       deviceGrid = llvm::to_vector(
           ttcore::lookupDevice(module).getWorkerGrid().getShape());
-      gridAnalysis.emplace(module, deviceGrid, ttnnMode);
+      int64_t h = deviceGrid[0], w = deviceGrid[1];
+      targets.assign(1, {h, w});
+      for (int64_t a = 1; a <= h; ++a) {
+        for (int64_t b = 1; b <= w; ++b) {
+          if (h % a == 0 && w % b == 0 && (a != h || b != w)) {
+            targets.push_back({a, b});
+          }
+        }
+      }
+      // Most cores first, then the aspect ratio closest to the device's (the
+      // ratio of a * w to b * h nearest to 1), then fewer rows.
+      auto skew = [&](ArrayRef<int64_t> t) {
+        int64_t p = t[0] * w, q = t[1] * h;
+        return std::make_pair(std::max(p, q), std::min(p, q));
+      };
+      std::stable_sort(targets.begin() + 1, targets.end(),
+                       [&](ArrayRef<int64_t> l, ArrayRef<int64_t> r) {
+                         if (l[0] * l[1] != r[0] * r[1]) {
+                           return l[0] * l[1] > r[0] * r[1];
+                         }
+                         auto [ln, ld] = skew(l);
+                         auto [rn, rd] = skew(r);
+                         if (ln * rd != rn * ld) {
+                           return ln * rd < rn * ld;
+                         }
+                         return l[0] < r[0];
+                       });
+      analyses.clear();
+      analyses.resize(targets.size());
+      analyses[0] =
+          std::make_shared<GridAnalysis>(module, deviceGrid, ttnnMode);
     }
     for (func::FuncOp func : module.getOps<func::FuncOp>()) {
       for (Block &block : func.getBody()) {
@@ -153,7 +190,7 @@ public:
           numDependencyEdges += node.predecessors.size();
         }
         if (greedy) {
-          planBlock(dag, block, *gridAnalysis);
+          planBlock(dag, block, *analyses[0]);
         }
         nextGenericIndex += dag.size();
       }
@@ -169,11 +206,24 @@ private:
   std::string tryAdd(Group &group, unsigned node, const GenericDAG &dag,
                      Block &block, ArrayRef<NodeCost> costs);
   bool place(Group &group, ArrayRef<int64_t> grid);
+  std::optional<SmallVector<int64_t, 2>> gridAt(unsigned node, unsigned target,
+                                                const GenericDAG &dag,
+                                                ArrayRef<NodeCost> costs);
+  bool fit(Group &group, unsigned node, const GenericDAG &dag,
+           ArrayRef<NodeCost> costs, std::string &tried);
   void planBlock(const GenericDAG &dag, Block &block,
                  const GridAnalysis &gridAnalysis);
   Group emptyGroup();
 
   SmallVector<int64_t> deviceGrid;
+  // GridAnalysis targets: the device grid, then its factor shapes (a divides
+  // the device height, b its width) in the order fit() tries them. A grid
+  // GridAnalysis picks for a smaller target is again picked exactly by
+  // GridSelection with that grid as the region.
+  SmallVector<SmallVector<int64_t, 2>> targets;
+  // GridAnalysis per target, built on first use (shared: passes are copied
+  // when cloned; runOnOperation rebuilds them).
+  SmallVector<std::shared_ptr<GridAnalysis>> analyses;
   int64_t nextGenericIndex = 0;
   int64_t nextGroupId = 0;
 };
@@ -255,6 +305,71 @@ bool D2MSpatialPlanningPass::place(Group &group, ArrayRef<int64_t> grid) {
   return false;
 }
 
+// Region shape of `node` when GridAnalysis targets targets[target].
+std::optional<SmallVector<int64_t, 2>>
+D2MSpatialPlanningPass::gridAt(unsigned node, unsigned target,
+                               const GenericDAG &dag,
+                               ArrayRef<NodeCost> costs) {
+  if (target == 0) {
+    return costs[node].grid;
+  }
+  if (!analyses[target]) {
+    analyses[target] = std::make_shared<GridAnalysis>(
+        getOperation(), targets[target], ttnnMode);
+  }
+  GenericOp generic = dag[node].generic;
+  const GenericGridAnalysisResult *result = analyses[target]->lookup(generic);
+  unsigned out = generic.getInputs().size();
+  if (!result || result->normalizedOperandGrids.size() <= out ||
+      result->normalizedOperandGrids[out].size() != 2) {
+    return std::nullopt;
+  }
+  return llvm::to_vector<2>(result->normalizedOperandGrids[out]);
+}
+
+// Places `node` in `group` (it is not in group.nodes yet) at the group's
+// target. If no range is free, places the whole group again, members first,
+// at the first later target where everything fits. If no target works,
+// leaves the group unchanged and lists the targets tried in `tried`.
+bool D2MSpatialPlanningPass::fit(Group &group, unsigned node,
+                                 const GenericDAG &dag,
+                                 ArrayRef<NodeCost> costs, std::string &tried) {
+  auto grid = gridAt(node, group.target, dag, costs);
+  if (grid && place(group, *grid)) {
+    group.grids.push_back(*grid);
+    return true;
+  }
+  SmallVector<unsigned> nodes(group.nodes);
+  nodes.push_back(node);
+  for (unsigned t = group.target + 1; t < targets.size(); ++t) {
+    Group trial = emptyGroup();
+    trial.target = t;
+    bool fits = llvm::all_of(nodes, [&](unsigned n) {
+      auto g = gridAt(n, t, dag, costs);
+      if (!g || !place(trial, *g)) {
+        return false;
+      }
+      trial.grids.push_back(*g);
+      return true;
+    });
+    if (fits) {
+      group.ranges = std::move(trial.ranges);
+      group.grids = std::move(trial.grids);
+      group.occupied = std::move(trial.occupied);
+      group.target = t;
+      return true;
+    }
+    tried += (tried.empty() ? "" : ", ") + std::to_string(targets[t][0]) + "x" +
+             std::to_string(targets[t][1]);
+  }
+  return false;
+}
+
+// Suffix of a remark about a range that does not fit.
+static std::string triedTargets(const std::string &tried) {
+  return tried.empty() ? "" : " (nor with the group at targets " + tried + ")";
+}
+
 // Adds `node` to `group` if the group stays convex, every connection to the
 // group can be an edge and the budgets hold; otherwise returns why not and
 // leaves the group unchanged.
@@ -311,9 +426,11 @@ std::string D2MSpatialPlanningPass::tryAdd(Group &group, unsigned node,
   }
 
   Group trial = group;
-  if (!place(trial, costs[node].grid)) {
+  std::string tried;
+  if (!fit(trial, node, dag, costs, tried)) {
     return "no free " + std::to_string(costs[node].grid[0]) + "x" +
-           std::to_string(costs[node].grid[1]) + " core range is left";
+           std::to_string(costs[node].grid[1]) + " core range is left" +
+           triedTargets(tried);
   }
   trial.nodes = std::move(nodes);
   trial.edges = std::move(edges);
@@ -346,15 +463,25 @@ void D2MSpatialPlanningPass::planBlock(const GenericDAG &dag, Block &block,
     if (group.nodes.size() >= 2) {
       int64_t id = nextGroupId++;
       Builder b(&getContext());
-      std::string names;
+      std::string names, shrunk;
       int64_t cores = 0, cbs = 0;
-      for (auto [n, range] : llvm::zip(group.nodes, group.ranges)) {
+      for (auto [n, range, grid] :
+           llvm::zip(group.nodes, group.ranges, group.grids)) {
         GenericOp generic = dag[n].generic;
         generic->setAttr(kSpatialGroupAttr, b.getI64IntegerAttr(id));
         generic->setAttr(kSpatialRangeAttr, range);
         names += " " + genericName(n);
-        cores += costs[n].grid[0] * costs[n].grid[1];
+        cores += grid[0] * grid[1];
         cbs += costs[n].cbs;
+        shrunk += " " + genericName(n) + " " +
+                  std::to_string(costs[n].grid[0]) + "x" +
+                  std::to_string(costs[n].grid[1]) + "->" +
+                  std::to_string(grid[0]) + "x" + std::to_string(grid[1]);
+      }
+      if (remarks && group.target != 0) {
+        dag[group.nodes.front()].generic->emitRemark("spatial group ")
+            << id << " shrinks to target " << targets[group.target][0] << "x"
+            << targets[group.target][1] << ":" << shrunk;
       }
       if (remarks) {
         dag[group.nodes.front()].generic->emitRemark("spatial group ")
@@ -398,16 +525,15 @@ void D2MSpatialPlanningPass::planBlock(const GenericDAG &dag, Block &block,
       close(group);
       tainted.clear();
     }
-    group.nodes.push_back(i);
-    if (!place(group, costs[i].grid)) {
-      group.nodes.clear();
-      group = emptyGroup();
-      if (remarks) {
-        dag[i].generic->emitRemark("generic ")
-            << genericName(i) << " is not grouped: its " << costs[i].grid[0]
-            << "x" << costs[i].grid[1]
-            << " grid does not fit around the excluded cores";
-      }
+    std::string tried;
+    if (fit(group, i, dag, costs, tried)) {
+      group.nodes.push_back(i);
+    } else if (remarks) {
+      dag[i].generic->emitRemark("generic ")
+          << genericName(i) << " is not grouped: its " << costs[i].grid[0]
+          << "x" << costs[i].grid[1]
+          << " grid does not fit around the excluded cores"
+          << triedTargets(tried);
     }
   }
   close(group);

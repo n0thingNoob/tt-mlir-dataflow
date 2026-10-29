@@ -11,8 +11,11 @@
 // edge semaphore.
 // SEM: remark: generic #2 starts a new group: a core would need 2 local semaphores (limit 1)
 
-// Excluding every other core of rows 0, 2, 4, 6 leaves no 2x2 square free.
-// ROOM-COUNT-4: is not grouped: its 2x2 grid does not fit around the excluded cores
+// Excluding every other core of rows 0, 2, 4, 6 leaves no 2x2 square free:
+// the group takes the first smaller target whose grids fit, 1x8 (1x2 grids
+// in the free odd rows).
+// ROOM: remark: spatial group 0 shrinks to target 1x8: #0 2x2->1x2 #1 2x2->1x2 #2 2x2->1x2 #3 2x2->1x2
+// ROOM: remark: spatial group 0: generics #0 #1 #2 #3, 3 edges, 8 cores
 
 // Skipping the second generic: it reads the first and feeds the third, so
 // the first and third cannot share a group.

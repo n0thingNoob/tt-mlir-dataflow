@@ -2,18 +2,29 @@
 
 // Greedy spatial planning on small real programs. The remarks are the
 // budget record of each group: cores (worker grid 8x8, core (2,2) excluded),
-// CBs (32 per spatial) and local semaphores per core (16).
+// CBs (32 per spatial) and local semaphores per core (16). Only @mlp needs a
+// smaller target; every other group keeps the default grids (any shrink
+// would be an unexpected remark).
 
-// MLP: the three 2x8 generics fill rows 0-1, 3-4 and 5-6 around (2,2); the
-// last matmul's 2x4 range no longer fits.
+// MLP: the three 2x8 generics fill rows 0-1, 3-4 and 5-6 around (2,2), so
+// the last matmul's 2x4 range does not fit. The whole group is placed again
+// with the grids GridAnalysis picks for an 8x4 target: four 2x4 ranges, and
+// GridSelection picks exactly those grids, edges included.
 // CHECK-LABEL: func.func @mlp
-// CHECK: d2m.spatial {{.*}}grid_ranges = [#ttcore.core_range<(0,0), (1,7)>, #ttcore.core_range<(3,0), (4,7)>, #ttcore.core_range<(5,0), (6,7)>]
+// CHECK: d2m.spatial {{.*}}grid_ranges = [#ttcore.core_range<(0,0), (1,3)>, #ttcore.core_range<(0,4), (1,7)>, #ttcore.core_range<(2,3), (3,6)>, #ttcore.core_range<(4,0), (5,3)>]
+// CHECK: d2m.generic {{.*}}grid = #ttcore.grid<2x4{{[,>]}}
+// CHECK: }, {
+// CHECK: d2m.generic {{.*}}grid = #ttcore.grid<2x4{{[,>]}}
+// CHECK: }, {
+// CHECK: d2m.generic {{.*}}grid = #ttcore.grid<2x4{{[,>]}}
+// CHECK: }, {
+// CHECK: d2m.generic {{.*}}grid = #ttcore.grid<2x4{{[,>]}}
 func.func @mlp(%x: tensor<64x128xbf16>, %w1: tensor<128x256xbf16>, %b1: tensor<64x256xbf16>, %w2: tensor<256x128xbf16>) -> tensor<64x128xbf16> {
-  // expected-remark @+1 {{spatial group 0: generics #0 #1 #2, 2 edges, 48 cores, 8 CBs, 5 semaphores per core at most}}
+  // expected-remark @+2 {{spatial group 0 shrinks to target 8x4: #0 2x8->2x4 #1 2x8->2x4 #2 2x8->2x4 #3 2x4->2x4}}
+  // expected-remark @+1 {{spatial group 0: generics #0 #1 #2 #3, 3 edges, 32 cores, 11 CBs, 5 semaphores per core at most}}
   %0 = "ttir.matmul"(%x, %w1) : (tensor<64x128xbf16>, tensor<128x256xbf16>) -> tensor<64x256xbf16>
   %1 = "ttir.add"(%0, %b1) : (tensor<64x256xbf16>, tensor<64x256xbf16>) -> tensor<64x256xbf16>
   %2 = "ttir.relu"(%1) : (tensor<64x256xbf16>) -> tensor<64x256xbf16>
-  // expected-remark @+1 {{generic #3 starts a new group: no free 2x4 core range is left}}
   %3 = "ttir.matmul"(%2, %w2) : (tensor<64x256xbf16>, tensor<256x128xbf16>) -> tensor<64x128xbf16>
   return %3 : tensor<64x128xbf16>
 }
