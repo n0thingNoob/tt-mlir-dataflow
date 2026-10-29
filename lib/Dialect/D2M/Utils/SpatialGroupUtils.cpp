@@ -6,9 +6,11 @@
 
 #include "llvm/ADT/DenseSet.h"
 
+#include <optional>
+
 namespace mlir::tt::d2m {
 
-bool samePhysicalLayout(Type a, Type b) {
+bool sameLayoutExceptMemorySpace(Type a, Type b) {
   if (a == b) {
     return true;
   }
@@ -23,16 +25,26 @@ bool samePhysicalLayout(Type a, Type b) {
   return la && lb && la.getLogicalShape().size() <= 2 &&
          la.getLogicalShape() == lb.getLogicalShape() &&
          la.getDimAlignments() == lb.getDimAlignments() &&
-         la.getMemorySpace() == lb.getMemorySpace() &&
          la.getMemoryLayout() == lb.getMemoryLayout();
 }
 
-bool isL1Layout(Type t) {
+static std::optional<ttcore::MemorySpace> memorySpaceOf(Type t) {
   auto tensor = mlir::dyn_cast<RankedTensorType>(t);
   auto layout = tensor ? mlir::dyn_cast_or_null<ttcore::MetalLayoutAttr>(
                              tensor.getEncoding())
                        : nullptr;
-  return layout && layout.getMemorySpace() == ttcore::MemorySpace::DeviceL1;
+  if (!layout) {
+    return std::nullopt;
+  }
+  return layout.getMemorySpace();
+}
+
+bool isL1Layout(Type t) {
+  return memorySpaceOf(t) == ttcore::MemorySpace::DeviceL1;
+}
+
+bool isDRAMLayout(Type t) {
+  return memorySpaceOf(t) == ttcore::MemorySpace::DeviceDRAM;
 }
 
 // A mask whose fold returns its input (no maskable padding) is a no-op.
