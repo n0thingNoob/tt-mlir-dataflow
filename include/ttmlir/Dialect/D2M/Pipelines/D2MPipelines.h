@@ -35,6 +35,15 @@ struct D2MPipelineOptions : public PassPipelineOptions<D2MPipelineOptions> {
                      "already in the IR)."),
       llvm::cl::init("greedy")};
 
+  Option<bool> spatialFuseElementwise{
+      *this, "spatial-fuse-elementwise",
+      llvm::cl::desc("With execution-strategy=spatial, fuse elementwise "
+                     "generics (d2m-generic-fusion, after a canonicalization "
+                     "that folds the to_layout round trips between them) "
+                     "before spatial planning, so a chain of elementwise ops "
+                     "takes one region."),
+      llvm::cl::init(false)};
+
   ListOption<int64_t> spatialGroups{
       *this, "spatial-groups",
       llvm::cl::desc("Spatial groups given by hand: (group, generic, y0, x0, "
