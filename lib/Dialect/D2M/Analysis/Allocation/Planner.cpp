@@ -183,14 +183,11 @@ Planner::AllocateStats PlannerImpl::allocateImpl<Planner::Algorithm::Greedy>(
       const Request &allocatedRequest = requests[k];
       TT_debug((kOffset >= 0 && kOffset == allocatedRequest.offset));
 
-      const SequenceT maxFirst =
-          std::max(request.first, allocatedRequest.first);
-      const SequenceT minLast = std::min(request.last, allocatedRequest.last);
+      // If `allocatedRequest` conflicts with `request` (overlapping live
+      // ranges on common cores), check if we can use the gap between it and
+      // the previous conflict.
 
-      // If `allocatedRequest` conflicts with `request`, check if we can use the
-      // gap between it and the previous conflict.
-
-      if (maxFirst <= minLast) {
+      if (request.conflictsWith(allocatedRequest)) {
         TT_ALLOC_TRACE("\tconflict request #{}: {}", k, allocatedRequest);
         const AllocSizeT gap = allocatedRequest.offset - offsetPrev;
         if (gap >= allocatedRequest.size && gap < gapBest) {
@@ -259,9 +256,14 @@ Planner::AnalysisStats PlannerImpl::analyze(const Problem &solution,
     AllocSizeT usage = 0;
 
     const auto conflicts = intervals.getContaining(position);
+    int32_t conflictCount = 0;
     for (const auto &entry : conflicts) {
       const auto conflictIndex = entry->value();
       const Request &conflict = solution.request(conflictIndex);
+      if (!req.cores.intersects(conflict.cores)) {
+        continue;
+      }
+      ++conflictCount;
 
       usage = std::max(usage, conflict.offset + conflict.size);
     }
@@ -270,7 +272,7 @@ Planner::AnalysisStats PlannerImpl::analyze(const Problem &solution,
 
     metrics.inContentionGroup |= (usage > watermark);
     metrics.maxConflictSize =
-        std::max<int32_t>(metrics.maxConflictSize, conflicts.size());
+        std::max<int32_t>(metrics.maxConflictSize, conflictCount);
   }
 
   return analysis;
@@ -492,7 +494,8 @@ Planner::AllocateStats Planner::verify(const Problem &solution) {
 
     const auto conflicts = intervals.getContaining(req.first);
     for (const auto &entry : conflicts) {
-      if (entry->value() != reqIndex) {
+      if (entry->value() != reqIndex &&
+          req.cores.intersects(solution.request(entry->value()).cores)) {
         const Request &conflict = solution.request(entry->value());
 
         // 'conflict' and 'request' must not overlap in memory space.
@@ -503,7 +506,11 @@ Planner::AllocateStats Planner::verify(const Problem &solution) {
             std::min(req.offset + req.size, conflict.offset + conflict.size);
         TT_assertv(!memOverlap, "memory overlap b/w {} and {}", req, conflict);
 
-        load += conflict.size;
+        // Load on one core (the corner of `req`'s rectangle), where all these
+        // requests conflict pairwise.
+        if (conflict.cores.contains(req.cores.y0, req.cores.x0)) {
+          load += conflict.size;
+        }
       }
     }
 
