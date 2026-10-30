@@ -96,15 +96,15 @@ def count_multi_region_programs(ttmetal_mlir: str) -> int:
     return count
 
 
-# Inputs in DRAM (default-input-memspace=dram): the groups are the same and
-# their edges stay in L1. rms_mm and tm do not compile in this setting even
-# without spatial (a view cannot change memory space), so they are left out.
-DRAM_INPUT_PROGRAMS = [p for p in PROGRAMS if p not in ("rms_mm", "tm")]
-
-
+# dram_in: inputs in DRAM (default-input-memspace=dram); the groups are the
+# same and their edges stay in L1. dram_io: function arguments and results in
+# DRAM, everything else in L1 (dram-args-and-results); the groups are the same
+# as with everything in L1.
 @pytest.mark.parametrize(
     "program, memspace",
-    [(p, "l1") for p in PROGRAMS] + [(p, "dram_in") for p in DRAM_INPUT_PROGRAMS],
+    [(p, "l1") for p in PROGRAMS]
+    + [(p, "dram_in") for p in PROGRAMS]
+    + [(p, "dram_io") for p in PROGRAMS],
 )
 @pytest.mark.parametrize("spatial", [False, True], ids=["default", "spatial"])
 @pytest.mark.parametrize("target", ["ttmetal"])
@@ -115,6 +115,8 @@ def test_spatial_auto(
     options = ["execution-strategy=spatial"] if spatial else []
     if memspace == "dram_in":
         options.append("default-input-memspace=dram")
+    elif memspace == "dram_io":
+        options.append("dram-args-and-results=true")
     kwargs = get_request_kwargs(request)
     kwargs["save_artifacts"] = True
     compiled = compile_and_execute_ttir(

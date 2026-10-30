@@ -120,6 +120,7 @@ def TTIRToD2M: Pass<"ttir-to-d2m", "::mlir::ModuleOp"> {
       Option<"collapseTensorsTo2D", "collapse-tensors-2d", "bool", /*default=*/"true", "Default collapse all tensors to 2D">,
       Option<"ttnnMode", "ttnn-mode", "bool", /*default=*/"false", "Enable translation of TTNN Tensors">,
       Option<"enableMulticastInference", "enable-multicast-inference", "bool", /*default=*/"true", "Enable automatic multicast inference for reduction operations">,
+      Option<"dramArgsAndResults", "dram-args-and-results", "bool", /*default=*/"false", "Put function arguments and returned results in DRAM and every other tensor in L1 (overrides default-input-memspace and default-output-memspace)">,
   ];
 }
 

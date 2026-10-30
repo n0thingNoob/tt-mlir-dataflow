@@ -159,6 +159,14 @@ struct D2MPipelineOptions : public PassPipelineOptions<D2MPipelineOptions> {
           clEnumValN(ttcore::MemorySpace::DeviceL1, "l1", "L1"),
           clEnumValN(ttcore::MemorySpace::DeviceDRAM, "dram", "DRAM")),
       llvm::cl::init(ttcore::MemorySpace::DeviceL1)};
+  // Per-tensor placement instead of the two defaults above: function
+  // arguments and returned results in DRAM, every other tensor in L1.
+  Option<bool> dramArgsAndResults{
+      *this, "dram-args-and-results",
+      llvm::cl::desc("Put function arguments and returned results in DRAM and "
+                     "every other tensor in L1 (overrides "
+                     "default-input-memspace and default-output-memspace)."),
+      llvm::cl::init(false)};
 
   // This option disables back-to-back ToLayoutOp folding; this is mainly
   // useful for mocking up DMA tests that do 'unnecessary' roundtrip DMA.

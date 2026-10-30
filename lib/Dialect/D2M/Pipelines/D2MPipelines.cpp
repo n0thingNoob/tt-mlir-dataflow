@@ -105,6 +105,7 @@ void createD2MFrontendPipeline(OpPassManager &pm,
   {
     toD2MOptions.defaultInputMemSpace = options.defaultInputMemSpace;
     toD2MOptions.defaultOutputMemSpace = options.defaultOutputMemSpace;
+    toD2MOptions.dramArgsAndResults = options.dramArgsAndResults;
     toD2MOptions.ttnnMode = options.ttnnMode;
     toD2MOptions.collapseTensorsTo2D = options.collapseTensors;
     toD2MOptions.enableMulticastInference = options.enableMulticastInference;
