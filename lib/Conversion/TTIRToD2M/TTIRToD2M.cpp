@@ -460,6 +460,19 @@ protected:
 
     auto emptyOp = rewriter.create<d2m::EmptyOp>(value.getLoc(), shardedShape,
                                                  elementType, layout);
+    // The DRAM copy of a function argument starts at the bank the argument
+    // names (d2m.dram_bank), if any.
+    if (memSpace == ttcore::MemorySpace::DeviceDRAM) {
+      if (auto arg = mlir::dyn_cast<BlockArgument>(value)) {
+        if (auto func =
+                mlir::dyn_cast<func::FuncOp>(arg.getOwner()->getParentOp())) {
+          if (auto bank = func.getArgAttrOfType<IntegerAttr>(
+                  arg.getArgNumber(), d2m::utils::kDramBankAttr)) {
+            emptyOp->setAttr(d2m::utils::kDramBankAttr, bank);
+          }
+        }
+      }
+    }
 
     // For ND tensors (logicalShape.size() > 2), set placeholder virtual grid
     // mappings on the EmptyOp.  These will be replaced when GridSelection
@@ -5626,6 +5639,32 @@ public:
     if (failed(applyOpPatternsGreedily(embeddingOps, frozenPatterns, config))) {
       signalPassFailure();
       return;
+    }
+
+    // d2m.dram_bank on a function argument: a bank index.
+    int64_t numDramBanks = 0;
+    if (ttcore::SystemDescAttr systemDesc =
+            ttcore::getCurrentScopeSystemDesc(module)) {
+      numDramBanks = systemDesc.getChipDescs().front().getNumDramChannels();
+    }
+    for (func::FuncOp func : module.getOps<func::FuncOp>()) {
+      for (unsigned i = 0; i < func.getNumArguments(); ++i) {
+        Attribute bank = func.getArgAttr(i, d2m::utils::kDramBankAttr);
+        if (!bank) {
+          continue;
+        }
+        auto index = mlir::dyn_cast<IntegerAttr>(bank);
+        if (!index || index.getInt() < 0 ||
+            (numDramBanks > 0 && index.getInt() >= numDramBanks)) {
+          func.emitOpError("argument ")
+              << i << ": " << d2m::utils::kDramBankAttr
+              << " must be a DRAM bank index"
+              << (numDramBanks > 0 ? " below " + std::to_string(numDramBanks)
+                                   : std::string());
+          signalPassFailure();
+          return;
+        }
+      }
     }
 
     RewritePatternSet patterns(ctx);

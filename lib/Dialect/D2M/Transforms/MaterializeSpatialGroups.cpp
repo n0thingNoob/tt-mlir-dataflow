@@ -7,6 +7,7 @@
 #include "ttmlir/Dialect/D2M/IR/D2MGenericRegionOps.h"
 #include "ttmlir/Dialect/D2M/IR/D2MOps.h"
 #include "ttmlir/Dialect/D2M/Utils/SpatialGroupUtils.h"
+#include "ttmlir/Dialect/D2M/Utils/Utils.h"
 #include "ttmlir/Dialect/TTCore/IR/Utils.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -260,8 +261,11 @@ LogicalResult D2MMaterializeSpatialGroupsPass::materialize(Group &group,
           })) {
         continue;
       }
-      Value init = builder.create<EmptyOp>(
+      auto init = builder.create<EmptyOp>(
           toLayout.getLoc(), toLayout.getOutput().getType(), nullptr, nullptr);
+      if (Operation *oldInit = toLayout.getOutput().getDefiningOp()) {
+        utils::copyDramBank(oldInit, init);
+      }
       auto copy = builder.create<ToLayoutOp>(toLayout.getLoc(),
                                              toLayout.getInput(), init);
       Value old = operand.get();

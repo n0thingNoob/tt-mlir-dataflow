@@ -220,6 +220,7 @@ mlir::LogicalResult d2m::EmptyOp::bufferize(
   if (auto fwd = getVirtualGridForwardMappingAttr()) {
     allocOp->setAttr(d2m::utils::kVirtualGridForwardMappingAttr, fwd);
   }
+  utils::copyDramBank(getOperation(), allocOp);
   if (auto reductionScaler =
           getOperation()->getAttr(utils::kReductionScalerAttr)) {
     allocOp->setAttr(utils::kReductionScalerAttr, reductionScaler);
