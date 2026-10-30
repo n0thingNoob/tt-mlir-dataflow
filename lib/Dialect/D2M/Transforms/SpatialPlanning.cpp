@@ -7,16 +7,19 @@
 #include "ttmlir/Dialect/D2M/Analysis/GridAnalysis.h"
 #include "ttmlir/Dialect/D2M/IR/D2MGenericRegionOps.h"
 #include "ttmlir/Dialect/D2M/Utils/SpatialGroupUtils.h"
+#include "ttmlir/Dialect/D2M/Utils/Utils.h"
 #include "ttmlir/Dialect/TTCore/IR/Utils.h"
 
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Transforms/RegionUtils.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -222,13 +225,20 @@ public:
         nextGenericIndex += dag.size();
       }
     }
-    if (!greedy && !given) {
+    // Load regions go in last, so the generic indices they name are the same
+    // as in `groups` and `skip-generics`.
+    if (failed(insertGivenLoads(module))) {
+      signalPassFailure();
+      return;
+    }
+    if (!greedy && !given && loads.empty()) {
       markAllAnalysesPreserved();
     }
   }
 
 private:
   LogicalResult applyGivenGroups(ModuleOp module, bool &applied);
+  LogicalResult insertGivenLoads(ModuleOp module);
   std::optional<NodeCost>
   costOf(GenericOp generic, const GridAnalysis &gridAnalysis, std::string &why);
   std::string tryAdd(Group &group, unsigned node, const GenericDAG &dag,
@@ -589,6 +599,176 @@ LogicalResult D2MSpatialPlanningPass::applyGivenGroups(ModuleOp module,
            << " generics";
   }
   applied = true;
+  return success();
+}
+
+LogicalResult D2MSpatialPlanningPass::insertGivenLoads(ModuleOp module) {
+  if (loads.empty()) {
+    return success();
+  }
+  if (loads.size() % 6 != 0) {
+    return module.emitError("loads takes (generic, operand, y0, x0, y1, x1) "
+                            "per input, got ")
+           << loads.size() << " values";
+  }
+  SmallVector<GenericOp> generics;
+  for (func::FuncOp func : module.getOps<func::FuncOp>()) {
+    for (Block &block : func.getBody()) {
+      for (const GenericDAGNode &node : buildGenericDAG(block)) {
+        generics.push_back(node.generic);
+      }
+    }
+  }
+  // The inputs to copy, by the cores of their load region (one generic per
+  // region: regions of a spatial cannot share cores).
+  MLIRContext *ctx = &getContext();
+  llvm::MapVector<Attribute, SmallVector<OpOperand *>> byRange;
+  for (size_t i = 0; i < loads.size(); i += 6) {
+    int64_t index = loads[i], operand = loads[i + 1];
+    if (index < 0 || index >= static_cast<int64_t>(generics.size())) {
+      return module.emitError("loads names generic #")
+             << index << ", but the module has only " << generics.size()
+             << " generics";
+    }
+    GenericOp generic = generics[index];
+    if (!generic->hasAttr(kSpatialGroupAttr)) {
+      return generic.emitOpError("loads names generic #")
+             << index << ", which is not in a spatial group";
+    }
+    if (operand < 0 ||
+        operand >= static_cast<int64_t>(generic.getInputs().size())) {
+      return generic.emitOpError("loads names input ")
+             << operand << " of generic #" << index << ", which has "
+             << generic.getInputs().size() << " inputs";
+    }
+    OpOperand &input = generic.getInputsMutable()[operand];
+    auto type = mlir::dyn_cast<RankedTensorType>(input.get().getType());
+    auto layout = type ? mlir::dyn_cast_if_present<ttcore::MetalLayoutAttr>(
+                             type.getEncoding())
+                       : nullptr;
+    if (!layout || layout.getMemorySpace() != ttcore::MemorySpace::DeviceDRAM) {
+      return generic.emitOpError("loads names input ")
+             << operand << " of generic #" << index << ", which is not in DRAM";
+    }
+    auto range = ttcore::CoreRangeAttr::get(
+        ctx, ttcore::CoreCoordAttr::get(ctx, loads[i + 2], loads[i + 3]),
+        ttcore::CoreCoordAttr::get(ctx, loads[i + 4], loads[i + 5]));
+    byRange[range].push_back(&input);
+  }
+
+  for (auto &[range, inputs] : byRange) {
+    // The load joins its consumers' group and goes before the first of them.
+    Operation *first = inputs.front()->getOwner();
+    Attribute group = first->getAttr(kSpatialGroupAttr);
+    for (OpOperand *input : inputs) {
+      Operation *consumer = input->getOwner();
+      if (consumer->getAttr(kSpatialGroupAttr) != group ||
+          consumer->getBlock() != first->getBlock()) {
+        return consumer->emitOpError("loads puts inputs of generics in "
+                                     "different groups on the same cores ")
+               << range;
+      }
+      if (consumer->isBeforeInBlock(first)) {
+        first = consumer;
+      }
+    }
+    // One copy per distinct input value. The outputs of one generic share its
+    // grid and indexing maps, so they must have one type.
+    llvm::SetVector<Value> sources;
+    for (OpOperand *input : inputs) {
+      sources.insert(input->get());
+    }
+    for (Value source : sources) {
+      if (source.getType() != sources.front().getType()) {
+        return first->emitOpError("loads puts inputs of different types on "
+                                  "the same cores ")
+               << range << ": " << sources.front().getType() << " and "
+               << source.getType();
+      }
+    }
+    // An input defined after the first consumer (the to_layout of a later
+    // generic's argument) moves up to it with the ops it uses.
+    std::function<LogicalResult(Value)> hoist =
+        [&](Value value) -> LogicalResult {
+      Operation *def = value.getDefiningOp();
+      if (!def || def->getBlock() != first->getBlock() ||
+          def->isBeforeInBlock(first)) {
+        return success();
+      }
+      if (def->getNumRegions() != 0) {
+        return def->emitOpError("defines an input of a load region after the "
+                                "load's first consumer");
+      }
+      for (Value operand : def->getOperands()) {
+        if (failed(hoist(operand))) {
+          return failure();
+        }
+      }
+      def->moveBefore(first);
+      return success();
+    };
+    for (Value source : sources) {
+      if (failed(hoist(source))) {
+        return failure();
+      }
+    }
+    OpBuilder builder(first);
+    Location loc = first->getLoc();
+    SmallVector<Value> outputs;
+    for (Value source : sources) {
+      auto type = mlir::cast<RankedTensorType>(source.getType());
+      auto layout = mlir::cast<ttcore::MetalLayoutAttr>(type.getEncoding());
+      auto l1Layout = ttcore::MetalLayoutAttr::get(
+          ctx, layout.getLogicalShape(), layout.getDimAlignments(),
+          layout.getCollapsedIntervals(), ttcore::MemorySpace::DeviceL1,
+          layout.getMemoryLayout());
+      outputs.push_back(builder.create<EmptyOp>(
+          loc, type.getShape(), type.getElementType(), l1Layout));
+    }
+    // The same shape as the data-movement generics LowerToLayout builds:
+    // each output shard is a remote_load of the input's shard, stored back.
+    auto load = builder.create<GenericOp>(
+        loc, sources.getArrayRef(), outputs, /*additionalArgs=*/ValueRange(),
+        [&](OpBuilder &b, Location bodyLoc, ValueRange shards) {
+          SmallVector<Value> stored;
+          for (auto [i, source] : llvm::enumerate(sources)) {
+            auto shardType = mlir::cast<RankedTensorType>(shards[i].getType());
+            SmallVector<Value> indices = d2m::utils::buildGridIndices(
+                b, bodyLoc, b.getMultiDimIdentityMap(shardType.getRank()));
+            Value buffer = b.create<tensor::EmptyOp>(
+                bodyLoc, shardType.getShape(), shardType.getElementType());
+            Value data = b.create<RemoteLoadOp>(bodyLoc, shardType, buffer,
+                                                source, indices)
+                             .getResult();
+            stored.push_back(b.create<RemoteStoreOp>(bodyLoc,
+                                                     outputs[i].getType(),
+                                                     outputs[i], indices, data)
+                                 .getResult());
+          }
+          b.create<YieldOp>(bodyLoc, stored);
+        },
+        ThreadType::Unified);
+    load->setAttr(kSpatialGroupAttr, group);
+    load->setAttr(kSpatialRangeAttr, range);
+    if (remarks) {
+      load.emitRemark("load region on ")
+          << range << " for " << sources.size() << " inputs";
+    }
+    // Each consumer reads the copy, in its operand and in its body.
+    for (auto [i, value] : llvm::enumerate(sources)) {
+      Value source = value;
+      Value copy = load.getResult(i);
+      for (OpOperand *input : inputs) {
+        if (input->get() != source) {
+          continue;
+        }
+        Operation *consumer = input->getOwner();
+        source.replaceUsesWithIf(copy, [&](OpOperand &use) {
+          return consumer->isAncestor(use.getOwner());
+        });
+      }
+    }
+  }
   return success();
 }
 

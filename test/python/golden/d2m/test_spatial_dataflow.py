@@ -10,9 +10,15 @@
 # to core through L1 (spatial edges). The groups are given by hand
 # (spatial-groups); elementwise chains are fused before planning.
 #
+# Two designs: V1 as above, and V2, where a load region on the bank's core
+# copies Wg[:, j] and Wu[:, j] into L1 (spatial-loads) and gate / up read them
+# over edges from the next cores (down still reads Wd[j, :] itself).
+#
 # Two shapes: a scaled one (H = 512, F = 1536) and the main one (H = 2048,
 # F = 8192 padded to 12 x 22 tiles = 8448 with zero weights; the matmuls are
-# also blocked along N so each region's stream buffers fit its L1).
+# also blocked along N so each region's stream buffers fit its L1). V2 runs the
+# scaled shape only: a main-shape load region would hold 2 x 1.4 MiB of
+# weights at once (whole-tensor edges).
 
 import re
 import pytest
@@ -54,10 +60,13 @@ BANK_CORES = [
 ]
 
 
-def placement() -> List[int]:
-    """spatial-groups values: per bank j, generics 4j..4j+3 = gate, up,
-    silu(g) * u, down; generic 48 = the hub. The gate takes the bank's core;
-    up, down and silu(g) * u take the free core nearest to it."""
+def placement(loads: bool = False) -> Tuple[List[int], List[int]]:
+    """spatial-groups and spatial-loads values: per bank j, generics
+    4j..4j+3 = gate, up, silu(g) * u, down; generic 48 = the hub. V1: the gate
+    takes the bank's core; up, down and silu(g) * u take the free core nearest
+    to it. V2 (loads): the load region takes the bank's core and copies input 1
+    (the weight) of gate and up; the four compute generics take the nearest
+    free cores."""
     taken = set()
 
     def nearest(core):
@@ -69,18 +78,25 @@ def placement() -> List[int]:
         ]
         return min(free)[1]
 
+    roles = ("gate", "up", "down", "glu")
+    if loads:
+        roles = ("load",) + roles
     where = {}
-    for role in ("gate", "up", "down", "glu"):
+    for i, role in enumerate(roles):
         for j, core in enumerate(BANK_CORES):
-            where[(j, role)] = core if role == "gate" else nearest(core)
+            where[(j, role)] = core if i == 0 else nearest(core)
             taken.add(where[(j, role)])
     hub = nearest((5, 2))
-    values = []
+    groups, load_values = [], []
     for j in range(BANKS):
         for k, role in enumerate(("gate", "up", "glu", "down")):
             y, x = where[(j, role)]
-            values += [0, 4 * j + k, y, x, y, x]
-    return values + [0, 4 * BANKS, hub[0], hub[1], hub[0], hub[1]]
+            groups += [0, 4 * j + k, y, x, y, x]
+        if loads:
+            y, x = where[(j, "load")]
+            load_values += [4 * j, 1, y, x, y, x, 4 * j + 1, 1, y, x, y, x]
+    groups += [0, 4 * BANKS, hub[0], hub[1], hub[0], hub[1]]
+    return groups, load_values
 
 
 def gated_mlp(b, x, *weights):
@@ -158,12 +174,20 @@ def pipeline_with_dram_banks(module, options: str):
     ttir_to_ttmetal_backend_pipeline(module, options)
 
 
+# (design, spatial): V2 only differs in spatial mode.
+MODES = [("v1", False), ("v1", True), ("v2", True)]
+
+
 @pytest.mark.parametrize("shape", list(SHAPES))
-@pytest.mark.parametrize("spatial", [False, True], ids=["default", "spatial"])
+@pytest.mark.parametrize(
+    "design,spatial", MODES, ids=["default", "spatial", "spatial_v2"]
+)
 @pytest.mark.parametrize("target", ["ttmetal"])
 def test_spatial_dataflow_gated_mlp(
-    shape: str, spatial: bool, target: str, request, device
+    shape: str, design: str, spatial: bool, target: str, request, device
 ):
+    if design == "v2" and shape != "scaled":
+        pytest.skip("V2 needs streaming edges at the main shape")
     h, f, f_padded, extra = SHAPES[shape]
     inputs = make_inputs(h, f, f_padded)
     # The zero padding leaves the layer unchanged (checked on the host; the
@@ -183,12 +207,15 @@ def test_spatial_dataflow_gated_mlp(
 
     options = ["dram-args-and-results=true"]
     if spatial:
+        groups, loads = placement(loads=design == "v2")
         options += [
             "execution-strategy=spatial",
             "spatial-fuse-elementwise=true",
             "spatial-policy=none",
-            "spatial-groups=" + ",".join(map(str, placement())),
+            "spatial-groups=" + ",".join(map(str, groups)),
         ] + extra
+        if loads:
+            options.append("spatial-loads=" + ",".join(map(str, loads)))
     kwargs = get_request_kwargs(request)
     kwargs["save_artifacts"] = True
     compiled = compile_and_execute_ttir(
@@ -207,5 +234,6 @@ def test_spatial_dataflow_gated_mlp(
         for line in final.splitlines()
         if '"ttmetal.enqueue_program"' in line
     ]
-    # Spatial: one program holds all 49 one-core regions.
-    assert [r for r in regions if r > 1] == ([4 * BANKS + 1] if spatial else [])
+    # Spatial: one program holds all 49 one-core regions (61 with the loads).
+    expected = 4 * BANKS + 1 + (BANKS if design == "v2" else 0)
+    assert [r for r in regions if r > 1] == ([expected] if spatial else [])
