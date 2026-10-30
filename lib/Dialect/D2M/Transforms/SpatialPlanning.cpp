@@ -504,12 +504,14 @@ std::string D2MSpatialPlanningPass::tryAdd(Group &group, unsigned node,
 
   SmallVector<unsigned> nodes(group.nodes);
   nodes.push_back(node);
+  // CBs are allocated per region on the region's cores, and every core runs
+  // one region, so the budget applies to each member, not to the sum.
   int64_t cbs = 0;
   for (unsigned n : nodes) {
-    cbs += costs[n].cbs;
+    cbs = std::max(cbs, costs[n].cbs);
   }
   if (cbs > maxCbs) {
-    return "the spatial would need " + std::to_string(cbs) + " CBs (limit " +
+    return "a core would need " + std::to_string(cbs) + " CBs (limit " +
            std::to_string(maxCbs) + ")";
   }
   int64_t sems = maxSemaphoresPerCore(nodes, edges, costs);

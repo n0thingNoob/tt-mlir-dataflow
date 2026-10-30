@@ -24,8 +24,9 @@ def D2MSpatialPlanning : Pass<"d2m-spatial-planning", "::mlir::ModuleOp"> {
     - every connection to a member can be a spatial edge (the same check as
       d2m-materialize-spatial-groups: only to_layout and no-op mask in
       between, same physical layout at both ends);
-    - the spatial needs at most `max-cbs` CBs in total (one per generic
-      operand; CBs are numbered across the whole spatial when it is lowered);
+    - no core needs more than `max-cbs` CBs (one per generic operand; a
+      region's CBs are placed on its own cores, so each member counts on its
+      own; the group remark still reports the spatial's total);
     - no core needs more than `max-semaphores` local semaphores (4 for a
       matmul's multicasts, plus one per edge leaving or entering the region);
     - a core range for the generic is still free. Its shape is the grid
@@ -55,7 +56,7 @@ def D2MSpatialPlanning : Pass<"d2m-spatial-planning", "::mlir::ModuleOp"> {
     ListOption<"groups", "groups", "int64_t",
                "Groups given by hand: (group, generic, y0, x0, y1, x1) per generic, generic indices as in skip-generics. Applied with any policy.">,
     Option<"maxCbs", "max-cbs", "int64_t", /*default=*/"32",
-           "CBs available to one spatial (the per-core hardware count).">,
+           "CBs available per core.">,
     Option<"maxSemaphores", "max-semaphores", "int64_t", /*default=*/"16",
            "Local semaphores available per core.">,
     Option<"remarks", "remarks", "bool", /*default=*/"false",
