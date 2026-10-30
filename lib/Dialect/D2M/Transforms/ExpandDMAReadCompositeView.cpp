@@ -593,6 +593,21 @@ static LogicalResult expandCompositeViews(ModuleOp moduleOp) {
   for (CompositeViewOp compositeView : compositeViews) {
     for (Operation *user :
          llvm::make_early_inc_range(compositeView->getUsers())) {
+      // A d2m.spatial lists the views its regions read as inputs; once the
+      // reads are expanded it reads the view's inputs instead.
+      if (auto spatial = mlir::dyn_cast<SpatialOp>(user)) {
+        llvm::SetVector<Value> inputs;
+        for (Value input : spatial.getInputs()) {
+          if (input == compositeView.getResult()) {
+            inputs.insert(compositeView.getInputs().begin(),
+                          compositeView.getInputs().end());
+          } else {
+            inputs.insert(input);
+          }
+        }
+        spatial.getInputsMutable().assign(inputs.getArrayRef());
+        continue;
+      }
       eraseDeadViewLayoutChain(rewriter, user);
     }
 
