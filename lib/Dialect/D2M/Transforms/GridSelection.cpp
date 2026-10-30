@@ -18,7 +18,6 @@
 #include "ttmlir/Dialect/TTCore/IR/TTCore.h"
 #include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h"
 #include "ttmlir/Dialect/TTCore/IR/Utils.h"
-#include "ttmlir/Dialect/TTCore/Utils/AffineMapUtils.h"
 #include "ttmlir/Dialect/TTIR/IR/TTIROps.h"
 #include "ttmlir/Utils.h"
 
@@ -684,36 +683,43 @@ static void applySpatialEdgeUpdate(const OperandGridInfo &info, bool ttnnMode) {
 // block argument at the producer's type and give the consumer generic a view
 // of it reblocked to `grid` (the same mapping LowerToLayout's L1 reshard
 // uses, without the copy).
-static LogicalResult insertSpatialEdgeReshardView(
-    d2m::GenericOp genericOp, unsigned operandIndex, ArrayRef<int64_t> grid,
-    const OperandGridInfo &info, bool ttnnMode, OpBuilder &builder) {
+static LogicalResult insertSpatialEdgeReshardView(d2m::GenericOp genericOp,
+                                                  unsigned operandIndex,
+                                                  ArrayRef<int64_t> grid,
+                                                  const OperandGridInfo &info,
+                                                  OpBuilder &builder) {
   OpOperand &operand = genericOp->getOpOperand(operandIndex);
-  auto edgeType = mlir::cast<RankedTensorType>(operand.get().getType());
+  Value edge = operand.get();
+  auto edgeType = mlir::cast<RankedTensorType>(edge.getType());
   auto edgeLayout = mlir::cast<ttcore::MetalLayoutAttr>(edgeType.getEncoding());
-  RankedTensorType viewType = utils::tensorWithOptimalGrid(
-      edgeType, ttnnMode, grid, info.paddingTileShape);
-  auto viewLayout = mlir::cast<ttcore::MetalLayoutAttr>(viewType.getEncoding());
-  if (ttmlir::utils::volume<int64_t>(edgeType.getShape()) !=
-      ttmlir::utils::volume<int64_t>(viewType.getShape())) {
+  // The view keeps the edge's layout (logical shape, alignments, collapse) and
+  // only changes the grid, so the remapping is a pure block reblock in the
+  // edge's device space (tiles stay tiles; a layout change would need an
+  // untilize/tilize, which a view cannot do).
+  llvm::SmallVector<int64_t> tileShape;
+  if (auto tileType =
+          mlir::dyn_cast<ttcore::TileType>(edgeType.getElementType())) {
+    tileShape = llvm::to_vector(tileType.getShape());
+  }
+  llvm::SmallVector<int64_t> physicalShape =
+      edgeLayout.getPhysicalShape(tileShape);
+  if (physicalShape.size() != grid.size() ||
+      llvm::any_of(llvm::zip_equal(physicalShape, grid), [](auto pair) {
+        return std::get<0>(pair) % std::get<1>(pair) != 0;
+      })) {
     return genericOp.emitOpError()
            << "operand " << operandIndex
            << " is a d2m.spatial edge laid out on grid "
            << ttmlir::utils::formatIterable(info.selectedGrid, "x")
-           << " by its producer; it cannot be read on grid "
-           << ttmlir::utils::formatIterable(grid, "x")
-           << " (the padded shapes differ)";
+           << " by its producer; its blocks do not divide evenly over grid "
+           << ttmlir::utils::formatIterable(grid, "x");
   }
-  AffineMap remapping =
-      edgeLayout.getDimAlignments() == viewLayout.getDimAlignments() &&
-              edgeLayout.getLogicalShape() == viewLayout.getLogicalShape() &&
-              edgeLayout.getCollapsedIntervals() ==
-                  viewLayout.getCollapsedIntervals()
-          ? ttmlir::utils::calculateReblockMap(
-                edgeType.getShape(), viewType.getShape(), builder.getContext())
-          : ttcore::utils::buildLayoutTransformMap(edgeLayout, edgeType,
-                                                   viewLayout, viewType);
+  auto viewType =
+      RankedTensorType::get(edgeLayout.getDeviceShape(grid, tileShape),
+                            edgeType.getElementType(), edgeLayout);
+  AffineMap remapping = ttmlir::utils::calculateReblockMap(
+      edgeType.getShape(), viewType.getShape(), builder.getContext());
   builder.setInsertionPoint(genericOp);
-  Value edge = operand.get();
   auto view = builder.create<d2m::ViewLayoutOp>(genericOp.getLoc(), viewType,
                                                 edge, remapping,
                                                 /*reinterpretLayout=*/false);
@@ -869,7 +875,7 @@ static LogicalResult applyGridDecisions(d2m::GenericOp genericOp,
     if (failed(insertSpatialEdgeReshardView(
             genericOp, operandIndex,
             result.normalizedOperandGrids[operandIndex],
-            result.operandInfos[operandIndex], ttnnMode, builder))) {
+            result.operandInfos[operandIndex], builder))) {
       return failure();
     }
   }
