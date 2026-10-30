@@ -9,6 +9,10 @@
 # sums the partial results and writes y to DRAM. Every intermediate goes core
 # to core through L1 (spatial edges). The groups are given by hand
 # (spatial-groups); elementwise chains are fused before planning.
+#
+# Two shapes: a scaled one (H = 512, F = 1536) and the main one (H = 2048,
+# F = 8192 padded to 12 x 22 tiles = 8448 with zero weights; the matmuls are
+# also blocked along N so each region's stream buffers fit its L1).
 
 import re
 import pytest
@@ -24,7 +28,13 @@ from ttmlir.passes import ttir_to_ttmetal_backend_pipeline
 
 pytestmark = pytest.mark.frontend("ttir")
 
-H, F, BANKS = 512, 1536, 12
+BANKS = 12
+
+# name -> (H, F, padded F, extra pipeline options for spatial mode)
+SHAPES = {
+    "scaled": (512, 1536, 1536, []),
+    "main": (2048, 8192, 8448, ["test-buffer-size-policy=auto-mn"]),
+}
 
 # Worker cores (y, x) next to DRAM banks 0..11 (dram_bank_to_logical_worker_noc0
 # of an n150). Another card only makes the placement less local.
@@ -90,17 +100,41 @@ def gated_mlp(b, x, *weights):
     return y
 
 
-def create_program(shapes: List[Tuple[int, ...]]):
+def make_inputs(h: int, f: int, f_padded: int) -> List[torch.Tensor]:
+    """x and the per-bank slices of Wg, Wu (columns) and Wd (rows). The F
+    positions past `f` are zero, so they add nothing: silu(0) * 0 = 0."""
+    rand = lambda *shape: (torch.rand(*shape) * 2 - 1).to(torch.bfloat16)
+    x, wg, wu, wd = rand(32, h), rand(h, f), rand(h, f), rand(f, h)
+    pad = f_padded - f
+    wg = torch.nn.functional.pad(wg, (0, pad))
+    wu = torch.nn.functional.pad(wu, (0, pad))
+    wd = torch.nn.functional.pad(wd, (0, 0, 0, pad))
+    slices = f_padded // BANKS
+    return (
+        [x]
+        + list(wg.split(slices, dim=1))
+        + list(wu.split(slices, dim=1))
+        + list(wd.split(slices, dim=0))
+    )
+
+
+def reference(inputs: List[torch.Tensor], f: int) -> torch.Tensor:
+    """The unpadded layer in float32."""
+    x = inputs[0].float()
+    wg = torch.cat(inputs[1 : 1 + BANKS], dim=1)[:, :f].float()
+    wu = torch.cat(inputs[1 + BANKS : 1 + 2 * BANKS], dim=1)[:, :f].float()
+    wd = torch.cat(inputs[1 + 2 * BANKS :], dim=0)[:f].float()
+    return (torch.nn.functional.silu(x @ wg) * (x @ wu)) @ wd
+
+
+def create_program(inputs: List[torch.Tensor]):
+    shapes = [tuple(t.shape) for t in inputs]
+
     def module(builder: TTIRBuilder):
         @builder.func(shapes, [torch.bfloat16] * len(shapes))
         def program(*args):
             operands, builder = args[: len(shapes)], args[len(shapes)]
-            builder.set_goldens(
-                inputs={
-                    operand: (torch.rand(shape) * 2 - 1).to(torch.bfloat16)
-                    for operand, shape in zip(operands, shapes)
-                }
-            )
+            builder.set_goldens(inputs=dict(zip(operands, inputs)))
             return gated_mlp(builder, *operands)
 
     return module
@@ -124,10 +158,29 @@ def pipeline_with_dram_banks(module, options: str):
     ttir_to_ttmetal_backend_pipeline(module, options)
 
 
+@pytest.mark.parametrize("shape", list(SHAPES))
 @pytest.mark.parametrize("spatial", [False, True], ids=["default", "spatial"])
 @pytest.mark.parametrize("target", ["ttmetal"])
-def test_spatial_dataflow_gated_mlp(spatial: bool, target: str, request, device):
-    shapes = [(32, H)] + [(H, F // BANKS)] * (2 * BANKS) + [(F // BANKS, H)] * BANKS
+def test_spatial_dataflow_gated_mlp(
+    shape: str, spatial: bool, target: str, request, device
+):
+    h, f, f_padded, extra = SHAPES[shape]
+    inputs = make_inputs(h, f, f_padded)
+    # The zero padding leaves the layer unchanged (checked on the host; the
+    # device result is checked against the padded program's golden below).
+    padded = sum(
+        (
+            torch.nn.functional.silu(inputs[0].float() @ inputs[1 + j].float())
+            * (inputs[0].float() @ inputs[1 + BANKS + j].float())
+        )
+        @ inputs[1 + 2 * BANKS + j].float()
+        for j in range(BANKS)
+    )
+    ref = reference(inputs, f)
+    torch.testing.assert_close(
+        padded, ref, rtol=1e-4, atol=1e-4 * ref.abs().max().item()
+    )
+
     options = ["dram-args-and-results=true"]
     if spatial:
         options += [
@@ -135,11 +188,11 @@ def test_spatial_dataflow_gated_mlp(spatial: bool, target: str, request, device)
             "spatial-fuse-elementwise=true",
             "spatial-policy=none",
             "spatial-groups=" + ",".join(map(str, placement())),
-        ]
+        ] + extra
     kwargs = get_request_kwargs(request)
     kwargs["save_artifacts"] = True
     compiled = compile_and_execute_ttir(
-        create_program(shapes),
+        create_program(inputs),
         target=target,
         device=device,
         pcc=0.999,
