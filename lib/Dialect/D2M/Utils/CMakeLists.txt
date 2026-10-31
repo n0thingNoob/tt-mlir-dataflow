@@ -3,6 +3,7 @@ add_mlir_library(MLIRD2MUtils
   DMAUtils.cpp
   DstRegisterAnalysis.cpp
   GridSelectionUtils.cpp
+  SpatialGroupUtils.cpp
   SpatialOpNormalizeUtil.cpp
   TopKUtils.cpp
   Utils.cpp

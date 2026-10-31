@@ -122,12 +122,22 @@ void createD2MFrontendPipeline(OpPassManager &pm,
   // sees the generics GridSelection sees: ScalarizeConstTensors removes
   // splat-fill generics and MaterializeViewReturns adds view copies.
   if (options.executionStrategy == D2MExecutionStrategy::Spatial) {
-    pm.addPass(d2m::createD2MSpatialPlanning());
-    d2m::D2MMaterializeSpatialGroupsOptions groupOptions;
-    groupOptions.excludeCores =
+    SmallVector<int64_t> excludeCores =
         options.spatialExcludeCores.empty()
             ? SmallVector<int64_t>{2, 2}
             : llvm::to_vector(options.spatialExcludeCores);
+    d2m::D2MSpatialPlanningOptions planningOptions;
+    {
+      planningOptions.policy = "greedy";
+      planningOptions.excludeCores = excludeCores;
+      planningOptions.skipGenerics =
+          llvm::to_vector(options.spatialSkipGenerics);
+      planningOptions.remarks = options.spatialRemarks;
+      planningOptions.ttnnMode = options.ttnnMode;
+    }
+    pm.addPass(d2m::createD2MSpatialPlanning(planningOptions));
+    d2m::D2MMaterializeSpatialGroupsOptions groupOptions;
+    groupOptions.excludeCores = excludeCores;
     pm.addPass(d2m::createD2MMaterializeSpatialGroups(groupOptions));
   }
   pm.addPass(d2m::createD2MGridSelection(gridOptOptions));
