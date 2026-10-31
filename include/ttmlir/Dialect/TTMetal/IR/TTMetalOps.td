@@ -25,13 +25,19 @@ def TTMetal_EnqueueProgramOp : TTMetal_Op<"enqueue_program", [MemoryEffects<[Mem
     let summary = "Enqueue program op.";
     let description = [{
       Enqueue program operation
+
+      `cb_core_ranges`, when present, holds one core range per entry of `cbs`:
+      the cores that circular buffer is created on. When absent, each circular
+      buffer is created on the core range of its buffer's circular buffer
+      config.
     }];
 
     let arguments = (ins Variadic<AnyType>:$args,
                          Variadic<AnyNon0RankedMemRef>:$cbs,
                          DenseI64ArrayAttr:$cb_ports,
                          TTMetal_KernelConfigArrayAttr:$kernelConfigs,
-                         OptionalAttr<TTCore_FabricConnectionConfigArrayAttr>:$fabricConnectionConfigs);
+                         OptionalAttr<TTCore_FabricConnectionConfigArrayAttr>:$fabricConnectionConfigs,
+                         OptionalAttr<TTMetal_CoreRangeArrayAttr>:$cb_core_ranges);
     let hasVerifier = 1;
 }
 

@@ -94,6 +94,9 @@ union ArgRef {
 table CBRef {
   port: uint32;
   buffer_ref: BufferRef;
+  // Cores this CB is created on. When absent, the runtime uses the
+  // core_range_set of the buffer's circular_buffer_config.
+  core_range_set: [Dim2dRange];
 }
 
 table MeshDesc {
