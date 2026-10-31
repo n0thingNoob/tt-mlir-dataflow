@@ -1526,13 +1526,21 @@ def D2MMaterializeSpatialStreams : Pass<"d2m-materialize-spatial-streams", "::ml
 
     An edge that can stream and is supported so far gets its ring. Supported:
     producer core k feeds consumer core k (equal grids, whose virtual grids
-    are shifted copies of their cores), and no fan-out; the producer may write
-    the edge inside a reduction loop. The edge buffer is replaced by a
-    `memref.alloc` of `depth` blocks per consumer core with the consumer's
-    virtual grid mapping and `d2m.stream_ring`, so d2m-allocate places it in
-    the consumers' L1, and both accesses read and write views of it in which a
-    block coordinate selects the core (coordinate / blocks per core) and the
-    slot (ordinal on that core mod depth).
+    are shifted copies of their cores); the producer may write the edge
+    inside a reduction loop, and one output may feed several consumer regions
+    (fan-out). Every consumer region gets a `memref.alloc` of `depth` blocks
+    per core with its virtual grid mapping and `d2m.stream_ring` (naming the
+    edge), so d2m-allocate places it in that region's L1. The producer's
+    access becomes a view of the first ring, each consumer's a view of its
+    own, in which a block coordinate selects the core (coordinate / blocks per
+    core) and the slot (ordinal on that core mod depth).
+
+    Before building rings it drops groups that could deadlock, keeping these
+    sufficient conditions: the streaming edges, undirected over the regions,
+    form a forest, no whole-tensor edge joins two regions of one streaming
+    tree, and the whole-tensor edges between trees form a DAG. Groups are taken
+    in order and one that would break a condition keeps the whole-tensor
+    handoff, with a remark.
     The producer then writes into the consumer's L1. Other edges that can
     stream keep the whole-tensor handoff for now, with a remark.
     d2m-lower-spatial-edges adds the per-block synchronization.
@@ -1571,8 +1579,11 @@ def D2MLowerSpatialEdges : Pass<"d2m-lower-spatial-edges", "::mlir::ModuleOp"> {
     signals core k of the other region (its core index plus the constant
     offset between the two grids). A producer that writes the edge inside a
     reduction loop writes the ring and signals only in the last iteration of
-    those loops; the other iterations yield a null transaction. A streaming
-    edge without a ring gets the whole-tensor handoff and a remark.
+    those loops; the other iterations yield a null transaction. With fan-out
+    to K consumer regions, the producer writes every block into each
+    region's ring (copies of its write, moved to that region's cores), waits
+    for K credits per block and signals every region. A streaming edge
+    without a ring gets the whole-tensor handoff and a remark.
 
     Lowered edges are removed from `edges`; the attribute is dropped once
     empty. With `ttnn-mode` the pass does nothing (the TTNN lowering does not

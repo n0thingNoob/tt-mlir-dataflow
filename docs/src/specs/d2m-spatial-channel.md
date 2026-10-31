@@ -4,8 +4,9 @@ Status: PR1 (IR representation), PR2a (synchronization and TTMetal lowering),
 PR2b (multi-core regions: GridSelection lays out both ends of an edge alike)
 and edge fan-out with multicast signalling implemented. Streaming edges
 (§2.6): the IR, its verifier rules, the option that asks for them, the
-analysis that decides which can stream, and the lowering between equal
-grids, core k to core k, including reduction producers, are in.
+analysis that decides which can stream, a deadlock check, and the lowering
+between equal grids, core k to core k, including reduction producers and
+fan-out, are in.
 
 ## 1. Problem and scope
 
@@ -238,17 +239,24 @@ An edge may ask for a second handoff protocol:
   edge keeps the whole-tensor handoff, with a remark giving the reason; the
   whole-tensor handoff is correct for any edge.
 - Lowered so far when producer core k feeds consumer core k (equal grids,
-  shifted copies of their cores) and there is no fan-out: the edge buffer
-  becomes a ring of `depth` blocks in every consumer core's L1
-  (`memref.alloc` with the consumer's virtual grid mapping and
-  `d2m.stream_ring`), which the producer writes remotely. A reduction
+  shifted copies of their cores): the edge buffer becomes a ring of `depth`
+  blocks in every consumer core's L1 (`memref.alloc` with the consumer's
+  virtual grid mapping and `d2m.stream_ring`), which the producer writes
+  remotely. With fan-out each consumer region has its own ring and the
+  producer writes every block into each of them; it reuses a slot once all
+  consumer regions returned their credits. A reduction
   producer writes the ring only in the last iteration of its reduction loops.
   `block = RxC` makes d2m-reblock-generics block both ends by R x C tiles. The GenericOp verifier accepts such a ring as an L1
   output on other cores than the generic's. d2m-lower-spatial-edges then
   synchronizes every block with one local semaphore, a HEAD count on the
   consumer core and a CREDIT count on the producer core (see the pass
-  description). Fan-out and other core pairings keep the whole-tensor handoff
-  for now.
+  description). Other core pairings keep the whole-tensor handoff for now.
+- Deadlock: rings are bounded, so streaming edges are kept only while they
+  form a forest over the regions, no whole-tensor edge joins two regions of
+  one streaming tree, and whole-tensor edges between trees form a DAG
+  (sufficient conditions; a tree of bounded rings always drains, and a
+  whole-tensor consumer starts only after its producer ended). An edge that
+  would break them keeps the whole-tensor handoff, with a remark.
 
 ## 3. Relation to existing code
 

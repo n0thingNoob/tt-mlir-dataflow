@@ -15,7 +15,7 @@
 // CHECK: remark: edge 0:0 -> 1:0 can stream: 4 core pairs, 2 blocks of 1x1 tiles each, in the producer's order
 // CHECK: remark: edge 0:0 -> 1:0 streams through a ring of 2 blocks of 1x1 tiles in the L1 of each of the 4 consumer cores, from (0, 3)
 // CHECK-LABEL: IR Dump After D2MMaterializeSpatialStreams
-// CHECK: memref.alloc() {d2m.stream_ring, {{.*}}} : memref<2x2x2x1x!ttcore.tile<32x32, bf16>
+// CHECK: memref.alloc() {d2m.stream_ring = array<i64: 0, 0, 1, 0>, {{.*}}} : memref<2x2x2x1x!ttcore.tile<32x32, bf16>
 
 // The matmul's writer writes the ring only in the last k iteration; earlier
 // iterations yield a null transaction. Core k signals core k + (0, 3), and

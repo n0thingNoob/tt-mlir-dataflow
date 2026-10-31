@@ -315,6 +315,13 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
         spatialEdgeBuffers.insert(spatialOp.getEdgeBuffer(edge));
       }
     });
+    // A streaming edge with fan-out has one ring per consumer region; only the
+    // first is the producer's output (getEdgeBuffer), so mark them all.
+    moduleOp.walk([&](memref::AllocOp allocOp) {
+      if (allocOp->hasAttr(d2m::utils::kStreamRingAttr)) {
+        spatialEdgeBuffers.insert(allocOp.getResult());
+      }
+    });
 
     memSpaces = [this, moduleOp]() {
       ttcore::SystemDescAttr systemDesc =
