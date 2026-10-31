@@ -246,7 +246,11 @@ An edge may ask for a second handoff protocol:
   producer writes every block into each of them; it reuses a slot once all
   consumer regions returned their credits. A reduction
   producer writes the ring only in the last iteration of its reduction loops.
-  `block = RxC` makes d2m-reblock-generics block both ends by R x C tiles. The GenericOp verifier accepts such a ring as an L1
+  `block = RxC` makes d2m-reblock-generics block both ends by R x C tiles.
+  A load region (`spatial-loads`) whose copy streams is built to walk its
+  blocks in its consumer's order and takes its consumer's blocks, so it
+  copies the weight block by block instead of holding it whole in L1; the
+  design V2 at its main shape needs this to fit. The GenericOp verifier accepts such a ring as an L1
   output on other cores than the generic's. d2m-lower-spatial-edges then
   synchronizes every block with one local semaphore, a HEAD count on the
   consumer core and a CREDIT count on the producer core (see the pass

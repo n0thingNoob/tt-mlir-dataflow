@@ -56,8 +56,10 @@ def D2MSpatialPlanning : Pass<"d2m-spatial-planning", "::mlir::ModuleOp"> {
     per input of a grouped generic: the edge that input becomes gets
     `stream<depth = depth>` (d2m-materialize-spatial-groups reads the
     `d2m.spatial_streams` attribute this sets). Load copies keep the index of
-    the input they replace. `stream-block` (R, C) adds `block = RxC` to all of
-    them.
+    the input they replace, and a load whose copies stream iterates its
+    blocks in the order its consumers read them (its outer loop is the copy
+    dim the consumer's loops vary slowest). `stream-block` (R, C) adds
+    `block = RxC` to all of them.
   }];
   let options = [
     Option<"policy", "policy", "std::string", /*default=*/"\"none\"",
@@ -726,7 +728,10 @@ def D2MReblockGenerics : Pass<"d2m-reblock-generics", "::mlir::ModuleOp"> {
 
     In a d2m.spatial, a streaming edge with `block = RxC` sets the factors of
     the loop dims that index the edge at either end to (shard extent / block
-    extent), so both ends move blocks of R x C tiles per core.
+    extent), so both ends move blocks of R x C tiles per core. A
+    data-movement generic (such as a load region) that produces a streaming
+    edge without `block` takes its consumer's blocks instead. Generics with
+    several outputs (only data-movement ones) get one return view per output.
   }];
   let dependentDialects = [
     "::mlir::tt::d2m::D2MDialect",

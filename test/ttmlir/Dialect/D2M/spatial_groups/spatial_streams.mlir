@@ -24,12 +24,12 @@
 
 // BLOCK: d2m.spatial {edges = [#d2m.spatial_edge<0:0 -> 2:0, stream<depth = 2, block = 1x4>>, #d2m.spatial_edge<1:0 -> 2:1, stream<depth = 2, block = 1x4>>, #d2m.spatial_edge<2:0 -> 3:0>]
 
-// The load regions copy each weight with one remote_load of the whole shard,
-// while the matmuls read it in two K blocks, so d2m-materialize-spatial-streams
-// keeps both load edges as whole-tensor handoffs (spatial_streams_analysis_*.mlir
-// covers edges that can stream).
-// REMARK: remark: edge 0:0 -> 1:0 stays a whole-tensor handoff: consumer core (0, 0) reads 2 blocks but the producer writes 1; a ring would need 1 of 1 blocks
-// REMARK: remark: edge 0:1 -> 2:0 stays a whole-tensor handoff: consumer core (0, 0) reads 2 blocks but the producer writes 1; a ring would need 1 of 1 blocks
+// The matmuls read each weight in two K blocks of 4x8 tiles. The load region
+// whose copies stream takes those blocks (d2m-reblock-generics) in the
+// matmuls' order, so both load edges stream (spatial_streams_load.mlir checks
+// the load itself).
+// REMARK: remark: edge 0:0 -> 1:0 streams through a ring of 2 blocks of 4x8 tiles in the L1 of consumer core (0, 0)
+// REMARK: remark: edge 0:1 -> 2:0 streams through a ring of 2 blocks of 4x8 tiles in the L1 of consumer core (0, 1)
 // REMARK-NOT: asks for a streaming handoff
 
 // ERR-COUNT: error: streams takes (generic, operand, depth) per input, got 2 values

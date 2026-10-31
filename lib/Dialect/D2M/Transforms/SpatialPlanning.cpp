@@ -21,6 +21,7 @@
 
 #include <functional>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <string>
 
@@ -674,6 +675,60 @@ LogicalResult D2MSpatialPlanningPass::applyGivenStreams(ModuleOp module) {
   return success();
 }
 
+// The iteration order for a load whose inputs `inputs` the consumers read
+// as streams (an input named in the consumer's d2m.spatial_streams): the
+// copy's dims, slowest-varying in the consumer's loops first, as the load's
+// indexing map (copy dim r = load loop position). nullopt when no input
+// streams, when the streaming consumers disagree, or when the order is the
+// identity.
+static std::optional<AffineMap>
+streamedLoadOrder(ArrayRef<OpOperand *> inputs) {
+  std::optional<SmallVector<unsigned>> order;
+  for (OpOperand *input : inputs) {
+    auto consumer = mlir::cast<GenericOp>(input->getOwner());
+    auto streams =
+        consumer->getAttrOfType<DenseI64ArrayAttr>(kSpatialStreamsAttr);
+    if (!streams) {
+      continue;
+    }
+    bool streamed = false;
+    ArrayRef<int64_t> list = streams.asArrayRef();
+    for (size_t i = 0; i + 3 < list.size(); i += 4) {
+      streamed |= list[i] == input->getOperandNumber();
+    }
+    if (!streamed) {
+      continue;
+    }
+    AffineMap map = consumer.getIndexingMap(input->getOperandNumber());
+    SmallVector<unsigned> results(map.getNumResults());
+    std::iota(results.begin(), results.end(), 0u);
+    for (AffineExpr expr : map.getResults()) {
+      if (!mlir::isa<AffineDimExpr>(expr)) {
+        return std::nullopt;
+      }
+    }
+    llvm::stable_sort(results, [&](unsigned a, unsigned b) {
+      return mlir::cast<AffineDimExpr>(map.getResult(a)).getPosition() <
+             mlir::cast<AffineDimExpr>(map.getResult(b)).getPosition();
+    });
+    if (order && *order != results) {
+      return std::nullopt;
+    }
+    order = results;
+  }
+  if (!order || llvm::is_sorted(*order)) {
+    return std::nullopt;
+  }
+  // Load loop position p walks copy dim order[p]: copy dim r is load dim
+  // (position of r in order).
+  MLIRContext *ctx = inputs.front()->getOwner()->getContext();
+  SmallVector<AffineExpr> exprs(order->size());
+  for (auto [position, dim] : llvm::enumerate(*order)) {
+    exprs[dim] = getAffineDimExpr(position, ctx);
+  }
+  return AffineMap::get(order->size(), 0, exprs, ctx);
+}
+
 LogicalResult D2MSpatialPlanningPass::insertGivenLoads(ModuleOp module) {
   if (loads.empty()) {
     return success();
@@ -797,29 +852,50 @@ LogicalResult D2MSpatialPlanningPass::insertGivenLoads(ModuleOp module) {
       outputs.push_back(builder.create<EmptyOp>(
           loc, type.getShape(), type.getElementType(), l1Layout));
     }
-    // The same shape as the data-movement generics LowerToLayout builds:
-    // each output shard is a remote_load of the input's shard, stored back.
-    auto load = builder.create<GenericOp>(
-        loc, sources.getArrayRef(), outputs, /*additionalArgs=*/ValueRange(),
-        [&](OpBuilder &b, Location bodyLoc, ValueRange shards) {
-          SmallVector<Value> stored;
-          for (auto [i, source] : llvm::enumerate(sources)) {
-            auto shardType = mlir::cast<RankedTensorType>(shards[i].getType());
-            SmallVector<Value> indices = d2m::utils::buildGridIndices(
-                b, bodyLoc, b.getMultiDimIdentityMap(shardType.getRank()));
-            Value buffer = b.create<tensor::EmptyOp>(
-                bodyLoc, shardType.getShape(), shardType.getElementType());
-            Value data = b.create<RemoteLoadOp>(bodyLoc, shardType, buffer,
-                                                source, indices)
-                             .getResult();
-            stored.push_back(b.create<RemoteStoreOp>(bodyLoc,
-                                                     outputs[i].getType(),
-                                                     outputs[i], indices, data)
-                                 .getResult());
-          }
-          b.create<YieldOp>(bodyLoc, stored);
-        },
-        ThreadType::Unified);
+    // A load whose copies stream to their consumers (d2m.spatial_streams on
+    // the consumer, set by `streams`) walks its blocks in the order the
+    // consumers read them, so that the copy streams (d2m-reblock-generics
+    // gives it the consumers' blocks): its outer loop is the copy's dim that
+    // the consumer's loops vary slowest. Otherwise it keeps the identity
+    // order.
+    std::optional<AffineMap> streamOrder = streamedLoadOrder(inputs);
+    auto body = [&](OpBuilder &b, Location bodyLoc, ValueRange shards) {
+      SmallVector<Value> stored;
+      for (auto [i, source] : llvm::enumerate(sources)) {
+        auto shardType = mlir::cast<RankedTensorType>(shards[i].getType());
+        SmallVector<Value> indices = d2m::utils::buildGridIndices(
+            b, bodyLoc,
+            streamOrder ? *streamOrder
+                        : b.getMultiDimIdentityMap(shardType.getRank()));
+        Value buffer = b.create<tensor::EmptyOp>(bodyLoc, shardType.getShape(),
+                                                 shardType.getElementType());
+        Value data =
+            b.create<RemoteLoadOp>(bodyLoc, shardType, buffer, source, indices)
+                .getResult();
+        stored.push_back(b.create<RemoteStoreOp>(bodyLoc, outputs[i].getType(),
+                                                 outputs[i], indices, data)
+                             .getResult());
+      }
+      b.create<YieldOp>(bodyLoc, stored);
+    };
+    GenericOp load;
+    if (streamOrder) {
+      SmallVector<Attribute> maps(2 * sources.size(),
+                                  AffineMapAttr::get(*streamOrder));
+      SmallVector<Attribute> iterators(
+          streamOrder->getNumDims(),
+          ttcore::IteratorTypeAttr::get(ctx, ttcore::IteratorType::Parallel));
+      load = builder.create<GenericOp>(
+          loc, sources.getArrayRef(), outputs, /*additionalArgs=*/ValueRange(),
+          builder.getArrayAttr(maps), builder.getArrayAttr(iterators), body,
+          ThreadType::Unified);
+    } else {
+      // The same shape as the data-movement generics LowerToLayout builds:
+      // each output shard is a remote_load of the input's shard, stored back.
+      load = builder.create<GenericOp>(loc, sources.getArrayRef(), outputs,
+                                       /*additionalArgs=*/ValueRange(), body,
+                                       ThreadType::Unified);
+    }
     load->setAttr(kSpatialGroupAttr, group);
     load->setAttr(kSpatialRangeAttr, range);
     if (remarks) {

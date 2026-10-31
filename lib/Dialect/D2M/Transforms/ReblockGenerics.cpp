@@ -9,6 +9,7 @@
 #include "ttmlir/Dialect/TTCore/IR/TTCore.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/PatternMatch.h"
 #include "llvm/ADT/StringSwitch.h"
@@ -127,14 +128,23 @@ class D2MReblockGenerics final
     funcOp.getBody().front().walk(
         [&](GenericOp genericOp) { genericOps.push_back(genericOp); });
 
-    for (GenericOp oldGenericOp : genericOps) {
+    // The factors of every generic first, so that a load can follow its
+    // consumers' blocks (alignLoadsToStreams).
+    llvm::DenseMap<Operation *, SmallVector<int64_t>> factorsOf;
+    for (GenericOp generic : genericOps) {
       const BlockFactorAnalysis::Result *bfResult =
-          blockFactorAnalysis.lookup(oldGenericOp);
+          blockFactorAnalysis.lookup(generic);
+      SmallVector<int64_t> factors = bfResult ? bfResult->reblockedFactors
+                                              : generic.getBlockFactorsValue();
+      applyStreamBlockHints(generic, factors);
+      factorsOf[generic] = factors;
+    }
+    alignLoadsToStreams(genericOps, factorsOf);
+
+    for (GenericOp oldGenericOp : genericOps) {
       SmallVector<int64_t> oldBlockFactors =
           oldGenericOp.getBlockFactorsValue();
-      SmallVector<int64_t> factors =
-          bfResult ? bfResult->reblockedFactors : oldBlockFactors;
-      applyStreamBlockHints(oldGenericOp, factors);
+      SmallVector<int64_t> factors = factorsOf.lookup(oldGenericOp);
       if (factors.empty() || oldBlockFactors == factors) {
         continue;
       }
@@ -149,35 +159,136 @@ class D2MReblockGenerics final
         return failure();
       }
 
-      TT_assertv(oldGenericOp.getOutputs().size() == 1u,
-                 "reblocking expects a single output operand");
-      Operation *sequenceAnchor = reblocked->returnView.getOperation();
-      Value newOutput = reblocked->returnView.getResult();
-
       if (oldGenericOp.getNumResults() > 0) {
-        TT_assert(oldGenericOp.getNumResults() == 1u);
-        oldGenericOp.getResult(0).replaceAllUsesWith(newOutput);
-      } else {
-        auto getContainingOpInBlock = [&](Operation *op) -> Operation * {
-          Operation *current = op;
-          while (current && current->getBlock() != sequenceAnchor->getBlock()) {
-            current = current->getParentOp();
-          }
-          return current;
-        };
-        oldGenericOp.getOutputs().front().replaceUsesWithIf(
-            newOutput, [&](OpOperand &use) {
-              Operation *ownerInBlock = getContainingOpInBlock(use.getOwner());
-              return ownerInBlock &&
-                     ownerInBlock != oldGenericOp.getOperation() &&
-                     sequenceAnchor->isBeforeInBlock(ownerInBlock);
-            });
+        TT_assertv(oldGenericOp.getOutputs().size() == 1u,
+                   "reblocking a generic with results expects a single "
+                   "output operand");
+        oldGenericOp.getResult(0).replaceAllUsesWith(
+            reblocked->returnView.getResult());
+        rewriter.eraseOp(oldGenericOp);
+        continue;
+      }
+      // Buffer form: every output gets a view of the reblocked output back to
+      // its old type, and the uses after the generic read that view. (Only a
+      // data-movement load has more than one output.)
+      Operation *sequenceAnchor = reblocked->returnView.getOperation();
+      auto getContainingOpInBlock = [&](Operation *op) -> Operation * {
+        Operation *current = op;
+        while (current && current->getBlock() != sequenceAnchor->getBlock()) {
+          current = current->getParentOp();
+        }
+        return current;
+      };
+      for (auto [index, oldOutput] :
+           llvm::enumerate(oldGenericOp.getOutputs())) {
+        Value newOutput = reblocked->returnView.getResult();
+        if (index > 0) {
+          rewriter.setInsertionPointAfter(sequenceAnchor);
+          auto view = rewriter.create<ViewLayoutOp>(
+              oldGenericOp.getLoc(), oldOutput.getType(),
+              reblocked->genericOp.getOutputs()[index]);
+          sequenceAnchor = view;
+          newOutput = view.getResult();
+        }
+        oldOutput.replaceUsesWithIf(newOutput, [&](OpOperand &use) {
+          Operation *ownerInBlock = getContainingOpInBlock(use.getOwner());
+          return ownerInBlock && ownerInBlock != oldGenericOp.getOperation() &&
+                 sequenceAnchor->isBeforeInBlock(ownerInBlock);
+        });
       }
 
       rewriter.eraseOp(oldGenericOp);
     }
 
     return success();
+  }
+
+  // A data-movement generic (only remote loads and stores, such as a
+  // spatial-loads load region) that produces a streaming edge without a
+  // `block` hint takes the blocks its consumer reads: along each copy dim,
+  // (its shard extent / the consumer's block extent).
+  void alignLoadsToStreams(
+      ArrayRef<GenericOp> generics,
+      llvm::DenseMap<Operation *, SmallVector<int64_t>> &factorsOf) {
+    for (GenericOp producer : generics) {
+      auto spatial =
+          mlir::dyn_cast_if_present<SpatialOp>(producer->getParentOp());
+      if (!spatial || !spatial.getEdgesAttr() ||
+          !isDataMovementOnly(producer)) {
+        continue;
+      }
+      unsigned region = producer->getParentRegion()->getRegionNumber();
+      SmallVector<int64_t> &factors = factorsOf[producer];
+      for (auto edge : spatial.getEdgesAttr().getAsRange<SpatialEdgeAttr>()) {
+        if (edge.getProducerRegion() != region || !edge.isStream() ||
+            !edge.getStreamBlock().empty()) {
+          continue;
+        }
+        GenericOp consumer = *spatial.getRegion(edge.getConsumerRegion())
+                                  .getOps<GenericOp>()
+                                  .begin();
+        Value buffer = spatial.getEdgeBuffer(edge);
+        OpOperand *read = nullptr;
+        for (OpOperand &operand : consumer->getOpOperands()) {
+          if (consumer.isDpsInput(&operand) &&
+              SpatialOp::stripViews(operand.get()) == buffer) {
+            read = &operand;
+          }
+        }
+        OpOperand &written =
+            producer.getDpsInitsMutable()[edge.getProducerOutput()];
+        if (!read || !factorsOf.contains(consumer)) {
+          continue;
+        }
+        auto readType = mlir::dyn_cast<MemRefType>(read->get().getType());
+        auto writtenType = mlir::dyn_cast<MemRefType>(written.get().getType());
+        AffineMap readMap = consumer.getIndexingMap(read->getOperandNumber());
+        AffineMap writtenMap =
+            producer.getIndexingMap(written.getOperandNumber());
+        if (!readType || !writtenType || readType.getRank() != 4 ||
+            writtenType.getRank() != 4 || readMap.getNumResults() != 2 ||
+            writtenMap.getNumResults() != 2) {
+          continue;
+        }
+        ArrayRef<int64_t> consumerFactors = factorsOf[consumer];
+        SmallVector<int64_t> aligned = factors;
+        bool fits = true;
+        for (unsigned r = 0; r < 2; ++r) {
+          auto readDim = mlir::dyn_cast<AffineDimExpr>(readMap.getResult(r));
+          auto writtenDim =
+              mlir::dyn_cast<AffineDimExpr>(writtenMap.getResult(r));
+          if (!readDim || !writtenDim) {
+            fits = false;
+            break;
+          }
+          int64_t readShard = readType.getShape()[2 + r];
+          int64_t writtenShard = writtenType.getShape()[2 + r];
+          int64_t blocks = consumerFactors[readDim.getPosition()];
+          if (blocks <= 0 || readShard % blocks != 0 ||
+              writtenShard % (readShard / blocks) != 0) {
+            fits = false;
+            break;
+          }
+          aligned[writtenDim.getPosition()] =
+              writtenShard / (readShard / blocks);
+        }
+        if (fits) {
+          factors = aligned;
+        }
+      }
+    }
+  }
+
+  static bool isDataMovementOnly(GenericOp generic) {
+    bool computes = false;
+    generic->walk([&](Operation *op) {
+      if (op != generic.getOperation() &&
+          (mlir::isa<linalg::GenericOp>(op) ||
+           op->getName().getStringRef().starts_with("d2m.tile_"))) {
+        computes = true;
+      }
+    });
+    return !computes;
   }
 };
 
