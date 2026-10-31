@@ -49,6 +49,11 @@ struct D2MPipelineOptions : public PassPipelineOptions<D2MPipelineOptions> {
       llvm::cl::desc("Spatial groups given by hand: (group, generic, y0, x0, "
                      "y1, x1) per generic, generic indices as in "
                      "spatial-skip-generics.")};
+  ListOption<int64_t> spatialLoads{
+      *this, "spatial-loads",
+      llvm::cl::desc("Load regions given by hand: (generic, operand, y0, x0, "
+                     "y1, x1) per DRAM input of a generic in spatial-groups; "
+                     "inputs on the same cores share one load generic.")};
 
   ListOption<int64_t> spatialSkipGenerics{
       *this, "spatial-skip-generics",

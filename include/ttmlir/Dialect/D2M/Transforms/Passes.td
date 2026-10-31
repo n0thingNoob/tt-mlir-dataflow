@@ -45,6 +45,12 @@ def D2MSpatialPlanning : Pass<"d2m-spatial-planning", "::mlir::ModuleOp"> {
     `groups` sets these attributes by hand before any policy runs, one
     (group, generic, y0, x0, y1, x1) per generic; the planner then numbers its
     own groups after the largest group id already in the module.
+
+    `loads` adds load regions by hand, one (generic, operand, y0, x0, y1, x1)
+    per DRAM input of a grouped generic: a data-movement generic copies the
+    input into L1 on cores (y0, x0)-(y1, x1), in the consumer's group, and the
+    consumer reads that copy (a spatial edge). Inputs given the same cores are
+    copied by one generic.
   }];
   let options = [
     Option<"policy", "policy", "std::string", /*default=*/"\"none\"",
@@ -55,6 +61,8 @@ def D2MSpatialPlanning : Pass<"d2m-spatial-planning", "::mlir::ModuleOp"> {
                "Indices (module order) of generics that must not be grouped.">,
     ListOption<"groups", "groups", "int64_t",
                "Groups given by hand: (group, generic, y0, x0, y1, x1) per generic, generic indices as in skip-generics. Applied with any policy.">,
+    ListOption<"loads", "loads", "int64_t",
+               "Load regions given by hand: (generic, operand, y0, x0, y1, x1) per DRAM input of a grouped generic, generic indices as in groups.">,
     Option<"maxCbs", "max-cbs", "int64_t", /*default=*/"32",
            "CBs available per core.">,
     Option<"maxSemaphores", "max-semaphores", "int64_t", /*default=*/"16",
