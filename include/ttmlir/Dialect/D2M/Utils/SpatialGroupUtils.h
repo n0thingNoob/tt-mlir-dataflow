@@ -17,6 +17,13 @@ namespace mlir::tt::d2m {
 inline constexpr llvm::StringLiteral kSpatialGroupAttr = "d2m.spatial_group";
 inline constexpr llvm::StringLiteral kSpatialRangeAttr = "d2m.spatial_range";
 
+// Inputs of a grouped generic whose edges should stream: a flat i64 array of
+// (operand, depth, block rows, block cols) entries, with block 0x0 when no
+// block is given. Set by d2m-spatial-planning (`streams`), consumed and
+// removed by d2m-materialize-spatial-groups.
+inline constexpr llvm::StringLiteral kSpatialStreamsAttr =
+    "d2m.spatial_streams";
+
 // True when `a` and `b` describe the same tensor apart from where it lives:
 // equal device shape and element type, and layouts that differ at most in
 // memory space and in collapsed_intervals with logical rank <= 2 (where any

@@ -117,16 +117,40 @@ def D2M_SpatialEdgeAttr : AttrDef<D2M_Dialect, "SpatialEdge", [], "::mlir::Attri
     `I` before bufferization) of the d2m.generic in region `P` feeds entry
     block argument `J` of region `C`. The consumer reads the edge only after
     the producer has written the whole tensor.
+
+    `#d2m.spatial_edge<P:I -> C:J, stream<depth = D>>` asks for a streaming
+    handoff instead: the producer pushes the edge block by block into a ring
+    of `D` blocks in the consumer's L1, with credits for back-pressure.
+    `stream<depth = D, block = RxC>` also asks for blocks of R x C tiles per
+    core. A depth of 0 (the default) means the whole-tensor handoff, and the
+    printed form is then the four-field one.
   }];
   let parameters = (ins
     "unsigned":$producerRegion,
     "unsigned":$producerOutput,
     "unsigned":$consumerRegion,
-    "unsigned":$consumerArg
+    "unsigned":$consumerArg,
+    DefaultValuedParameter<"unsigned", "0">:$streamDepth,
+    OptionalArrayRefParameter<"int64_t">:$streamBlock
   );
 
-  let assemblyFormat = [{
-    `<` $producerRegion `` `:` `` $producerOutput `->` $consumerRegion `` `:` `` $consumerArg `>`
+  // Format: `<` P `:` I `->` C `:` J
+  //             (`,` `stream` `<` `depth` `=` D (`,` `block` `=` RxC)? `>`)? `>`.
+  let hasCustomAssemblyFormat = 1;
+  let genVerifyDecl = 1;
+
+  let builders = [
+    AttrBuilder<(ins "unsigned":$producerRegion, "unsigned":$producerOutput,
+                     "unsigned":$consumerRegion, "unsigned":$consumerArg), [{
+      return $_get($_ctxt, producerRegion, producerOutput, consumerRegion,
+                   consumerArg, 0u, ::llvm::ArrayRef<int64_t>());
+    }]>
+  ];
+
+  let extraClassDeclaration = [{
+    // Largest ring depth a streaming edge may ask for.
+    static constexpr unsigned kMaxStreamDepth = 8;
+    bool isStream() const { return getStreamDepth() != 0; }
   }];
 }
 

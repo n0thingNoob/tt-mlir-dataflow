@@ -2352,6 +2352,8 @@ static mlir::LogicalResult verifySpatialEdges(d2m::SpatialOp op) {
   }
   llvm::DenseSet<std::pair<unsigned, unsigned>> seenSinks;
   llvm::DenseSet<std::tuple<unsigned, unsigned, unsigned>> seenSources;
+  llvm::DenseMap<std::pair<unsigned, unsigned>, d2m::SpatialEdgeAttr>
+      protocolOfSource;
   llvm::SmallVector<llvm::SmallVector<unsigned>> successors(numRegions);
   llvm::SmallVector<unsigned> inDegree(numRegions, 0);
   for (d2m::SpatialEdgeAttr edge : edges) {
@@ -2388,6 +2390,15 @@ static mlir::LogicalResult verifySpatialEdges(d2m::SpatialOp op) {
       return op.emitOpError("output ")
              << i << " of region " << p << " feeds region " << c
              << " more than once; reuse one block argument";
+    }
+    // The edges that leave one output share its synchronization, so they all
+    // use one protocol.
+    auto [first, isFirst] = protocolOfSource.try_emplace({p, i}, edge);
+    if (!isFirst && (first->second.getStreamDepth() != edge.getStreamDepth() ||
+                     first->second.getStreamBlock() != edge.getStreamBlock())) {
+      return op.emitOpError("edges ")
+             << first->second << " and " << edge
+             << " leave the same output but use different protocols";
     }
     Value edgeBuffer = producer.getOutputs()[i];
     // After bufferization the producer may write an out through a view

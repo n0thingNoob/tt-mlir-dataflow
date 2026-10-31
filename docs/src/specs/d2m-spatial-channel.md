@@ -2,7 +2,9 @@
 
 Status: PR1 (IR representation), PR2a (synchronization and TTMetal lowering),
 PR2b (multi-core regions: GridSelection lays out both ends of an edge alike)
-and edge fan-out with multicast signalling implemented.
+and edge fan-out with multicast signalling implemented. Streaming edges
+(§2.6): the IR, its verifier rules and the option that asks for them are in;
+their lowering is not, so they still use the whole-tensor handoff.
 
 ## 1. Problem and scope
 
@@ -203,6 +205,35 @@ The source references below are to the LLVM checkout tt-mlir builds against
   num_regions)` in `tools/d2m-jit/_src/builder.py` and
   `tools/builder/d2m/d2m_builder.py` keep working.
 
+### 2.6 Streaming edges (protocol only)
+
+An edge may ask for a second handoff protocol:
+
+```mlir
+#d2m.spatial_edge<0:0 -> 1:0>                                  // whole tensor (default)
+#d2m.spatial_edge<0:0 -> 1:0, stream<depth = 2>>               // stream, ring of 2 blocks
+#d2m.spatial_edge<0:0 -> 1:0, stream<depth = 2, block = 1x1>>  // and blocks of 1x1 tiles per core
+```
+
+- Streaming means the producer pushes the edge block by block into a ring of
+  `depth` blocks in the consumer's L1, and the consumer returns a credit per
+  block. A block is one final write of the producer (after its reduction
+  loop); `block` asks for its shape in tiles per core.
+- The fields live in the edge attribute (`streamDepth`, default 0 = whole
+  tensor; `streamBlock`, default empty). An edge without them prints exactly
+  as before.
+- The edge type does not change: the consumer's block argument is still the
+  producer's whole tensor. The ring is a lowering detail.
+- By hand: `spatial-streams` (pipeline option; `streams` on
+  d2m-spatial-planning) takes (generic, operand, depth) per input of a grouped
+  generic, with the generic numbering of `spatial-groups`;
+  `spatial-stream-block` (R, C) adds `block = RxC` to all of them. Planning
+  records them on the generic (`d2m.spatial_streams`) and
+  d2m-materialize-spatial-groups puts them on the edges that input becomes.
+- Not lowered yet: d2m-lower-spatial-edges gives a streaming edge the
+  whole-tensor handoff of §4 and emits a remark. The whole-tensor handoff is
+  correct for any edge, so a streaming request never changes the result.
+
 ## 3. Relation to existing code
 
 | Code | Change | Why |
@@ -367,6 +398,9 @@ arguments.
 | R8 | A block argument is a ranked tensor, used only inside its region's generic and never as one of its DPS inits | tensor form | use by an op outside the generic; block arg as `outs` |
 | R9 | `spatial_yield` (when present) yields exactly the generic's results in order, if the spatial has edges (in `SpatialYieldOp::verify`) | tensor form | yield in different order |
 | R10 | No region block arguments once the spatial is in buffer form (some `outs` is a memref) | buffer form | memref spatial with a block argument |
+| R11 | All edges that leave one producer output use the same protocol (same `stream` fields): they share its synchronization | always | `spatial_stream_edges_negative.mlir`: a fan-out with one streaming and one whole-tensor edge, and with two blocks |
+| R12 | A stream depth is in [1, 8] (`stream<depth = 0>` does not parse: write the edge without `stream`) | attribute | depth 9, depth 0 |
+| R13 | A stream block is RxC tiles with R, C > 0 | attribute | `block = 1x1x1`, `block = 0x1` |
 
 "Tensor form" means every `outs` is a tensor; otherwise the spatial is in buffer form. After bufferization the block
 arguments are gone, so R3c, R4-missing, R5, R6, R8 and R9 no longer apply (the

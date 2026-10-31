@@ -319,6 +319,15 @@ public:
             edge);
       }
       for (auto &[source, edges] : groups) {
+        // Streaming is not lowered yet: such edges keep the whole-tensor
+        // handoff, which is correct for any edge.
+        for (SpatialEdgeAttr edge : edges) {
+          if (edge.isStream()) {
+            spatial.emitRemark("edge ")
+                << edge << " asks for a streaming handoff, which is not "
+                << "lowered yet; it uses the whole-tensor handoff";
+          }
+        }
         if (failed(lowerEdgeGroup(spatial, edges, builder))) {
           return WalkResult::interrupt();
         }
