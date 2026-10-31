@@ -251,6 +251,10 @@ An edge may ask for a second handoff protocol:
   synchronizes every block with one local semaphore, a HEAD count on the
   consumer core and a CREDIT count on the producer core (see the pass
   description). Other core pairings keep the whole-tensor handoff for now.
+- Joins need nothing more: each streaming in-edge of a region has its own
+  ring and its own semaphore, so a region that reads several streams waits
+  for and returns each one separately (the design V1 dataflow runs with 36
+  streaming edges, among them the 12 into its hub).
 - Deadlock: rings are bounded, so streaming edges are kept only while they
   form a forest over the regions, no whole-tensor edge joins two regions of
   one streaming tree, and whole-tensor edges between trees form a DAG
