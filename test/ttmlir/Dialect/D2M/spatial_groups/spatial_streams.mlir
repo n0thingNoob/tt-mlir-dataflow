@@ -16,9 +16,7 @@
 // on (0,3). spatial-streams names (generic, operand, depth): the weights that
 // the load regions copy (input 1 of #0 and #1; the copy keeps the input
 // index) and g, u into #2 (inputs 0 and 1). The other edges (h into down, Wd
-// into down) stay whole-tensor handoffs. The edges are not lowered as
-// streams yet: d2m-lower-spatial-edges keeps the whole-tensor handoff and
-// says so.
+// into down) stay whole-tensor handoffs.
 
 // CHECK-LABEL: IR Dump After D2MMaterializeSpatialGroups
 // CHECK: d2m.spatial {edges = [#d2m.spatial_edge<0:0 -> 1:0, stream<depth = 2>>, #d2m.spatial_edge<0:1 -> 2:0, stream<depth = 2>>, #d2m.spatial_edge<1:0 -> 3:0, stream<depth = 1>>, #d2m.spatial_edge<2:0 -> 3:1, stream<depth = 1>>, #d2m.spatial_edge<3:0 -> 5:0>, #d2m.spatial_edge<4:0 -> 5:1>]
@@ -26,7 +24,13 @@
 
 // BLOCK: d2m.spatial {edges = [#d2m.spatial_edge<0:0 -> 2:0, stream<depth = 2, block = 1x4>>, #d2m.spatial_edge<1:0 -> 2:1, stream<depth = 2, block = 1x4>>, #d2m.spatial_edge<2:0 -> 3:0>]
 
-// REMARK-COUNT-2: remark: edge #d2m.spatial_edge<{{.*}}, stream<depth = 2>> asks for a streaming handoff, which is not lowered yet; it uses the whole-tensor handoff
+// The load regions copy each weight with one remote_load of the whole shard,
+// while the matmuls read it in two K blocks, so d2m-materialize-spatial-streams
+// keeps both load edges as whole-tensor handoffs (spatial_streams_analysis_*.mlir
+// covers edges that can stream).
+// REMARK: remark: edge 0:0 -> 1:0 stays a whole-tensor handoff: consumer core (0, 0) reads 2 blocks but the producer writes 1; a ring would need 1 of 1 blocks
+// REMARK: remark: edge 0:1 -> 2:0 stays a whole-tensor handoff: consumer core (0, 0) reads 2 blocks but the producer writes 1; a ring would need 1 of 1 blocks
+// REMARK-NOT: asks for a streaming handoff
 
 // ERR-COUNT: error: streams takes (generic, operand, depth) per input, got 2 values
 // ERR-INDEX: error: streams names generic #9, but the module has only 4 generics

@@ -188,6 +188,8 @@ void createD2MFrontendPipeline(OpPassManager &pm,
   }
   pm.addPass(d2m::createD2MReblockGenerics(reblockGenericsOptions));
   pm.addPass(d2m::createD2MMaterializeViewReturns());
+  // Block factors are final here: decide which streaming edges can stream.
+  pm.addPass(d2m::createD2MMaterializeSpatialStreams());
 
   // Run right before allocate to mark synchronized buffers
   d2m::D2MMarkSynchronizedBuffersOptions markSyncBuffersOptions;

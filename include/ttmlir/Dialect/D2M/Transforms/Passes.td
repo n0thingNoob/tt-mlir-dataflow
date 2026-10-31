@@ -1494,6 +1494,37 @@ def D2MHoistCBAllocs : Pass<"d2m-hoist-cb-allocs", "::mlir::ModuleOp"> {
   ];
 }
 
+def D2MMaterializeSpatialStreams : Pass<"d2m-materialize-spatial-streams", "::mlir::ModuleOp"> {
+  let summary = "Check which d2m.spatial edges can stream.";
+  let description = [{
+    For every edge with `stream<...>`, decides from the IR whether the
+    producer and consumer agree on a block order. Runs on affine blocked
+    generics after d2m-reblock-generics (block factors are final) and before
+    d2m-allocate.
+
+    Per (producer core, consumer core) pair it enumerates, with the blocking
+    loops' constant bounds and the generics' block factors:
+
+    - the producer's final writes of the edge buffer: each remote_store,
+      keeping only the last iteration of every reduction loop around it (an
+      output block is complete only then);
+    - the consumer's reads: each remote_load;
+
+    as sets of tiles of the edge buffer (through any views). The edge can
+    stream when every consumer core reads exactly one producer core's shard,
+    no other consumer core reads that shard, and it reads the same blocks in
+    the same order as the producer writes them, each block once ("FIFO"),
+    with more than one block per pair.
+
+    Otherwise the edge, and every other edge that leaves the same output, keeps
+    the whole-tensor handoff: its `stream` fields are dropped. A remark says
+    why, or, for an edge that can stream, its blocks. Nothing else changes
+    yet: the ring buffer and the per-block synchronization come later, and
+    d2m-lower-spatial-edges still uses the whole-tensor handoff.
+  }];
+  let dependentDialects = ["::mlir::tt::d2m::D2MDialect"];
+}
+
 def D2MLowerSpatialEdges : Pass<"d2m-lower-spatial-edges", "::mlir::ModuleOp"> {
   let summary = "Synchronize d2m.spatial edges with local semaphores.";
   let description = [{

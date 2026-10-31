@@ -139,4 +139,18 @@ module {
     return
   }
 
+  // semaphore_wait min: wait until the semaphore is at least the value
+  func.func private @wait_min() attributes {d2m.thread = #d2m.thread<datamovement>} {
+    %sem0 = d2m.get_arg(0) : !d2m.local_semaphore
+    %c3 = arith.constant 3 : index
+    d2m.semaphore_wait %sem0, %c3 min : !d2m.local_semaphore
+    // CHECK-LABEL: func.func private @wait_min
+    // CHECK: %[[SEM:[0-9]+]] = ttkernel.get_semaphore
+    // CHECK: %[[PTR:[0-9]+]] = ttkernel.reinterpret_cast(%[[SEM]])
+    // CHECK: %[[VAL:[0-9]+]] = arith.index_cast %c3 : index to i32
+    // CHECK: ttkernel.experimental.semaphore_wait_min(%[[PTR]], %[[VAL]])
+    // CHECK-NOT: ttkernel.noc_semaphore_set
+    return
+  }
+
 }
