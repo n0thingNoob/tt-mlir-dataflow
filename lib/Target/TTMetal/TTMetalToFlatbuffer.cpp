@@ -230,11 +230,14 @@ computeShardPageShapeForDistributionSpec(ArrayRef<int64_t> memrefShardShape,
   return shardShapeInPages;
 }
 
+// `firstBank` is the bank of shard 0 (d2m.dram_bank; shard i is in bank
+// (firstBank + i) mod banks).
 static flatbuffers::Offset<target::metal::ShardedBufferConfig>
 createShardedBufferConfigForDRAMMemref(FlatbufferObjectCache &cache,
                                        MemRefType memref,
                                        ttcore::DeviceAttr device,
-                                       ttcore::SystemDescAttr systemDesc) {
+                                       ttcore::SystemDescAttr systemDesc,
+                                       int64_t firstBank) {
   const bool isTiled = mlir::isa<ttcore::TileType>(memref.getElementType());
 
   // D2M DRAM shard-to-bank placement is cyclic. Use the same page granularity
@@ -275,9 +278,18 @@ createShardedBufferConfigForDRAMMemref(FlatbufferObjectCache &cache,
       systemDesc.getChipDescs().front().getNumDramChannels();
   uint64_t numDRAMBanksUsed = std::min(numDramBanks, gridVolume);
   // Important: the DRAM cores are distributed along the X dim on WH & BH.
-  // CoreRange(Set) is inclusive, but Dim2dRange is exclusive.
+  // Dim2dRange is (origin, size). Banks firstBank.. wrap around the last bank
+  // into a second range.
+  uint64_t rangeStart = static_cast<uint64_t>(firstBank) % numDramBanks;
+  uint64_t firstRangeSize =
+      std::min(numDramBanks - rangeStart, numDRAMBanksUsed);
   std::vector<target::Dim2dRange> coreRangeSet = {target::Dim2dRange(
-      target::Dim2d(0, 0), target::Dim2d(1, numDRAMBanksUsed))};
+      target::Dim2d(0, rangeStart), target::Dim2d(1, firstRangeSize))};
+  if (firstRangeSize < numDRAMBanksUsed) {
+    coreRangeSet.push_back(target::Dim2dRange(
+        target::Dim2d(0, 0),
+        target::Dim2d(1, numDRAMBanksUsed - firstRangeSize)));
+  }
 
   auto shardSpec = target::metal::CreateShardSpecDirect(
       *cache.fbb, &coreRangeSet, &shardShape);
@@ -310,7 +322,7 @@ createShardedBufferConfigForDRAMMemref(FlatbufferObjectCache &cache,
 
   std::vector<target::Dim2d> cores(numDRAMBanksUsed);
   for (uint64_t i = 0; i < numDRAMBanksUsed; i++) {
-    cores[i] = target::Dim2d(0, i);
+    cores[i] = target::Dim2d(0, (rangeStart + i) % numDramBanks);
   }
 
   auto bufferDistributionSpec =
@@ -350,7 +362,7 @@ static bool hasVirtualGridMappingPair(
 static ArrayAttr createVirtualGridBufferDescCacheKey(
     MemRefType memref, ttcore::DeviceAttr device,
     ttcore::SystemDescAttr systemDesc, AffineMap virtualGridInverseMapping,
-    AffineMap virtualGridForwardMapping) {
+    AffineMap virtualGridForwardMapping, int64_t dramBank) {
   SmallVector<Attribute> keyParts = {
       TypeAttr::get(memref),
       device,
@@ -358,6 +370,10 @@ static ArrayAttr createVirtualGridBufferDescCacheKey(
       AffineMapAttr::get(virtualGridInverseMapping),
       AffineMapAttr::get(virtualGridForwardMapping),
   };
+  if (dramBank != 0) {
+    keyParts.push_back(
+        IntegerAttr::get(IntegerType::get(memref.getContext(), 64), dramBank));
+  }
   return ArrayAttr::get(memref.getContext(), keyParts);
 }
 
@@ -523,12 +539,12 @@ memrefTypeToShardedBufferConfigFlatbuffer(
     FlatbufferObjectCache &cache, MemRefType memref, ttcore::DeviceAttr device,
     target::Dim2d elementShape, ttcore::SystemDescAttr systemDesc,
     bool hasVirtualGridMapping,
-    std::optional<AffineMap> virtualGridForwardMapping) {
+    std::optional<AffineMap> virtualGridForwardMapping, int64_t dramBank) {
 
   flatbuffers::Offset<target::metal::ShardedBufferConfig> sharded_buffer_config;
   if (isMemrefDeviceDRAMMemspace(memref)) {
     sharded_buffer_config = createShardedBufferConfigForDRAMMemref(
-        cache, memref, device, systemDesc);
+        cache, memref, device, systemDesc, dramBank);
   } else if (isMemrefDeviceL1Memspace(memref)) {
     sharded_buffer_config = createShardedBufferConfigForL1Memref(
         cache, memref, device, elementShape, systemDesc, hasVirtualGridMapping,
@@ -656,12 +672,11 @@ memrefTypeToCircularBufferConfigFlatbuffer(FlatbufferObjectCache &cache,
       /*page_size=*/pageSize, numBuffers);
 }
 
-static flatbuffers::Offset<target::metal::BufferDesc>
-memrefTypeToFlatbuffer(FlatbufferObjectCache &cache, MemRefType memref,
-                       ttcore::DeviceAttr device,
-                       ttcore::SystemDescAttr systemDesc,
-                       std::optional<AffineMap> virtualGridInverseMapping,
-                       std::optional<AffineMap> virtualGridForwardMapping) {
+static flatbuffers::Offset<target::metal::BufferDesc> memrefTypeToFlatbuffer(
+    FlatbufferObjectCache &cache, MemRefType memref, ttcore::DeviceAttr device,
+    ttcore::SystemDescAttr systemDesc,
+    std::optional<AffineMap> virtualGridInverseMapping,
+    std::optional<AffineMap> virtualGridForwardMapping, int64_t dramBank) {
   const Type elementType = memref.getElementType();
   target::Dim2d elementShape(0, 0);
   ttcore::DataType dtype = ttcore::DataType::Bool;
@@ -699,7 +714,7 @@ memrefTypeToFlatbuffer(FlatbufferObjectCache &cache, MemRefType memref,
       flatbuffers::Offset<target::metal::ShardedBufferConfig>
           shardedBufferConfig = memrefTypeToShardedBufferConfigFlatbuffer(
               cache, memref, device, elementShape, systemDesc,
-              hasVirtualGridMapping, virtualGridForwardMapping);
+              hasVirtualGridMapping, virtualGridForwardMapping, dramBank);
 
       // Only generate CircularBufferConfig for L1 memspace.
       flatbuffers::Offset<target::metal::CircularBufferConfig>
@@ -767,10 +782,23 @@ virtualGridMemrefTypeToFlatbuffer(
     FlatbufferObjectCache &cache, ArrayAttr /*cacheKey*/, MemRefType memref,
     ttcore::DeviceAttr device, ttcore::SystemDescAttr systemDesc,
     std::optional<AffineMap> virtualGridInverseMapping,
-    std::optional<AffineMap> virtualGridForwardMapping) {
+    std::optional<AffineMap> virtualGridForwardMapping, int64_t dramBank) {
   return memrefTypeToFlatbuffer(cache, memref, device, systemDesc,
                                 virtualGridInverseMapping,
-                                virtualGridForwardMapping);
+                                virtualGridForwardMapping, dramBank);
+}
+
+// A DRAM buffer placed from a bank other than 0 (d2m.dram_bank): cached under
+// its memref type and bank, so it does not share a descriptor with the same
+// type placed elsewhere.
+static flatbuffers::Offset<target::metal::BufferDesc>
+dramBankMemrefTypeToFlatbuffer(FlatbufferObjectCache &cache,
+                               ArrayAttr /*cacheKey*/, MemRefType memref,
+                               ttcore::DeviceAttr device,
+                               ttcore::SystemDescAttr systemDesc,
+                               int64_t dramBank) {
+  return memrefTypeToFlatbuffer(cache, memref, device, systemDesc, std::nullopt,
+                                std::nullopt, dramBank);
 }
 
 static flatbuffers::Offset<target::metal::BufferRef>
@@ -804,7 +832,12 @@ bufferValueToFlatbuffer(FlatbufferObjectCache &cache, Value value,
 
   std::optional<AffineMap> virtualGridInverseMapping;
   std::optional<AffineMap> virtualGridForwardMapping;
+  int64_t dramBank = 0;
   if (auto createBufferOp = value.getDefiningOp<ttmetal::CreateBufferOp>()) {
+    if (auto bank = createBufferOp->getAttrOfType<IntegerAttr>(
+            d2m::utils::kDramBankAttr)) {
+      dramBank = bank.getInt();
+    }
     if (auto mapAttr = createBufferOp.getVirtualGridInverseMappingAttr()) {
       virtualGridInverseMapping = mapAttr.getValue();
     }
@@ -835,14 +868,21 @@ bufferValueToFlatbuffer(FlatbufferObjectCache &cache, Value value,
   if (hasVirtualGridMapping) {
     ArrayAttr cacheKey = createVirtualGridBufferDescCacheKey(
         memrefType, device, systemDesc, *virtualGridInverseMapping,
-        *virtualGridForwardMapping);
-    bufferDesc = cache.getOrCreate(
-        cacheKey, virtualGridMemrefTypeToFlatbuffer, memrefType, device,
-        systemDesc, virtualGridInverseMapping, virtualGridForwardMapping);
+        *virtualGridForwardMapping, dramBank);
+    bufferDesc = cache.getOrCreate(cacheKey, virtualGridMemrefTypeToFlatbuffer,
+                                   memrefType, device, systemDesc,
+                                   virtualGridInverseMapping,
+                                   virtualGridForwardMapping, dramBank);
+  } else if (dramBank != 0) {
+    Builder builder(memrefType.getContext());
+    ArrayAttr cacheKey = builder.getArrayAttr(
+        {TypeAttr::get(memrefType), builder.getI64IntegerAttr(dramBank)});
+    bufferDesc = cache.getOrCreate(cacheKey, dramBankMemrefTypeToFlatbuffer,
+                                   memrefType, device, systemDesc, dramBank);
   } else {
     bufferDesc = cache.getOrCreate(memrefType, memrefTypeToFlatbuffer, device,
                                    systemDesc, virtualGridInverseMapping,
-                                   virtualGridForwardMapping);
+                                   virtualGridForwardMapping, dramBank);
   }
   return target::metal::CreateBufferRef(*cache.fbb, cache.nextGlobalId(),
                                         address, bufferDesc);

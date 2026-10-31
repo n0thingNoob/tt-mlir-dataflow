@@ -215,6 +215,7 @@ optimizeToLayoutGrid(d2m::ToLayoutOp toLayoutOp, ArrayRef<int64_t> targetGrid,
   auto newEmptyOp = builder.create<d2m::EmptyOp>(
       emptyOp.getLoc(), newTensorType, virtualGridInverseMapping,
       virtualGridForwardMapping);
+  utils::copyDramBank(emptyOp, newEmptyOp);
 
   builder.setInsertionPoint(toLayoutOp);
   auto newToLayoutOp = builder.create<d2m::ToLayoutOp>(
@@ -473,6 +474,7 @@ static Value rewriteSingleUseCompositeInputProducer(
   auto newEmptyOp = builder.create<d2m::EmptyOp>(emptyOp.getLoc(), newInputType,
                                                  virtualGridInverseMapping,
                                                  virtualGridForwardMapping);
+  utils::copyDramBank(emptyOp, newEmptyOp);
 
   builder.setInsertionPoint(toLayoutOp);
   auto newToLayoutOp = builder.create<d2m::ToLayoutOp>(
@@ -564,6 +566,7 @@ applyEmptyOpUpdate(const OperandGridInfo &info,
   auto newEmptyOp = builder.create<d2m::EmptyOp>(
       emptyOp.getLoc(), newTensorType, virtualGridInverseMapping,
       virtualGridForwardMapping);
+  utils::copyDramBank(emptyOp, newEmptyOp);
   emptyOp.getResult().replaceAllUsesWith(newEmptyOp.getResult());
   emptyOp.erase();
 }

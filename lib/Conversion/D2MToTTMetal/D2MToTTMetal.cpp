@@ -380,9 +380,10 @@ public:
     // Hoisted CB allocs carry CBLayoutAttr (per-core local shape).
     // Keep the original type on CreateBufferOp so the dialect conversion
     // framework doesn't see a type mismatch.
-    rewriter.replaceOpWithNewOp<ttmetal::CreateBufferOp>(
+    auto buffer = rewriter.replaceOpWithNewOp<ttmetal::CreateBufferOp>(
         op, memrefType, address, /*virtualGridInverseMapping=*/vgm,
         /*virtualGridForwardMapping=*/fwd);
+    d2m::utils::copyDramBank(op, buffer);
 
     return success();
   };
