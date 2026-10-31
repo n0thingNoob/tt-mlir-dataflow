@@ -41,8 +41,7 @@ struct D2MPipelineOptions : public PassPipelineOptions<D2MPipelineOptions> {
   ListOption<int64_t> spatialExcludeCores{
       *this, "spatial-exclude-cores",
       llvm::cl::desc("Logical cores (y, x pairs) that no spatial region may "
-                     "contain. Unset means (2, 2), which hangs on the n150 "
-                     "used for validation.")};
+                     "contain. Unset means none.")};
 
   ListOption<int64_t> meshShape{
       *this, "mesh-shape", llvm::cl::desc("Set the multi-device mesh shape.")};

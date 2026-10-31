@@ -123,9 +123,7 @@ void createD2MFrontendPipeline(OpPassManager &pm,
   // splat-fill generics and MaterializeViewReturns adds view copies.
   if (options.executionStrategy == D2MExecutionStrategy::Spatial) {
     SmallVector<int64_t> excludeCores =
-        options.spatialExcludeCores.empty()
-            ? SmallVector<int64_t>{2, 2}
-            : llvm::to_vector(options.spatialExcludeCores);
+        llvm::to_vector(options.spatialExcludeCores);
     d2m::D2MSpatialPlanningOptions planningOptions;
     {
       planningOptions.policy = "greedy";

@@ -195,7 +195,15 @@ LogicalResult D2MMaterializeSpatialGroupsPass::materialize(Group &group,
                << " through ops that cannot be an edge (only to_layout and "
                   "no-op mask are folded)";
       }
-      if (!samePhysicalLayout(src.getType(), operand.get().getType())) {
+      Type dst = operand.get().getType();
+      if (!isL1Layout(src.getType()) ||
+          (!isL1Layout(dst) && !isDRAMLayout(dst))) {
+        return generic.emitOpError("input ")
+               << operand.getOperandNumber() << " reads another member of "
+               << "spatial group " << group.id
+               << " outside L1; an edge buffer must stay in L1";
+      }
+      if (!sameLayoutExceptMemorySpace(src.getType(), dst)) {
         return generic.emitOpError("input ")
                << operand.getOperandNumber()
                << " needs a layout change from its producer in spatial group "
@@ -311,8 +319,9 @@ LogicalResult D2MMaterializeSpatialGroupsPass::materialize(Group &group,
                                              use.producerResult, c,
                                              it->second.getArgNumber()));
       }
-      // Retype a collapsed_intervals-only difference to the producer's type
-      // (R5 needs equal types on both ends).
+      // Retype a collapsed_intervals-only or memory-space-only difference to
+      // the producer's type (R5 needs equal types on both ends): a DRAM
+      // operand then reads the producer's L1 buffer directly.
       Value old = operand.get();
       old.replaceUsesWithIf(it->second, [&](OpOperand &u) {
         return generic->isAncestor(u.getOwner());

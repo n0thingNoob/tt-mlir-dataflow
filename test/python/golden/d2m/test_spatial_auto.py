@@ -54,7 +54,9 @@ def tm(b, x, w, y):
     return b.relu(b.reshape(b.matmul(t, y), [64, 128]))
 
 
-# name -> (input shapes, body, spatials expected in spatial mode)
+# name -> (input shapes, body, spatials expected in spatial mode). The big
+# programs have 8x8 or 4x8 generics in the default flow; they only group at a
+# smaller target, where their eltwise regions are also reblocked.
 PROGRAMS = {
     "mlp": ([(64, 128), (128, 256), (64, 256), (256, 128)], mlp, 1),
     "fanout": ([(64, 64), (64, 64)], fanout, 1),
@@ -64,6 +66,9 @@ PROGRAMS = {
     "decode_glu": ([(32, 256), (256, 512), (256, 512), (512, 256)], decode_glu, 1),
     "attn_odd": ([(50, 64), (64, 50), (50, 64)], attn, 2),
     "tm": ([(64, 128), (128, 128), (64, 64)], tm, 1),
+    "big_fanout": ([(128, 256), (256, 256)], fanout, 1),
+    "big_attn": ([(256, 256), (256, 256), (256, 256)], attn, 1),
+    "big_mlp": ([(256, 256), (256, 512), (256, 512), (512, 256)], mlp, 1),
 }
 
 
@@ -91,11 +96,25 @@ def count_multi_region_programs(ttmetal_mlir: str) -> int:
     return count
 
 
-@pytest.mark.parametrize("program", PROGRAMS.keys())
+# Inputs in DRAM (default-input-memspace=dram): the groups are the same and
+# their edges stay in L1. rms_mm and tm do not compile in this setting even
+# without spatial (a view cannot change memory space), so they are left out.
+DRAM_INPUT_PROGRAMS = [p for p in PROGRAMS if p not in ("rms_mm", "tm")]
+
+
+@pytest.mark.parametrize(
+    "program, memspace",
+    [(p, "l1") for p in PROGRAMS] + [(p, "dram_in") for p in DRAM_INPUT_PROGRAMS],
+)
 @pytest.mark.parametrize("spatial", [False, True], ids=["default", "spatial"])
 @pytest.mark.parametrize("target", ["ttmetal"])
-def test_spatial_auto(program: str, spatial: bool, target: str, request, device):
+def test_spatial_auto(
+    program: str, memspace: str, spatial: bool, target: str, request, device
+):
     shapes, body, num_spatials = PROGRAMS[program]
+    options = ["execution-strategy=spatial"] if spatial else []
+    if memspace == "dram_in":
+        options.append("default-input-memspace=dram")
     kwargs = get_request_kwargs(request)
     kwargs["save_artifacts"] = True
     compiled = compile_and_execute_ttir(
@@ -103,7 +122,7 @@ def test_spatial_auto(program: str, spatial: bool, target: str, request, device)
         target=target,
         device=device,
         pcc=0.999,
-        pipeline_options=["execution-strategy=spatial"] if spatial else [],
+        pipeline_options=options,
         **kwargs,
     )
     with open(compiled) as f:

@@ -2389,7 +2389,15 @@ static mlir::LogicalResult verifySpatialEdges(d2m::SpatialOp op) {
              << " more than once; reuse one block argument";
     }
     Value edgeBuffer = producer.getOutputs()[i];
-    if (!llvm::is_contained(op.getOutputs(), edgeBuffer)) {
+    // After bufferization the producer may write an out through a view
+    // (d2m-reblock-generics), and an out may itself be a view: compare the
+    // buffers under the views.
+    bool isOut = tensorForm ? llvm::is_contained(op.getOutputs(), edgeBuffer)
+                            : llvm::any_of(op.getOutputs(), [&](Value out) {
+                                return SpatialOp::stripViews(out) ==
+                                       op.getEdgeBuffer(edge);
+                              });
+    if (!isOut) {
       return op.emitOpError("edge ")
              << edge << ": producer output must be one of the spatial outs";
     }
@@ -3696,6 +3704,17 @@ mlir::Value d2m::SpatialOp::getEdgeSource(SpatialEdgeAttr edge) {
   auto producer =
       *getRegion(edge.getProducerRegion()).getOps<GenericOp>().begin();
   return producer.getOutputs()[edge.getProducerOutput()];
+}
+
+mlir::Value d2m::SpatialOp::stripViews(mlir::Value value) {
+  while (auto view = value.getDefiningOp<ViewLayoutOp>()) {
+    value = view.getInput();
+  }
+  return value;
+}
+
+mlir::Value d2m::SpatialOp::getEdgeBuffer(SpatialEdgeAttr edge) {
+  return stripViews(getEdgeSource(edge));
 }
 
 // Replace every consumer block argument with the buffer its producer writes,

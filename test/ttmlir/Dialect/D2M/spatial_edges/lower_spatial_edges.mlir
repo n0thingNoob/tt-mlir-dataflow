@@ -401,3 +401,87 @@ func.func @pipelined_write(%in: memref<1x1x1x1x!ttcore.tile<32x32, bf16>, #ttcor
   }
   return
 }
+
+// -----
+
+#l1 = #ttcore.memory_space<l1>
+
+// Both ends reach the edge buffer %e through a view (as after
+// d2m-reblock-generics): the producer's output is a view of the spatial out,
+// and the consumer reads another view of it. The producer's write is carried
+// out of a loop through scf.if; the write wait after the loop (a write
+// barrier) covers it.
+// CHECK-LABEL: func.func @views
+// CHECK: %[[SEM:.*]] = d2m.create_local_semaphore
+// CHECK: d2m.spatial {grid_ranges
+// CHECK: d2m.view_layout
+// CHECK: d2m.generic
+// CHECK: additionalArgs(%{{.*}}, %[[SEM]] :
+// CHECK: scf.for
+// CHECK: d2m.dma_write
+// CHECK: d2m.dma_wait %{{.*}} : !d2m.mem_tx<write>
+// CHECK: d2m.pop
+// CHECK: d2m.semaphore_inc %[[SEM]]
+// CHECK-NEXT: }, {
+// CHECK: d2m.view_layout
+// CHECK: d2m.generic
+// CHECK: additionalArgs(%{{.*}}, %[[SEM]] :
+// CHECK-NEXT: {
+// CHECK-NEXT: %[[N:.*]] = arith.constant 1 : index
+// CHECK-NEXT: d2m.semaphore_wait %[[SEM]], %[[N]]
+// CHECK: d2m.dma_read
+func.func @views(%in: memref<1x1x1x1x!ttcore.tile<32x32, bf16>, #ttcore.shard<2048x2048, 1>, #l1>) {
+  %e = memref.alloc() : memref<1x1x1x1x!ttcore.tile<32x32, bf16>, #ttcore.shard<2048x2048, 1>, #l1>
+  %o = memref.alloc() {d2m.virtualGridForwardMapping = affine_map<(d0, d1, d2, d3) -> (d0 + 1, d1 + 1, d2, d3)>, d2m.virtualGridInverseMapping = affine_map<(d0, d1) -> (0, d0 - 1, d1 - 1)>} : memref<1x1x1x1x!ttcore.tile<32x32, bf16>, #ttcore.shard<2048x2048, 1>, #l1>
+  %cb0 = memref.alloc() : memref<1x1x!ttcore.tile<32x32, bf16>, #ttcore.cb_layout<2048x2048, 2>, #l1>
+  %cb1 = memref.alloc() : memref<1x1x!ttcore.tile<32x32, bf16>, #ttcore.cb_layout<2048x2048, 2>, #l1>
+  d2m.spatial {edges = [#d2m.spatial_edge<0:0 -> 1:0>], grid_ranges = [#ttcore.core_range<(0, 0), (0, 0)>, #ttcore.core_range<(1, 1), (1, 1)>]}
+      ins(%in : memref<1x1x1x1x!ttcore.tile<32x32, bf16>, #ttcore.shard<2048x2048, 1>, #l1>) outs(%e, %o : memref<1x1x1x1x!ttcore.tile<32x32, bf16>, #ttcore.shard<2048x2048, 1>, #l1>, memref<1x1x1x1x!ttcore.tile<32x32, bf16>, #ttcore.shard<2048x2048, 1>, #l1>) {
+      %ev = d2m.view_layout %e remapping = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)> : memref<1x1x1x1x!ttcore.tile<32x32, bf16>, #ttcore.shard<2048x2048, 1>, #l1> -> memref<1x1x1x1x!ttcore.tile<32x32, bf16>, #ttcore.shard<2048x2048, 1>, #l1>
+      d2m.generic {block_factors = [], grid = #ttcore.grid<1x1>, indexing_maps = [], iterator_types = [], threads = [#d2m.thread<datamovement>, #d2m.thread<compute>]}
+          ins(%in : memref<1x1x1x1x!ttcore.tile<32x32, bf16>, #ttcore.shard<2048x2048, 1>, #l1>)
+          outs(%ev : memref<1x1x1x1x!ttcore.tile<32x32, bf16>, #ttcore.shard<2048x2048, 1>, #l1>)
+          additionalArgs(%cb0 : memref<1x1x!ttcore.tile<32x32, bf16>, #ttcore.cb_layout<2048x2048, 2>, #l1>) {
+        %cb = d2m.get_cb(2) resolution_stage = compile : <memref<1x1x!ttcore.tile<32x32, bf16>, #ttcore.cb_layout<2048x2048, 2>, #l1>>
+        %y = d2m.core_index(0) : index
+        %x = d2m.core_index(1) : index
+        %c0 = arith.constant 0 : index
+        %c1 = arith.constant 1 : index
+        %c2 = arith.constant 2 : index
+        %init = d2m.null_tx : !d2m.mem_tx<write>
+        %last = scf.for %k = %c0 to %c2 step %c1 iter_args(%prev = %init) -> (!d2m.mem_tx<write>) {
+          %isLast = arith.cmpi eq, %k, %c1 : index
+          %t = scf.if %isLast -> (!d2m.mem_tx<write>) {
+            %src = d2m.wait %cb : <memref<1x1x!ttcore.tile<32x32, bf16>, #ttcore.cb_layout<2048x2048, 2>, #l1>> -> memref<1x1x!ttcore.tile<32x32, bf16>, #ttcore.cb_layout<2048x2048, 2>, #l1>
+            %tx = d2m.dma_write %src[%c0], %ev[%y, %x, %c0], <1> : (memref<1x1x!ttcore.tile<32x32, bf16>, #ttcore.cb_layout<2048x2048, 2>, #l1>, memref<1x1x1x1x!ttcore.tile<32x32, bf16>, #ttcore.shard<2048x2048, 1>, #l1>) -> !d2m.mem_tx<write>
+            scf.yield %tx : !d2m.mem_tx<write>
+          } else {
+            scf.yield %prev : !d2m.mem_tx<write>
+          }
+          scf.yield %t : !d2m.mem_tx<write>
+        }
+        d2m.dma_wait %last : !d2m.mem_tx<write>
+        d2m.pop %cb : <memref<1x1x!ttcore.tile<32x32, bf16>, #ttcore.cb_layout<2048x2048, 2>, #l1>>
+      }, {
+        %unused = arith.constant 0 : index
+      }
+  }, {
+      %ev2 = d2m.view_layout %e remapping = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)> : memref<1x1x1x1x!ttcore.tile<32x32, bf16>, #ttcore.shard<2048x2048, 1>, #l1> -> memref<1x1x1x1x!ttcore.tile<32x32, bf16>, #ttcore.shard<2048x2048, 1>, #l1>
+      d2m.generic {block_factors = [], grid = #ttcore.grid<1x1, virt_to_physical_map = (d0, d1) -> (0, d0 + 1, d1 + 1), physical_to_virt_map = (d0, d1) -> (0, d0 - 1, d1 - 1)>, indexing_maps = [], iterator_types = [], threads = [#d2m.thread<datamovement>, #d2m.thread<compute>]}
+          ins(%ev2 : memref<1x1x1x1x!ttcore.tile<32x32, bf16>, #ttcore.shard<2048x2048, 1>, #l1>)
+          outs(%o : memref<1x1x1x1x!ttcore.tile<32x32, bf16>, #ttcore.shard<2048x2048, 1>, #l1>)
+          additionalArgs(%cb1 : memref<1x1x!ttcore.tile<32x32, bf16>, #ttcore.cb_layout<2048x2048, 2>, #l1>) {
+        %cb = d2m.get_cb(2) resolution_stage = compile : <memref<1x1x!ttcore.tile<32x32, bf16>, #ttcore.cb_layout<2048x2048, 2>, #l1>>
+        %y = d2m.core_index(0) : index
+        %x = d2m.core_index(1) : index
+        %c0 = arith.constant 0 : index
+        %dst = d2m.reserve %cb : <memref<1x1x!ttcore.tile<32x32, bf16>, #ttcore.cb_layout<2048x2048, 2>, #l1>> -> memref<1x1x!ttcore.tile<32x32, bf16>, #ttcore.cb_layout<2048x2048, 2>, #l1>
+        %tx = d2m.dma_read %ev2[%y, %x, %c0], %dst[%c0], <1> : (memref<1x1x1x1x!ttcore.tile<32x32, bf16>, #ttcore.shard<2048x2048, 1>, #l1>, memref<1x1x!ttcore.tile<32x32, bf16>, #ttcore.cb_layout<2048x2048, 2>, #l1>) -> !d2m.mem_tx<read>
+        d2m.dma_wait %tx : !d2m.mem_tx<read>
+        d2m.push %cb : <memref<1x1x!ttcore.tile<32x32, bf16>, #ttcore.cb_layout<2048x2048, 2>, #l1>>
+      }, {
+        %unused = arith.constant 0 : index
+      }
+  }
+  return
+}

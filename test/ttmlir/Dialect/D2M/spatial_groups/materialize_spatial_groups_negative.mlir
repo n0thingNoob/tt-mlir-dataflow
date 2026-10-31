@@ -288,3 +288,41 @@ func.func @view(%arg0: !H) -> (!H) {
   %out = d2m.to_layout %b, %out_h : !T into !H -> !H
   return %out : !H
 }
+
+// -----
+
+#l = #ttcore.metal_layout<logical_shape = 64x64, dim_alignments = 32x32, collapsed_intervals = dense<[[0, 1], [1, 2]]> : tensor<2x2xi64>, l1, sharded>
+#lu = #ttcore.metal_layout<logical_shape = 64x64, dim_alignments = 32x32, collapsed_intervals = dense<> : tensor<0x2xi64>, l1, sharded>
+#lo = #ttcore.metal_layout<logical_shape = 50x50, dim_alignments = 32x32, collapsed_intervals = dense<[[0, 1], [1, 2]]> : tensor<2x2xi64>, l1, sharded>
+#id2 = affine_map<(d0, d1) -> (d0, d1)>
+#parallel = #ttcore.iterator_type<parallel>
+!T = tensor<1x1x2x2x!ttcore.tile<32x32, f32>, #l>
+!U = tensor<1x1x2x2x!ttcore.tile<32x32, f32>, #lu>
+!O = tensor<1x1x2x2x!ttcore.tile<32x32, f32>, #lo>
+!R = tensor<1x1x64x64xf32, #l>
+!H = tensor<64x64xf32>
+!S = tensor<2x2x!ttcore.tile<32x32, f32>>
+#ld = #ttcore.metal_layout<logical_shape = 64x64, dim_alignments = 32x32, collapsed_intervals = dense<[[0, 1], [1, 2]]> : tensor<2x2xi64>, dram, sharded>
+!D = tensor<1x1x2x2x!ttcore.tile<32x32, f32>, #ld>
+#id4 = affine_map<(d0, d1, d2, d3) -> (d0, d1, d3, d2)>
+// Both members' tensors are in DRAM: an edge buffer must stay in L1.
+func.func @dram(%arg0: !H) -> (!H) {
+  %x_d = d2m.empty() : !D
+  %x = d2m.to_layout %arg0, %x_d : !H into !D -> !D
+  %o0 = d2m.empty() : !D
+  %a = d2m.generic {d2m.spatial_group = 0 : i64, d2m.spatial_range = #ttcore.core_range<(0, 0), (1, 1)>, block_factors = [1, 1], grid = #ttcore.grid<1x1>, indexing_maps = [#id2, #id2], iterator_types = [#parallel, #parallel], threads = [#d2m.thread<unified>]}
+      ins(%x : !D) outs(%o0 : !D) {
+  %blk = tensor.empty() : !S
+  d2m.yield %blk : (!S)
+  } : !D
+  %o1 = d2m.empty() : !D
+  // expected-error @+1 {{input 0 reads another member of spatial group 0 outside L1; an edge buffer must stay in L1}}
+  %b = d2m.generic {d2m.spatial_group = 0 : i64, d2m.spatial_range = #ttcore.core_range<(0, 3), (1, 4)>, block_factors = [1, 1], grid = #ttcore.grid<1x1>, indexing_maps = [#id2, #id2], iterator_types = [#parallel, #parallel], threads = [#d2m.thread<unified>]}
+      ins(%a : !D) outs(%o1 : !D) {
+  %blk = tensor.empty() : !S
+  d2m.yield %blk : (!S)
+  } : !D
+  %out_h = d2m.empty() : !H
+  %out = d2m.to_layout %b, %out_h : !D into !H -> !H
+  return %out : !H
+}

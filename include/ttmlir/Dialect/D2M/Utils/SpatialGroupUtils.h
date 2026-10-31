@@ -17,11 +17,20 @@ namespace mlir::tt::d2m {
 inline constexpr llvm::StringLiteral kSpatialGroupAttr = "d2m.spatial_group";
 inline constexpr llvm::StringLiteral kSpatialRangeAttr = "d2m.spatial_range";
 
-// True when `a` and `b` describe the same physical L1 tensor: equal device
-// shape and element type, and layouts that differ at most in
-// collapsed_intervals with logical rank <= 2 (where any collapse is the
-// identity, so a to_layout between them only reinterprets metadata).
-bool samePhysicalLayout(Type a, Type b);
+// True when `a` and `b` describe the same tensor apart from where it lives:
+// equal device shape and element type, and layouts that differ at most in
+// memory space and in collapsed_intervals with logical rank <= 2 (where any
+// collapse is the identity, so a to_layout between them only reinterprets
+// metadata).
+bool sameLayoutExceptMemorySpace(Type a, Type b);
+
+// True when `t` is a device tensor laid out in L1 / in DRAM. An edge buffer
+// stays in the producer's L1 for the whole spatial (d2m-allocate enforces
+// it), so an edge needs an L1 producer output. The consumer operand may be
+// the same tensor in DRAM: d2m-materialize-spatial-groups retypes it to the
+// producer's L1 type, so the consumer reads the producer's L1 buffer.
+bool isL1Layout(Type t);
+bool isDRAMLayout(Type t);
 
 // Follows `v` back through d2m.to_layout ops and d2m.mask ops that fold to
 // their input, to the generic result it carries. Returns null if the chain
