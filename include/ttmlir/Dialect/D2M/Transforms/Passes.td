@@ -723,6 +723,10 @@ def D2MReblockGenerics : Pass<"d2m-reblock-generics", "::mlir::ModuleOp"> {
     This pass uses
     BlockFactorAnalysis to select block factors for affine blocked d2m.generic
     ops, then rebuilds those generics with the selected factors.
+
+    In a d2m.spatial, a streaming edge with `block = RxC` sets the factors of
+    the loop dims that index the edge at either end to (shard extent / block
+    extent), so both ends move blocks of R x C tiles per core.
   }];
   let dependentDialects = [
     "::mlir::tt::d2m::D2MDialect",
@@ -1520,12 +1524,15 @@ def D2MMaterializeSpatialStreams : Pass<"d2m-materialize-spatial-streams", "::ml
     the whole-tensor handoff: its `stream` fields are dropped. A remark says
     why, or, for an edge that can stream, its blocks.
 
-    An edge that can stream and is supported so far (one producer core, one
-    consumer core, no reduction loop around the producer's write, no fan-out)
-    gets its ring: the edge buffer is replaced by a `memref.alloc` of `depth`
-    blocks with the consumer's virtual grid mapping and `d2m.stream_ring`, so
-    d2m-allocate places it in the consumer's L1, and both accesses read and
-    write views of it whose block coordinates select slot (ordinal mod depth).
+    An edge that can stream and is supported so far gets its ring. Supported:
+    producer core k feeds consumer core k (equal grids, whose virtual grids
+    are shifted copies of their cores), and no fan-out; the producer may write
+    the edge inside a reduction loop. The edge buffer is replaced by a
+    `memref.alloc` of `depth` blocks per consumer core with the consumer's
+    virtual grid mapping and `d2m.stream_ring`, so d2m-allocate places it in
+    the consumers' L1, and both accesses read and write views of it in which a
+    block coordinate selects the core (coordinate / blocks per core) and the
+    slot (ordinal on that core mod depth).
     The producer then writes into the consumer's L1. Other edges that can
     stream keep the whole-tensor handoff for now, with a remark.
     d2m-lower-spatial-edges adds the per-block synchronization.
@@ -1560,8 +1567,12 @@ def D2MLowerSpatialEdges : Pass<"d2m-lower-spatial-edges", "::mlir::ModuleOp"> {
     the consumer's count; the consumer's reading thread waits until n + 1
     blocks were written, reads, waits for the read and increments the
     producer's count. The producer finally waits until all blocks were read.
-    The waits are `semaphore_wait ... min`. A streaming edge without a ring
-    gets the whole-tensor handoff and a remark.
+    The waits are `semaphore_wait ... min`. Between multi-core regions, core k
+    signals core k of the other region (its core index plus the constant
+    offset between the two grids). A producer that writes the edge inside a
+    reduction loop writes the ring and signals only in the last iteration of
+    those loops; the other iterations yield a null transaction. A streaming
+    edge without a ring gets the whole-tensor handoff and a remark.
 
     Lowered edges are removed from `edges`; the attribute is dropped once
     empty. With `ttnn-mode` the pass does nothing (the TTNN lowering does not

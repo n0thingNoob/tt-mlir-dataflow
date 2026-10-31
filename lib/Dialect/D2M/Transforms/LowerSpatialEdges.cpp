@@ -319,15 +319,21 @@ static SmallVector<scf::ForOp> blockingLoops(Operation *op) {
 // blocks, all in the body of the same innermost blocking loop, and the block
 // count and ordinal of the current iteration.
 struct BlockSite {
-  SmallVector<scf::ForOp> loops;
+  SmallVector<scf::ForOp> loops;          // all blocking loops, outer first
+  SmallVector<scf::ForOp> blockLoops;     // the non-reduction ones
+  SmallVector<scf::ForOp> reductionLoops; // a block is final in their last
+                                          // iteration
   Operation *first = nullptr; // first op of the loop body holding a DMA op
   Operation *last = nullptr;  // last such op
   int64_t numBlocks = 1;
 };
 
+// For writes, reduction loops do not count blocks: the producer writes a block
+// once per reduction, finally in the last iteration. For reads every
+// iteration reads a block.
 static FailureOr<BlockSite> findBlockSite(ArrayRef<Operation *> dmaOps,
                                           SpatialOp spatial,
-                                          SpatialEdgeAttr edge) {
+                                          SpatialEdgeAttr edge, bool isWrite) {
   BlockSite site;
   site.loops = blockingLoops(dmaOps.front());
   for (Operation *op : dmaOps) {
@@ -348,10 +354,11 @@ static FailureOr<BlockSite> findBlockSite(ArrayRef<Operation *> dmaOps,
       return spatial.emitOpError("edge ")
              << edge << ": a blocking loop around it is not 0..N step 1";
     }
-    if (loop->hasAttr("d2m.reduction_loop")) {
-      return spatial.emitOpError("edge ")
-             << edge << ": streaming from a reduction loop is not lowered";
+    if (isWrite && loop->hasAttr("d2m.reduction_loop")) {
+      site.reductionLoops.push_back(loop);
+      continue;
     }
+    site.blockLoops.push_back(loop);
     site.numBlocks *= *ub;
   }
   Block *body = site.loops.back().getBody();
@@ -435,8 +442,10 @@ static LogicalResult lowerStreamEdge(SpatialOp spatial, SpatialEdgeAttr edge,
            << "producer and one reading thread in the consumer, got "
            << writers.size() << " and " << readers.size();
   }
-  FailureOr<BlockSite> writeSite = findBlockSite(writes, spatial, edge);
-  FailureOr<BlockSite> readSite = findBlockSite(reads, spatial, edge);
+  FailureOr<BlockSite> writeSite =
+      findBlockSite(writes, spatial, edge, /*isWrite=*/true);
+  FailureOr<BlockSite> readSite =
+      findBlockSite(reads, spatial, edge, /*isWrite=*/false);
   if (failed(writeSite) || failed(readSite)) {
     return failure();
   }
@@ -460,7 +469,11 @@ static LogicalResult lowerStreamEdge(SpatialOp spatial, SpatialEdgeAttr edge,
   producer.getAdditionalArgsMutable().append(semaphore);
   consumer.getAdditionalArgsMutable().append(semaphore);
 
-  // semaphore_inc core indices are virtual coordinates of the issuing generic.
+  // semaphore_inc core indices are virtual coordinates of the issuing
+  // generic. Core k of one region pairs with core k of the other, and both
+  // virtual grids are shifted copies of their cores
+  // (d2m-materialize-spatial-streams checks both), so the partner of virtual
+  // core k is k + (the target's core 0 in the issuer's virtual coordinates).
   auto coreIn = [&](GenericOp issuer, GenericOp target) {
     auto [y, x] = getLogicalCores(target).front();
     AffineMap physToVirt = issuer.getGrid().getPhysicalToVirtMap();
@@ -476,6 +489,12 @@ static LogicalResult lowerStreamEdge(SpatialOp spatial, SpatialEdgeAttr edge,
     Value one = builder.create<arith::ConstantIndexOp>(loc, 1);
     Value coreY = builder.create<arith::ConstantIndexOp>(loc, y);
     Value coreX = builder.create<arith::ConstantIndexOp>(loc, x);
+    if (issuer.getGrid().getGridVolume() > 1) {
+      coreY = builder.create<arith::AddIOp>(
+          loc, builder.create<CoreIndexOp>(loc, 0), coreY);
+      coreX = builder.create<arith::AddIOp>(
+          loc, builder.create<CoreIndexOp>(loc, 1), coreX);
+    }
     builder.create<SemaphoreIncOp>(loc, semaphore, one,
                                    ValueRange{coreY, coreX});
   };
@@ -492,22 +511,64 @@ static LogicalResult lowerStreamEdge(SpatialOp spatial, SpatialEdgeAttr edge,
   // Producer: wait for a free slot, then signal the written block.
   int64_t depth = edge.getStreamDepth();
   builder.setInsertionPoint(writeSite->first);
-  Value n = blockOrdinal(builder, loc, writeSite->loops);
-  Value credits = builder.create<arith::SubIOp>(
-      loc, n, builder.create<arith::ConstantIndexOp>(loc, depth - 1));
-  credits = builder.create<arith::MaxSIOp>(
-      loc, credits, builder.create<arith::ConstantIndexOp>(loc, 0));
-  waitAtLeast(credits);
-  builder.setInsertionPointAfter(writeSite->last);
-  barrier(DMAType::Write);
-  increment(producer, consumer);
+  Value n = blockOrdinal(builder, loc, writeSite->blockLoops);
+  auto waitForSlot = [&]() {
+    Value credits = builder.create<arith::SubIOp>(
+        loc, n, builder.create<arith::ConstantIndexOp>(loc, depth - 1));
+    credits = builder.create<arith::MaxSIOp>(
+        loc, credits, builder.create<arith::ConstantIndexOp>(loc, 0));
+    waitAtLeast(credits);
+  };
+  if (writeSite->reductionLoops.empty()) {
+    waitForSlot();
+    builder.setInsertionPointAfter(writeSite->last);
+    barrier(DMAType::Write);
+    increment(producer, consumer);
+  } else {
+    // A reduction producer rewrites its output block in every iteration of
+    // its reduction loops; only the last one is final. The others would
+    // overwrite a slot the consumer may still read, so only the final
+    // iteration writes the ring (the compute thread keeps its partial sums in
+    // its own output CB) and signals it; the others yield a null transaction
+    // to whatever waited on the write.
+    auto write = mlir::dyn_cast<DMAWriteOp>(writeSite->first);
+    if (writes.size() != 1 || writeSite->first != writeSite->last || !write) {
+      return spatial.emitOpError("edge ")
+             << edge << ": a reduction producer must write each block with "
+             << "one DMA op directly in its innermost blocking loop";
+    }
+    Value isFinal;
+    for (scf::ForOp loop : writeSite->reductionLoops) {
+      Value last = builder.create<arith::SubIOp>(
+          loc, loop.getUpperBound(),
+          builder.create<arith::ConstantIndexOp>(loc, 1));
+      Value cond = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,
+                                                 loop.getInductionVar(), last);
+      isFinal =
+          isFinal ? builder.create<arith::AndIOp>(loc, isFinal, cond) : cond;
+    }
+    Type txType = write.getResult().getType();
+    auto ifOp = builder.create<scf::IfOp>(loc, TypeRange{txType}, isFinal,
+                                          /*withElseRegion=*/true);
+    write.getResult().replaceAllUsesWith(ifOp.getResult(0));
+    builder.setInsertionPointToStart(ifOp.thenBlock());
+    waitForSlot();
+    write->moveBefore(ifOp.thenBlock(), ifOp.thenBlock()->end());
+    builder.setInsertionPointToEnd(ifOp.thenBlock());
+    barrier(DMAType::Write);
+    increment(producer, consumer);
+    builder.create<scf::YieldOp>(loc, write.getResult());
+    builder.setInsertionPointToStart(ifOp.elseBlock());
+    builder.create<scf::YieldOp>(
+        loc, builder.create<NullTxOp>(loc, DMAType::Write).getResult());
+  }
   builder.setInsertionPointToEnd(&writers.front()->front());
   waitAtLeast(
       builder.create<arith::ConstantIndexOp>(loc, writeSite->numBlocks));
 
   // Consumer: wait for the block, then return its slot.
   builder.setInsertionPoint(readSite->first);
-  Value m = blockOrdinal(builder, loc, readSite->loops);
+  Value m = blockOrdinal(builder, loc, readSite->blockLoops);
   waitAtLeast(builder.create<arith::AddIOp>(
       loc, m, builder.create<arith::ConstantIndexOp>(loc, 1)));
   builder.setInsertionPointAfter(readSite->last);

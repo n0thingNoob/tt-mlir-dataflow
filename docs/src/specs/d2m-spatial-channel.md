@@ -4,8 +4,8 @@ Status: PR1 (IR representation), PR2a (synchronization and TTMetal lowering),
 PR2b (multi-core regions: GridSelection lays out both ends of an edge alike)
 and edge fan-out with multicast signalling implemented. Streaming edges
 (§2.6): the IR, its verifier rules, the option that asks for them, the
-analysis that decides which can stream, and the lowering between two 1x1
-regions are in.
+analysis that decides which can stream, and the lowering between equal
+grids, core k to core k, including reduction producers, are in.
 
 ## 1. Problem and scope
 
@@ -237,16 +237,18 @@ An edge may ask for a second handoff protocol:
   more than one block per (producer core, consumer core) pair. Otherwise the
   edge keeps the whole-tensor handoff, with a remark giving the reason; the
   whole-tensor handoff is correct for any edge.
-- Lowered so far between two 1x1 regions, with the producer's write outside
-  any reduction loop and no fan-out: the edge buffer becomes a ring of
-  `depth` blocks in the consumer core's L1 (`memref.alloc` with the
-  consumer's virtual grid mapping and `d2m.stream_ring`), which the producer
-  writes remotely. The GenericOp verifier accepts such a ring as an L1
+- Lowered so far when producer core k feeds consumer core k (equal grids,
+  shifted copies of their cores) and there is no fan-out: the edge buffer
+  becomes a ring of `depth` blocks in every consumer core's L1
+  (`memref.alloc` with the consumer's virtual grid mapping and
+  `d2m.stream_ring`), which the producer writes remotely. A reduction
+  producer writes the ring only in the last iteration of its reduction loops.
+  `block = RxC` makes d2m-reblock-generics block both ends by R x C tiles. The GenericOp verifier accepts such a ring as an L1
   output on other cores than the generic's. d2m-lower-spatial-edges then
   synchronizes every block with one local semaphore, a HEAD count on the
   consumer core and a CREDIT count on the producer core (see the pass
-  description). Multi-core regions, reduction producers and fan-out keep the
-  whole-tensor handoff for now.
+  description). Fan-out and other core pairings keep the whole-tensor handoff
+  for now.
 
 ## 3. Relation to existing code
 

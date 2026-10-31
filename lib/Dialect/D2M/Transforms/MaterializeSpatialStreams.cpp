@@ -331,6 +331,7 @@ public:
                       " reads it from more than one producer core");
         }
       }
+      pairs.push_back({writerOf.lookup(owner), c});
       auto [it, inserted] = readerOf.try_emplace(owner, c);
       if (!inserted) {
         return fail("consumer cores " + coreString(reads->cores[it->second]) +
@@ -391,6 +392,9 @@ public:
   Value storeMemref, loadMemref;
   AccessTrace writeTrace, readTrace;
   bool storeInReduction = false;
+  // (producer core, consumer core) of every pair, as indices into the traces'
+  // core lists (row-major over each generic's grid).
+  SmallVector<std::pair<size_t, size_t>> pairs;
 
 private:
   bool fail(const std::string &why) {
@@ -613,41 +617,103 @@ static std::string edgeName(SpatialEdgeAttr edge) {
          std::to_string(edge.getConsumerArg());
 }
 
-// The block ordinal (position in the access's sequence) as an affine function
-// of the access's block coordinates: base + sum_d stride_d * coord_d. Fitted on
-// steps of one coordinate and checked on every block.
-static std::optional<std::pair<SmallVector<int64_t>, int64_t>>
-fitOrdinal(ArrayRef<Block> blocks) {
-  size_t rank = blocks.front().coord.size();
-  std::map<SmallVector<int64_t>, int64_t> ordinalOf;
-  for (auto [j, block] : llvm::enumerate(blocks)) {
-    ordinalOf[block.coord] = j;
+// How an access's block coordinates split into a core and a block on it, and
+// the block's ordinal on its core: along view dim d, core c_d / B_d and local
+// block c_d mod B_d, with ordinal = base + sum_d stride_d * local_d, the same
+// on every core. Fitted on core 0 and checked on every block of every core.
+struct BlockFit {
+  SmallVector<int64_t> perCore; // B_d
+  SmallVector<int64_t> stride;
+  int64_t base = 0;
+};
+
+static std::optional<BlockFit> fitBlocks(const AccessTrace &trace,
+                                         ArrayRef<int64_t> grid) {
+  ArrayRef<Block> first = trace.perCore.front();
+  size_t rank = first.front().coord.size();
+  if (rank != grid.size()) {
+    return std::nullopt;
   }
-  SmallVector<int64_t> stride(rank, 0);
+  BlockFit fit;
+  fit.perCore.assign(rank, 1);
+  for (const Block &block : first) {
+    for (size_t d = 0; d < rank; ++d) {
+      if (block.coord[d] < 0) {
+        return std::nullopt;
+      }
+      fit.perCore[d] = std::max(fit.perCore[d], block.coord[d] + 1);
+    }
+  }
+  auto local = [&](const Block &block) {
+    SmallVector<int64_t> l;
+    for (size_t d = 0; d < rank; ++d) {
+      l.push_back(block.coord[d] % fit.perCore[d]);
+    }
+    return l;
+  };
+  std::map<SmallVector<int64_t>, int64_t> ordinalOf;
+  for (auto [j, block] : llvm::enumerate(first)) {
+    ordinalOf[local(block)] = j;
+  }
+  fit.stride.assign(rank, 0);
   for (size_t d = 0; d < rank; ++d) {
-    for (auto [j, block] : llvm::enumerate(blocks)) {
-      SmallVector<int64_t> next = block.coord;
+    for (auto [j, block] : llvm::enumerate(first)) {
+      SmallVector<int64_t> next = local(block);
       ++next[d];
       if (auto it = ordinalOf.find(next); it != ordinalOf.end()) {
-        stride[d] = it->second - static_cast<int64_t>(j);
+        fit.stride[d] = it->second - static_cast<int64_t>(j);
         break;
       }
     }
   }
-  int64_t base = 0;
+  SmallVector<int64_t> origin = local(first.front());
   for (size_t d = 0; d < rank; ++d) {
-    base -= stride[d] * blocks.front().coord[d];
+    fit.base -= fit.stride[d] * origin[d];
   }
-  for (auto [j, block] : llvm::enumerate(blocks)) {
-    int64_t ordinal = base;
-    for (size_t d = 0; d < rank; ++d) {
-      ordinal += stride[d] * block.coord[d];
-    }
-    if (ordinal != static_cast<int64_t>(j)) {
-      return std::nullopt;
+  for (auto [k, blocks] : llvm::enumerate(trace.perCore)) {
+    for (auto [j, block] : llvm::enumerate(blocks)) {
+      int64_t ordinal = fit.base;
+      SmallVector<int64_t> l = local(block);
+      for (size_t d = 0; d < rank; ++d) {
+        if (block.coord[d] / fit.perCore[d] != trace.cores[k][d]) {
+          return std::nullopt;
+        }
+        ordinal += fit.stride[d] * l[d];
+      }
+      if (ordinal != static_cast<int64_t>(j)) {
+        return std::nullopt;
+      }
     }
   }
-  return std::make_pair(stride, base);
+  return fit;
+}
+
+// True when `generic`'s virtual grid is its physical cores shifted by a
+// constant, so that "the same virtual core" of two such grids differ by a
+// constant on the device.
+static bool isTranslatedGrid(GenericOp generic) {
+  ttcore::GridAttr grid = generic.getGrid();
+  AffineMap virtToPhys = grid.getVirtToPhysicalMap();
+  if (virtToPhys.isEmpty()) {
+    return true;
+  }
+  ArrayRef<int64_t> shape = grid.getShape();
+  if (shape.size() != 2) {
+    return false;
+  }
+  std::optional<std::pair<int64_t, int64_t>> shift;
+  for (int64_t y = 0; y < shape[0]; ++y) {
+    for (int64_t x = 0; x < shape[1]; ++x) {
+      SmallVector<int64_t> phys = virtToPhys.compose({y, x});
+      std::pair<int64_t, int64_t> d = {phys[phys.size() - 2] - y,
+                                       phys[phys.size() - 1] - x};
+      if (shift && *shift != d) {
+        return false;
+      }
+      shift = d;
+    }
+  }
+  return true;
 }
 
 // Values from `view` down its view chain, excluding the root.
@@ -673,12 +739,20 @@ static std::optional<std::string> materializeRing(SpatialOp spatial,
   };
   GenericOp producer = genericOf(edge.getProducerRegion());
   GenericOp consumer = genericOf(edge.getConsumerRegion());
-  if (producer.getGrid().getGridVolume() != 1 ||
-      consumer.getGrid().getGridVolume() != 1) {
-    return std::string("streaming between multi-core regions");
+  // Multi-core regions: core k of the producer feeds core k of the consumer
+  // (same grid shape, every consumer core in one pair), and both grids are
+  // shifted copies of their cores, so the partner of a core is a constant
+  // offset away.
+  ArrayRef<int64_t> grid = consumer.getGrid().getShape();
+  if (producer.getGrid().getShape() != grid ||
+      analysis.pairs.size() != consumer.getGrid().getGridVolume() ||
+      llvm::any_of(analysis.pairs,
+                   [](auto pair) { return pair.first != pair.second; })) {
+    return std::string("a core pairing other than core k to core k");
   }
-  if (analysis.storeInReduction) {
-    return std::string("a producer that writes it inside a reduction loop");
+  if (!isTranslatedGrid(producer) || !isTranslatedGrid(consumer)) {
+    return std::string("a region whose virtual grid is not a shifted copy of "
+                       "its cores");
   }
   Value buffer = spatial.getEdgeBuffer(edge);
   auto alloc = buffer.getDefiningOp<memref::AllocOp>();
@@ -702,19 +776,19 @@ static std::optional<std::string> materializeRing(SpatialOp spatial,
   if (block != loadType.getShape().drop_front(2)) {
     return std::string("blocks of different shapes at the two ends");
   }
-  auto writeOrdinal = fitOrdinal(analysis.writeTrace.perCore.front());
-  auto readOrdinal = fitOrdinal(analysis.readTrace.perCore.front());
-  if (!writeOrdinal || !readOrdinal) {
+  std::optional<BlockFit> writeFit = fitBlocks(analysis.writeTrace, grid);
+  std::optional<BlockFit> readFit = fitBlocks(analysis.readTrace, grid);
+  if (!writeFit || !readFit) {
     return std::string("a block order that is not affine in the views");
   }
 
-  // The ring: one core (the consumer's), `depth` blocks stacked by rows.
+  // The ring: on every consumer core, `depth` blocks stacked by rows.
   MLIRContext *ctx = spatial.getContext();
   int64_t depth = edge.getStreamDepth();
   int64_t rows = block[0], cols = block[1];
   auto bufferType = mlir::cast<MemRefType>(buffer.getType());
   SmallVector<int64_t> shard = {depth * rows, cols};
-  SmallVector<int64_t> ringShape = {1, 1, depth * rows, cols};
+  SmallVector<int64_t> ringShape = {grid[0], grid[1], depth * rows, cols};
   auto ringType = MemRefType::get(
       ringShape, bufferType.getElementType(),
       ttcore::ShardLayoutAttr::get(shard, bufferType.getElementType(), 1),
@@ -722,10 +796,10 @@ static std::optional<std::string> materializeRing(SpatialOp spatial,
   OpBuilder builder(alloc);
   auto ring = builder.create<memref::AllocOp>(alloc.getLoc(), ringType);
   ring->setAttr(utils::kStreamRingAttr, UnitAttr::get(ctx));
-  ttcore::GridAttr grid = consumer.getGrid();
-  AffineMap physToVirt = grid.getPhysicalToVirtMap();
+  ttcore::GridAttr consumerGrid = consumer.getGrid();
+  AffineMap physToVirt = consumerGrid.getPhysicalToVirtMap();
   if (!physToVirt.isEmpty()) {
-    AffineMap virtToPhys = grid.getVirtToPhysicalMap();
+    AffineMap virtToPhys = consumerGrid.getVirtToPhysicalMap();
     unsigned n = virtToPhys.getNumResults();
     AffineMap forward = AffineMap::get(
         4, 0,
@@ -739,28 +813,30 @@ static std::optional<std::string> materializeRing(SpatialOp spatial,
   }
 
   // A view with the access's type: block (d0, d1), tile (d2, d3) of it ->
-  // slot ((base + s0 d0 + s1 d1) mod depth), row slot * rows + d2.
-  auto ringView = [&](Value access,
-                      const std::pair<SmallVector<int64_t>, int64_t> &fit) {
-    auto [stride, base] = fit;
-    AffineExpr ordinal = getAffineConstantExpr(base, ctx);
+  // core (d0 / B0, d1 / B1) of the ring, slot
+  // ((base + s0 (d0 mod B0) + s1 (d1 mod B1)) mod depth), row slot * rows + d2.
+  // Along a grid dim of size 1 the core is 0 and the local block is d.
+  auto ringView = [&](Value access, const BlockFit &fit) {
+    AffineExpr ordinal = getAffineConstantExpr(fit.base, ctx);
+    SmallVector<AffineExpr> results;
     for (unsigned d = 0; d < 2; ++d) {
-      ordinal = ordinal + getAffineDimExpr(d, ctx) * stride[d];
+      AffineExpr dim = getAffineDimExpr(d, ctx);
+      bool split = grid[d] > 1;
+      results.push_back(split ? dim.floorDiv(fit.perCore[d])
+                              : getAffineConstantExpr(0, ctx));
+      ordinal = ordinal + (split ? dim % fit.perCore[d] : dim) * fit.stride[d];
     }
-    AffineExpr zero = getAffineConstantExpr(0, ctx);
-    AffineMap map = AffineMap::get(
-        4, 0,
-        {zero, zero, (ordinal % depth) * rows + getAffineDimExpr(2, ctx),
-         getAffineDimExpr(3, ctx)},
-        ctx);
+    results.push_back((ordinal % depth) * rows + getAffineDimExpr(2, ctx));
+    results.push_back(getAffineDimExpr(3, ctx));
+    AffineMap map = AffineMap::get(4, 0, results, ctx);
     OpBuilder b(access.getDefiningOp());
     Value view = b.create<ViewLayoutOp>(access.getLoc(), access.getType(),
                                         ring.getResult(), map,
                                         /*reinterpretLayout=*/false);
     access.replaceAllUsesWith(view);
   };
-  ringView(storeView, *writeOrdinal);
-  ringView(loadView, *readOrdinal);
+  ringView(storeView, *writeFit);
+  ringView(loadView, *readFit);
   buffer.replaceUsesWithIf(ring.getResult(), [&](OpOperand &use) {
     return mlir::isa<SpatialOp, memref::DeallocOp>(use.getOwner());
   });
@@ -783,12 +859,20 @@ static std::optional<std::string> materializeRing(SpatialOp spatial,
     alloc.erase();
   }
   SmallVector<int64_t> core =
-      physToVirt.isEmpty() ? SmallVector<int64_t>{0, 0}
-                           : llvm::to_vector(llvm::drop_begin(
-                                 grid.getVirtToPhysicalMap().compose({0, 0})));
+      physToVirt.isEmpty()
+          ? SmallVector<int64_t>{0, 0}
+          : llvm::to_vector(llvm::drop_begin(
+                consumerGrid.getVirtToPhysicalMap().compose({0, 0})));
   placed = "a ring of " + std::to_string(depth) + " blocks of " +
            std::to_string(rows) + "x" + std::to_string(cols) +
-           " tiles in the L1 of consumer core " + coreString(core);
+           " tiles in the L1 of ";
+  if (consumer.getGrid().getGridVolume() == 1) {
+    placed += "consumer core " + coreString(core);
+  } else {
+    placed += "each of the " +
+              std::to_string(consumer.getGrid().getGridVolume()) +
+              " consumer cores, from " + coreString(core);
+  }
   return std::nullopt;
 }
 
