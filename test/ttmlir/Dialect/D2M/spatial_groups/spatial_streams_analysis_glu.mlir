@@ -1,5 +1,5 @@
 // RUN: ttmlir-opt --d2m-fe-pipeline="execution-strategy=spatial dram-args-and-results=true spatial-fuse-elementwise=true spatial-policy=none spatial-groups=0,0,0,0,0,0,0,1,0,1,0,1,0,2,0,2,0,2,0,3,0,3,0,3 test-buffer-size-policy=auto-mn spatial-streams=2,0,2,2,1,2,3,0,2" --mlir-print-ir-after=d2m-materialize-spatial-streams --mlir-print-local-scope --mlir-disable-threading %s -o /dev/null 2>&1 | FileCheck %s
-// RUN: ttmlir-opt --ttir-to-ttmetal-pipeline="execution-strategy=spatial dram-args-and-results=true spatial-fuse-elementwise=true spatial-policy=none spatial-groups=0,0,0,0,0,0,0,1,0,1,0,1,0,2,0,2,0,2,0,3,0,3,0,3 test-buffer-size-policy=auto-mn spatial-streams=2,0,2,2,1,2,3,0,2" %s 2>&1 >/dev/null | FileCheck %s --check-prefix=LOWER
+// RUN: ttmlir-opt --ttir-to-ttmetal-pipeline="execution-strategy=spatial dram-args-and-results=true spatial-fuse-elementwise=true spatial-policy=none spatial-groups=0,0,0,0,0,0,0,1,0,1,0,1,0,2,0,2,0,2,0,3,0,3,0,3 test-buffer-size-policy=auto-mn spatial-streams=2,0,2,2,1,2,3,0,2" %s -o /dev/null
 
 // d2m-materialize-spatial-streams on one bank of the decode gated MLP at the
 // main shape (H = 2048, F_j = 704 = 22 tiles), weights in DRAM: gate #0 on
@@ -13,15 +13,17 @@
 // output blocks it reads both 1x11 blocks of h again (32 reads), so h stays a
 // whole-tensor handoff.
 
+// The gate and up matmuls write their output inside the k loop, and a
+// reduction producer is not lowered as a stream yet, so all three edges keep
+// the whole-tensor handoff (the second RUN line checks that the program still
+// compiles).
 // CHECK-DAG: remark: edge 0:0 -> 2:0 can stream: 1 core pair, 2 blocks of 1x11 tiles each, in the producer's order
+// CHECK-DAG: remark: edge 0:0 -> 2:0 stays a whole-tensor handoff: a producer that writes it inside a reduction loop is not lowered yet
 // CHECK-DAG: remark: edge 1:0 -> 2:1 can stream: 1 core pair, 2 blocks of 1x11 tiles each, in the producer's order
+// CHECK-DAG: remark: edge 1:0 -> 2:1 stays a whole-tensor handoff: a producer that writes it inside a reduction loop is not lowered yet
 // CHECK-DAG: remark: edge 2:0 -> 3:0 stays a whole-tensor handoff: consumer core (0, 0) reads 32 blocks but the producer writes 2; a ring would need 2 of 2 blocks
 // CHECK-LABEL: IR Dump After D2MMaterializeSpatialStreams
-// CHECK: d2m.spatial {edges = [#d2m.spatial_edge<0:0 -> 2:0, stream<depth = 2>>, #d2m.spatial_edge<1:0 -> 2:1, stream<depth = 2>>, #d2m.spatial_edge<2:0 -> 3:0>]
-
-// The two edges that can stream reach d2m-lower-spatial-edges, which still
-// gives them the whole-tensor handoff.
-// LOWER-COUNT-2: asks for a streaming handoff, which is not lowered yet
+// CHECK: d2m.spatial {edges = [#d2m.spatial_edge<0:0 -> 2:0>, #d2m.spatial_edge<1:0 -> 2:1>, #d2m.spatial_edge<2:0 -> 3:0>]
 func.func @glu(%x: tensor<32x2048xbf16>, %wg: tensor<2048x704xbf16>, %wu: tensor<2048x704xbf16>, %wd: tensor<704x2048xbf16>) -> tensor<32x2048xbf16> {
   %g = "ttir.matmul"(%x, %wg) : (tensor<32x2048xbf16>, tensor<2048x704xbf16>) -> tensor<32x704xbf16>
   %s = "ttir.silu"(%g) : (tensor<32x704xbf16>) -> tensor<32x704xbf16>

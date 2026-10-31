@@ -1518,9 +1518,17 @@ def D2MMaterializeSpatialStreams : Pass<"d2m-materialize-spatial-streams", "::ml
 
     Otherwise the edge, and every other edge that leaves the same output, keeps
     the whole-tensor handoff: its `stream` fields are dropped. A remark says
-    why, or, for an edge that can stream, its blocks. Nothing else changes
-    yet: the ring buffer and the per-block synchronization come later, and
-    d2m-lower-spatial-edges still uses the whole-tensor handoff.
+    why, or, for an edge that can stream, its blocks.
+
+    An edge that can stream and is supported so far (one producer core, one
+    consumer core, no reduction loop around the producer's write, no fan-out)
+    gets its ring: the edge buffer is replaced by a `memref.alloc` of `depth`
+    blocks with the consumer's virtual grid mapping and `d2m.stream_ring`, so
+    d2m-allocate places it in the consumer's L1, and both accesses read and
+    write views of it whose block coordinates select slot (ordinal mod depth).
+    The producer then writes into the consumer's L1. Other edges that can
+    stream keep the whole-tensor handoff for now, with a remark.
+    d2m-lower-spatial-edges adds the per-block synchronization.
   }];
   let dependentDialects = ["::mlir::tt::d2m::D2MDialect"];
 }
@@ -1543,8 +1551,17 @@ def D2MLowerSpatialEdges : Pass<"d2m-lower-spatial-edges", "::mlir::ModuleOp"> {
       anything else, until the semaphore reaches
       (producer cores) x (producer writing threads).
 
-    Edges with `stream<...>` are not lowered as streams yet: they get the
-    same whole-tensor handoff and a remark.
+    A streaming edge whose buffer is a ring (d2m-materialize-spatial-streams)
+    is lowered block by block instead, with one local semaphore: the consumer
+    core's copy counts blocks written into its ring, the producer core's copy
+    counts blocks read. For block n (the blocking loops' induction variables,
+    linearized), the producer's writing thread waits until at least
+    n + 1 - depth blocks were read, writes, waits for the write and increments
+    the consumer's count; the consumer's reading thread waits until n + 1
+    blocks were written, reads, waits for the read and increments the
+    producer's count. The producer finally waits until all blocks were read.
+    The waits are `semaphore_wait ... min`. A streaming edge without a ring
+    gets the whole-tensor handoff and a remark.
 
     Lowered edges are removed from `edges`; the attribute is dropped once
     empty. With `ttnn-mode` the pass does nothing (the TTNN lowering does not

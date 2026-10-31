@@ -3,8 +3,9 @@
 Status: PR1 (IR representation), PR2a (synchronization and TTMetal lowering),
 PR2b (multi-core regions: GridSelection lays out both ends of an edge alike)
 and edge fan-out with multicast signalling implemented. Streaming edges
-(§2.6): the IR, its verifier rules and the option that asks for them are in;
-their lowering is not, so they still use the whole-tensor handoff.
+(§2.6): the IR, its verifier rules, the option that asks for them, the
+analysis that decides which can stream, and the lowering between two 1x1
+regions are in.
 
 ## 1. Problem and scope
 
@@ -205,7 +206,7 @@ The source references below are to the LLVM checkout tt-mlir builds against
   num_regions)` in `tools/d2m-jit/_src/builder.py` and
   `tools/builder/d2m/d2m_builder.py` keep working.
 
-### 2.6 Streaming edges (protocol only)
+### 2.6 Streaming edges
 
 An edge may ask for a second handoff protocol:
 
@@ -230,9 +231,22 @@ An edge may ask for a second handoff protocol:
   `spatial-stream-block` (R, C) adds `block = RxC` to all of them. Planning
   records them on the generic (`d2m.spatial_streams`) and
   d2m-materialize-spatial-groups puts them on the edges that input becomes.
-- Not lowered yet: d2m-lower-spatial-edges gives a streaming edge the
-  whole-tensor handoff of §4 and emits a remark. The whole-tensor handoff is
-  correct for any edge, so a streaming request never changes the result.
+- d2m-materialize-spatial-streams (after d2m-reblock-generics) checks, from
+  the blocking loops, block factors and views, that the consumer reads the
+  producer's final writes one block at a time in the producer's order, with
+  more than one block per (producer core, consumer core) pair. Otherwise the
+  edge keeps the whole-tensor handoff, with a remark giving the reason; the
+  whole-tensor handoff is correct for any edge.
+- Lowered so far between two 1x1 regions, with the producer's write outside
+  any reduction loop and no fan-out: the edge buffer becomes a ring of
+  `depth` blocks in the consumer core's L1 (`memref.alloc` with the
+  consumer's virtual grid mapping and `d2m.stream_ring`), which the producer
+  writes remotely. The GenericOp verifier accepts such a ring as an L1
+  output on other cores than the generic's. d2m-lower-spatial-edges then
+  synchronizes every block with one local semaphore, a HEAD count on the
+  consumer core and a CREDIT count on the producer core (see the pass
+  description). Multi-core regions, reduction producers and fan-out keep the
+  whole-tensor handoff for now.
 
 ## 3. Relation to existing code
 

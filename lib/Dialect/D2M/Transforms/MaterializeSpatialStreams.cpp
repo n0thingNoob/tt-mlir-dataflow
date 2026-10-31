@@ -7,13 +7,16 @@
 #include "ttmlir/Dialect/D2M/IR/D2MGenericRegionOps.h"
 #include "ttmlir/Dialect/D2M/IR/D2MOps.h"
 #include "ttmlir/Dialect/D2M/IR/D2MOpsInterfaces.h"
+#include "ttmlir/Dialect/D2M/Utils/Utils.h"
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
 
+#include <map>
 #include <string>
 
 namespace mlir::tt::d2m {
@@ -31,6 +34,8 @@ constexpr int64_t kMaxEvaluations = 1 << 22;
 struct Block {
   SmallVector<int64_t> tiles;
   int64_t owner = -1;
+  // Grid indices of the access (block coordinates in the accessed view).
+  SmallVector<int64_t> coord;
   bool operator==(const Block &other) const { return tiles == other.tiles; }
 };
 
@@ -267,6 +272,8 @@ public:
       return fail("the consumer loads it with a multicast inside its region");
     }
 
+    storeMemref = mlir::cast<RemoteStoreOp>(stores.front()).getMemref();
+    loadMemref = load.getMemref();
     std::optional<AccessTrace> writes =
         trace(producer, stores.front(),
               mlir::cast<RemoteStoreOp>(stores.front()).getMemref(),
@@ -369,6 +376,8 @@ public:
     if (blocksPerPair == 1) {
       return fail("one block per core pair, nothing to stream");
     }
+    writeTrace = std::move(*writes);
+    readTrace = std::move(*reads);
     summary = std::to_string(readerOf.size()) + " core pair" +
               (readerOf.size() == 1 ? "" : "s") + ", " +
               std::to_string(blocksPerPair) + " blocks of " + blockText +
@@ -378,6 +387,10 @@ public:
 
   std::string reason;
   std::string summary;
+  // Set by a successful run(): the accessed views and the access traces.
+  Value storeMemref, loadMemref;
+  AccessTrace writeTrace, readTrace;
+  bool storeInReduction = false;
 
 private:
   bool fail(const std::string &why) {
@@ -441,6 +454,9 @@ private:
         return std::nullopt;
       }
       loops.push_back({loop, 0, loop->hasAttr("d2m.reduction_loop")});
+      if (finalOnly && loops.back().reduction) {
+        storeInReduction = true;
+      }
     }
     std::reverse(loops.begin(), loops.end());
 
@@ -534,6 +550,7 @@ private:
             coord.push_back(*e);
           }
           Block &block = blocks.emplace_back();
+          block.coord = coord;
           SmallVector<int64_t> shardPos(rank, 0);
           for (int64_t n = 0; n < shardVolume; ++n) {
             SmallVector<int64_t> full(coord);
@@ -596,6 +613,185 @@ static std::string edgeName(SpatialEdgeAttr edge) {
          std::to_string(edge.getConsumerArg());
 }
 
+// The block ordinal (position in the access's sequence) as an affine function
+// of the access's block coordinates: base + sum_d stride_d * coord_d. Fitted on
+// steps of one coordinate and checked on every block.
+static std::optional<std::pair<SmallVector<int64_t>, int64_t>>
+fitOrdinal(ArrayRef<Block> blocks) {
+  size_t rank = blocks.front().coord.size();
+  std::map<SmallVector<int64_t>, int64_t> ordinalOf;
+  for (auto [j, block] : llvm::enumerate(blocks)) {
+    ordinalOf[block.coord] = j;
+  }
+  SmallVector<int64_t> stride(rank, 0);
+  for (size_t d = 0; d < rank; ++d) {
+    for (auto [j, block] : llvm::enumerate(blocks)) {
+      SmallVector<int64_t> next = block.coord;
+      ++next[d];
+      if (auto it = ordinalOf.find(next); it != ordinalOf.end()) {
+        stride[d] = it->second - static_cast<int64_t>(j);
+        break;
+      }
+    }
+  }
+  int64_t base = 0;
+  for (size_t d = 0; d < rank; ++d) {
+    base -= stride[d] * blocks.front().coord[d];
+  }
+  for (auto [j, block] : llvm::enumerate(blocks)) {
+    int64_t ordinal = base;
+    for (size_t d = 0; d < rank; ++d) {
+      ordinal += stride[d] * block.coord[d];
+    }
+    if (ordinal != static_cast<int64_t>(j)) {
+      return std::nullopt;
+    }
+  }
+  return std::make_pair(stride, base);
+}
+
+// Values from `view` down its view chain, excluding the root.
+static SmallVector<Value> viewChain(Value view) {
+  SmallVector<Value> chain;
+  while (auto op = view.getDefiningOp<ViewLayoutOp>()) {
+    chain.push_back(view);
+    view = op.getInput();
+  }
+  return chain;
+}
+
+// Replaces the edge buffer of a streaming edge by a ring of `depth` blocks in
+// the consumer core's L1, and both accesses by views of the ring whose block
+// coordinate selects slot (ordinal mod depth). Returns a reason, and changes
+// nothing, when the edge needs something not lowered yet.
+static std::optional<std::string> materializeRing(SpatialOp spatial,
+                                                  SpatialEdgeAttr edge,
+                                                  EdgeAnalysis &analysis,
+                                                  std::string &placed) {
+  auto genericOf = [&](unsigned region) {
+    return *spatial.getRegion(region).getOps<GenericOp>().begin();
+  };
+  GenericOp producer = genericOf(edge.getProducerRegion());
+  GenericOp consumer = genericOf(edge.getConsumerRegion());
+  if (producer.getGrid().getGridVolume() != 1 ||
+      consumer.getGrid().getGridVolume() != 1) {
+    return std::string("streaming between multi-core regions");
+  }
+  if (analysis.storeInReduction) {
+    return std::string("a producer that writes it inside a reduction loop");
+  }
+  Value buffer = spatial.getEdgeBuffer(edge);
+  auto alloc = buffer.getDefiningOp<memref::AllocOp>();
+  Value storeView = analysis.storeMemref, loadView = analysis.loadMemref;
+  if (!alloc || storeView == buffer || loadView == buffer) {
+    return std::string("an edge buffer that is not reached through views");
+  }
+  SmallVector<Value> chains = viewChain(storeView);
+  llvm::append_range(chains, viewChain(loadView));
+  for (OpOperand &use : buffer.getUses()) {
+    Operation *user = use.getOwner();
+    if (user == spatial.getOperation() || mlir::isa<memref::DeallocOp>(user) ||
+        llvm::is_contained(chains, user->getResult(0))) {
+      continue;
+    }
+    return std::string("an edge buffer with other uses");
+  }
+  auto storeType = mlir::cast<MemRefType>(storeView.getType());
+  auto loadType = mlir::cast<MemRefType>(loadView.getType());
+  ArrayRef<int64_t> block = storeType.getShape().drop_front(2);
+  if (block != loadType.getShape().drop_front(2)) {
+    return std::string("blocks of different shapes at the two ends");
+  }
+  auto writeOrdinal = fitOrdinal(analysis.writeTrace.perCore.front());
+  auto readOrdinal = fitOrdinal(analysis.readTrace.perCore.front());
+  if (!writeOrdinal || !readOrdinal) {
+    return std::string("a block order that is not affine in the views");
+  }
+
+  // The ring: one core (the consumer's), `depth` blocks stacked by rows.
+  MLIRContext *ctx = spatial.getContext();
+  int64_t depth = edge.getStreamDepth();
+  int64_t rows = block[0], cols = block[1];
+  auto bufferType = mlir::cast<MemRefType>(buffer.getType());
+  SmallVector<int64_t> shard = {depth * rows, cols};
+  SmallVector<int64_t> ringShape = {1, 1, depth * rows, cols};
+  auto ringType = MemRefType::get(
+      ringShape, bufferType.getElementType(),
+      ttcore::ShardLayoutAttr::get(shard, bufferType.getElementType(), 1),
+      bufferType.getMemorySpace());
+  OpBuilder builder(alloc);
+  auto ring = builder.create<memref::AllocOp>(alloc.getLoc(), ringType);
+  ring->setAttr(utils::kStreamRingAttr, UnitAttr::get(ctx));
+  ttcore::GridAttr grid = consumer.getGrid();
+  AffineMap physToVirt = grid.getPhysicalToVirtMap();
+  if (!physToVirt.isEmpty()) {
+    AffineMap virtToPhys = grid.getVirtToPhysicalMap();
+    unsigned n = virtToPhys.getNumResults();
+    AffineMap forward = AffineMap::get(
+        4, 0,
+        {virtToPhys.getResult(n - 2), virtToPhys.getResult(n - 1),
+         getAffineDimExpr(2, ctx), getAffineDimExpr(3, ctx)},
+        ctx);
+    ring->setAttr(utils::kVirtualGridForwardMappingAttr,
+                  AffineMapAttr::get(forward));
+    ring->setAttr(utils::kVirtualGridInverseMappingAttr,
+                  AffineMapAttr::get(physToVirt));
+  }
+
+  // A view with the access's type: block (d0, d1), tile (d2, d3) of it ->
+  // slot ((base + s0 d0 + s1 d1) mod depth), row slot * rows + d2.
+  auto ringView = [&](Value access,
+                      const std::pair<SmallVector<int64_t>, int64_t> &fit) {
+    auto [stride, base] = fit;
+    AffineExpr ordinal = getAffineConstantExpr(base, ctx);
+    for (unsigned d = 0; d < 2; ++d) {
+      ordinal = ordinal + getAffineDimExpr(d, ctx) * stride[d];
+    }
+    AffineExpr zero = getAffineConstantExpr(0, ctx);
+    AffineMap map = AffineMap::get(
+        4, 0,
+        {zero, zero, (ordinal % depth) * rows + getAffineDimExpr(2, ctx),
+         getAffineDimExpr(3, ctx)},
+        ctx);
+    OpBuilder b(access.getDefiningOp());
+    Value view = b.create<ViewLayoutOp>(access.getLoc(), access.getType(),
+                                        ring.getResult(), map,
+                                        /*reinterpretLayout=*/false);
+    access.replaceAllUsesWith(view);
+  };
+  ringView(storeView, *writeOrdinal);
+  ringView(loadView, *readOrdinal);
+  buffer.replaceUsesWithIf(ring.getResult(), [&](OpOperand &use) {
+    return mlir::isa<SpatialOp, memref::DeallocOp>(use.getOwner());
+  });
+  // The old access views are now dead; erase them, then the buffer.
+  for (Value view : chains) {
+    if (Operation *op = view.getDefiningOp(); op && view.use_empty()) {
+      op->erase();
+    }
+  }
+  for (bool erased = true; erased;) {
+    erased = false;
+    for (Operation *user : llvm::make_early_inc_range(buffer.getUsers())) {
+      if (mlir::isa<ViewLayoutOp>(user) && user->use_empty()) {
+        user->erase();
+        erased = true;
+      }
+    }
+  }
+  if (buffer.use_empty()) {
+    alloc.erase();
+  }
+  SmallVector<int64_t> core =
+      physToVirt.isEmpty() ? SmallVector<int64_t>{0, 0}
+                           : llvm::to_vector(llvm::drop_begin(
+                                 grid.getVirtToPhysicalMap().compose({0, 0})));
+  placed = "a ring of " + std::to_string(depth) + " blocks of " +
+           std::to_string(rows) + "x" + std::to_string(cols) +
+           " tiles in the L1 of consumer core " + coreString(core);
+  return std::nullopt;
+}
+
 class D2MMaterializeSpatialStreams
     : public impl::D2MMaterializeSpatialStreamsBase<
           D2MMaterializeSpatialStreams> {
@@ -605,10 +801,13 @@ public:
 
   void runOnOperation() final {
     MLIRContext *ctx = &getContext();
+    SmallVector<SpatialOp> spatials;
     getOperation()->walk([&](SpatialOp spatial) {
-      if (!spatial.hasEdges()) {
-        return;
+      if (spatial.hasEdges()) {
+        spatials.push_back(spatial);
       }
+    });
+    for (SpatialOp spatial : spatials) {
       SmallVector<SpatialEdgeAttr> edges =
           llvm::to_vector(spatial.getEdgesAttr().getAsRange<SpatialEdgeAttr>());
       // Edges that leave one output share one protocol (R11): they stream
@@ -623,7 +822,6 @@ public:
       }
       bool changed = false;
       for (auto &[source, members] : groups) {
-        SmallVector<std::string> summaries;
         std::string failure;
         for (unsigned index : members) {
           EdgeAnalysis analysis(spatial, edges[index]);
@@ -632,13 +830,26 @@ public:
                       " stays a whole-tensor handoff: " + analysis.reason;
             break;
           }
-          summaries.push_back("edge " + edgeName(edges[index]) +
-                              " can stream: " + analysis.summary);
+          spatial.emitRemark("edge " + edgeName(edges[index]) +
+                             " can stream: " + analysis.summary);
+          // Not lowered yet: these keep the whole-tensor handoff.
+          std::optional<std::string> missing;
+          std::string placed;
+          if (members.size() > 1) {
+            missing = "a streaming edge with fan-out";
+          } else {
+            missing = materializeRing(spatial, edges[index], analysis, placed);
+          }
+          if (missing) {
+            failure = "edge " + edgeName(edges[index]) +
+                      " stays a whole-tensor handoff: " + *missing +
+                      " is not lowered yet";
+            break;
+          }
+          spatial.emitRemark("edge " + edgeName(edges[index]) +
+                             " streams through " + placed);
         }
         if (failure.empty()) {
-          for (const std::string &s : summaries) {
-            spatial.emitRemark(s);
-          }
           continue;
         }
         if (members.size() > 1) {
@@ -659,7 +870,7 @@ public:
         spatial.setEdgesAttr(
             ArrayAttr::get(ctx, llvm::to_vector_of<Attribute>(edges)));
       }
-    });
+    }
   }
 };
 

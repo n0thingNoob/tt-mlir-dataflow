@@ -6,9 +6,11 @@
 
 #include "ttmlir/Dialect/D2M/IR/D2MGenericRegionOps.h"
 #include "ttmlir/Dialect/D2M/IR/D2MOps.h"
+#include "ttmlir/Dialect/D2M/Utils/Utils.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Builders.h"
 #include "llvm/ADT/MapVector.h"
@@ -295,6 +297,225 @@ static LogicalResult lowerEdgeGroup(SpatialOp spatial,
   return success();
 }
 
+// The scf.for blocking loops (d2m.blocking_loop) around `op` in its thread,
+// outer first.
+static SmallVector<scf::ForOp> blockingLoops(Operation *op) {
+  SmallVector<scf::ForOp> loops;
+  for (Operation *parent = op->getParentOp(); parent;
+       parent = parent->getParentOp()) {
+    if (auto loop = mlir::dyn_cast<scf::ForOp>(parent);
+        loop && loop->hasAttr("d2m.blocking_loop")) {
+      loops.push_back(loop);
+    }
+    if (mlir::isa<GenericOp>(parent)) {
+      break;
+    }
+  }
+  std::reverse(loops.begin(), loops.end());
+  return loops;
+}
+
+// The ops of one streaming edge in one thread: the DMA ops that move its
+// blocks, all in the body of the same innermost blocking loop, and the block
+// count and ordinal of the current iteration.
+struct BlockSite {
+  SmallVector<scf::ForOp> loops;
+  Operation *first = nullptr; // first op of the loop body holding a DMA op
+  Operation *last = nullptr;  // last such op
+  int64_t numBlocks = 1;
+};
+
+static FailureOr<BlockSite> findBlockSite(ArrayRef<Operation *> dmaOps,
+                                          SpatialOp spatial,
+                                          SpatialEdgeAttr edge) {
+  BlockSite site;
+  site.loops = blockingLoops(dmaOps.front());
+  for (Operation *op : dmaOps) {
+    if (blockingLoops(op) != site.loops) {
+      return spatial.emitOpError("edge ")
+             << edge << ": its DMA ops in one thread are in different loops";
+    }
+  }
+  if (site.loops.empty()) {
+    return spatial.emitOpError("edge ")
+           << edge << ": a streaming edge needs its DMA ops in blocking loops";
+  }
+  for (scf::ForOp loop : site.loops) {
+    std::optional<int64_t> lb = getConstantIntValue(loop.getLowerBound());
+    std::optional<int64_t> ub = getConstantIntValue(loop.getUpperBound());
+    std::optional<int64_t> step = getConstantIntValue(loop.getStep());
+    if (!lb || !ub || !step || *lb != 0 || *step != 1) {
+      return spatial.emitOpError("edge ")
+             << edge << ": a blocking loop around it is not 0..N step 1";
+    }
+    if (loop->hasAttr("d2m.reduction_loop")) {
+      return spatial.emitOpError("edge ")
+             << edge << ": streaming from a reduction loop is not lowered";
+    }
+    site.numBlocks *= *ub;
+  }
+  Block *body = site.loops.back().getBody();
+  for (Operation *op : dmaOps) {
+    Operation *top = body->findAncestorOpInBlock(*op);
+    if (!site.first || top->isBeforeInBlock(site.first)) {
+      site.first = top;
+    }
+    if (!site.last || site.last->isBeforeInBlock(top)) {
+      site.last = top;
+    }
+  }
+  return site;
+}
+
+// The block ordinal of the current iteration: the blocking loops' induction
+// variables, linearized row-major.
+static Value blockOrdinal(OpBuilder &builder, Location loc,
+                          ArrayRef<scf::ForOp> loops) {
+  Value ordinal = builder.create<arith::ConstantIndexOp>(loc, 0);
+  for (scf::ForOp loop : loops) {
+    Value extent = loop.getUpperBound();
+    ordinal = builder.create<arith::MulIOp>(loc, ordinal, extent);
+    ordinal =
+        builder.create<arith::AddIOp>(loc, ordinal, loop.getInductionVar());
+  }
+  return ordinal;
+}
+
+// Lowers one streaming edge whose buffer is a ring in the consumer's L1
+// (d2m-materialize-spatial-streams). One local semaphore: the consumer core's
+// copy counts the blocks written into its ring (HEAD), the producer core's
+// copy counts the blocks the consumer has read (CREDIT). For block n:
+//   producer: wait CREDIT >= n + 1 - depth; write the block; barrier;
+//             increment HEAD on the consumer core.
+//   consumer: wait HEAD >= n + 1; read the block; barrier; increment CREDIT on
+//             the producer core.
+// The producer finally waits for all credits, so no increment is in flight
+// when the program ends.
+static LogicalResult lowerStreamEdge(SpatialOp spatial, SpatialEdgeAttr edge,
+                                     OpBuilder &builder) {
+  auto getGeneric = [&](unsigned region) {
+    return *spatial.getRegion(region).getOps<GenericOp>().begin();
+  };
+  GenericOp producer = getGeneric(edge.getProducerRegion());
+  GenericOp consumer = getGeneric(edge.getConsumerRegion());
+  Value ring = spatial.getEdgeBuffer(edge);
+  auto isRing = [&](Value value) {
+    return SpatialOp::stripViews(value) == ring;
+  };
+
+  // The DMA ops that move the ring's blocks, and the threads that hold them.
+  auto collect = [&](GenericOp generic, bool isWrite,
+                     SmallVector<Operation *> &ops,
+                     SmallVector<Region *> &threads) {
+    for (auto [index, region] : llvm::enumerate(generic.getRegions())) {
+      if (generic.getRegionThreadType(index) != ThreadType::Datamovement) {
+        continue;
+      }
+      size_t before = ops.size();
+      region.walk([&](Operation *op) {
+        auto write = mlir::dyn_cast<DMAWriteOp>(op);
+        auto read = mlir::dyn_cast<DMAReadOp>(op);
+        if ((isWrite && write && isRing(write.getDst())) ||
+            (!isWrite && read && isRing(read.getSrc()))) {
+          ops.push_back(op);
+        }
+      });
+      if (ops.size() != before) {
+        threads.push_back(&region);
+      }
+    }
+  };
+  SmallVector<Operation *> writes, reads;
+  SmallVector<Region *> writers, readers;
+  collect(producer, /*isWrite=*/true, writes, writers);
+  collect(consumer, /*isWrite=*/false, reads, readers);
+  if (writers.size() != 1 || readers.size() != 1) {
+    return spatial.emitOpError("edge ")
+           << edge << ": a streaming edge needs one writing thread in the "
+           << "producer and one reading thread in the consumer, got "
+           << writers.size() << " and " << readers.size();
+  }
+  FailureOr<BlockSite> writeSite = findBlockSite(writes, spatial, edge);
+  FailureOr<BlockSite> readSite = findBlockSite(reads, spatial, edge);
+  if (failed(writeSite) || failed(readSite)) {
+    return failure();
+  }
+  if (writeSite->numBlocks != readSite->numBlocks) {
+    return spatial.emitOpError("edge ")
+           << edge << ": the producer writes " << writeSite->numBlocks
+           << " blocks but the consumer reads " << readSite->numBlocks;
+  }
+  for (GenericOp generic : {producer, consumer}) {
+    if (countLocalSemaphoreArgs(generic) + 1 > kMaxLocalSemaphoresPerCore) {
+      return spatial.emitOpError("edge ")
+             << edge << ": more than " << kMaxLocalSemaphoresPerCore
+             << " local semaphores on one core range";
+    }
+  }
+
+  Location loc = spatial.getLoc();
+  builder.setInsertionPoint(spatial);
+  Value semaphore = builder.create<CreateLocalSemaphoreOp>(
+      loc, builder.getType<LocalSemaphoreType>(), 0u);
+  producer.getAdditionalArgsMutable().append(semaphore);
+  consumer.getAdditionalArgsMutable().append(semaphore);
+
+  // semaphore_inc core indices are virtual coordinates of the issuing generic.
+  auto coreIn = [&](GenericOp issuer, GenericOp target) {
+    auto [y, x] = getLogicalCores(target).front();
+    AffineMap physToVirt = issuer.getGrid().getPhysicalToVirtMap();
+    if (!physToVirt.isEmpty()) {
+      SmallVector<int64_t> virt = physToVirt.compose({y, x});
+      y = virt[virt.size() - 2];
+      x = virt[virt.size() - 1];
+    }
+    return std::make_pair(y, x);
+  };
+  auto increment = [&](GenericOp issuer, GenericOp target) {
+    auto [y, x] = coreIn(issuer, target);
+    Value one = builder.create<arith::ConstantIndexOp>(loc, 1);
+    Value coreY = builder.create<arith::ConstantIndexOp>(loc, y);
+    Value coreX = builder.create<arith::ConstantIndexOp>(loc, x);
+    builder.create<SemaphoreIncOp>(loc, semaphore, one,
+                                   ValueRange{coreY, coreX});
+  };
+  auto waitAtLeast = [&](Value value) {
+    builder.create<SemaphoreWaitOp>(loc, semaphore, value,
+                                    /*resetValue=*/nullptr,
+                                    builder.getUnitAttr());
+  };
+  auto barrier = [&](DMAType type) {
+    Value tx = builder.create<NullTxOp>(loc, type);
+    builder.create<DMAWaitOp>(loc, tx);
+  };
+
+  // Producer: wait for a free slot, then signal the written block.
+  int64_t depth = edge.getStreamDepth();
+  builder.setInsertionPoint(writeSite->first);
+  Value n = blockOrdinal(builder, loc, writeSite->loops);
+  Value credits = builder.create<arith::SubIOp>(
+      loc, n, builder.create<arith::ConstantIndexOp>(loc, depth - 1));
+  credits = builder.create<arith::MaxSIOp>(
+      loc, credits, builder.create<arith::ConstantIndexOp>(loc, 0));
+  waitAtLeast(credits);
+  builder.setInsertionPointAfter(writeSite->last);
+  barrier(DMAType::Write);
+  increment(producer, consumer);
+  builder.setInsertionPointToEnd(&writers.front()->front());
+  waitAtLeast(
+      builder.create<arith::ConstantIndexOp>(loc, writeSite->numBlocks));
+
+  // Consumer: wait for the block, then return its slot.
+  builder.setInsertionPoint(readSite->first);
+  Value m = blockOrdinal(builder, loc, readSite->loops);
+  waitAtLeast(builder.create<arith::AddIOp>(
+      loc, m, builder.create<arith::ConstantIndexOp>(loc, 1)));
+  builder.setInsertionPointAfter(readSite->last);
+  barrier(DMAType::Read);
+  increment(consumer, producer);
+  return success();
+}
+
 class D2MLowerSpatialEdges
     : public impl::D2MLowerSpatialEdgesBase<D2MLowerSpatialEdges> {
 public:
@@ -319,13 +540,24 @@ public:
             edge);
       }
       for (auto &[source, edges] : groups) {
-        // Streaming is not lowered yet: such edges keep the whole-tensor
-        // handoff, which is correct for any edge.
+        // A streaming edge whose ring d2m-materialize-spatial-streams built
+        // streams. Any other edge, including a streaming edge without a ring
+        // (that pass did not run), gets the whole-tensor handoff, which is
+        // correct for any edge.
+        Operation *bufferDef =
+            spatial.getEdgeBuffer(edges.front()).getDefiningOp();
+        if (edges.size() == 1 && edges.front().isStream() && bufferDef &&
+            bufferDef->hasAttr(utils::kStreamRingAttr)) {
+          if (failed(lowerStreamEdge(spatial, edges.front(), builder))) {
+            return WalkResult::interrupt();
+          }
+          continue;
+        }
         for (SpatialEdgeAttr edge : edges) {
           if (edge.isStream()) {
             spatial.emitRemark("edge ")
-                << edge << " asks for a streaming handoff, which is not "
-                << "lowered yet; it uses the whole-tensor handoff";
+                << edge << " asks for a streaming handoff without a ring; "
+                << "it uses the whole-tensor handoff";
           }
         }
         if (failed(lowerEdgeGroup(spatial, edges, builder))) {

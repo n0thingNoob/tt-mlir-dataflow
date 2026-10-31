@@ -2066,9 +2066,15 @@ MutableArrayRef<OpOperand> d2m::GenericOp::getInputsAndOutputsMutable() {
     //    grid shape matching the output's grid shape.
     // DRAM outputs may carry VGM attrs used for address calculation, but they
     // are not constrained by the GenericOp's L1 execution grid.
+    // A streaming edge's ring is written by the producer but lives on the
+    // consumer's cores.
+    auto isStreamRing = [](Value output) {
+      Operation *root = SpatialOp::stripViews(output).getDefiningOp();
+      return root && root->hasAttr(utils::kStreamRingAttr);
+    };
     AffineMap gridInvMap = getGrid().getPhysicalToVirtMap();
     for (Value output : getOutputs()) {
-      if (!isDRAM(output)) {
+      if (!isDRAM(output) && !isStreamRing(output)) {
         auto outputInvMap = utils::getVirtualGridInverseMapping(output);
         if (outputInvMap && *outputInvMap != gridInvMap) {
           return emitOpError(

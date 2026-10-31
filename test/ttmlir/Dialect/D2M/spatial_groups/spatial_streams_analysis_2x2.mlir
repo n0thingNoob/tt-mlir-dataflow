@@ -6,9 +6,12 @@
 
 // 1024x1024: ReblockGenerics gives both generics [8, 8], so every core
 // writes and reads 64 blocks of 2x2 tiles in the same row-major order.
+// Streaming between multi-core regions is not lowered yet, so the edge keeps
+// the whole-tensor handoff.
 // CHECK: remark: edge 0:0 -> 1:0 can stream: 4 core pairs, 64 blocks of 2x2 tiles each, in the producer's order
+// CHECK: remark: edge 0:0 -> 1:0 stays a whole-tensor handoff: streaming between multi-core regions is not lowered yet
 // CHECK-LABEL: IR Dump After D2MMaterializeSpatialStreams
-// CHECK: d2m.spatial {edges = [#d2m.spatial_edge<0:0 -> 1:0, stream<depth = 2>>]
+// CHECK: d2m.spatial {edges = [#d2m.spatial_edge<0:0 -> 1:0>]
 func.func @chain_1024(%x: tensor<1024x1024xbf16>) -> tensor<1024x1024xbf16> {
   %t = "ttir.tanh"(%x) : (tensor<1024x1024xbf16>) -> tensor<1024x1024xbf16>
   %e = "ttir.exp"(%t) : (tensor<1024x1024xbf16>) -> tensor<1024x1024xbf16>
