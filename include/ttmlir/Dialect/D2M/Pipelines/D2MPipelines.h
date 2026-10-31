@@ -61,8 +61,14 @@ struct D2MPipelineOptions : public PassPipelineOptions<D2MPipelineOptions> {
                      "spatial-groups whose edge should stream.")};
   ListOption<int64_t> spatialStreamBlock{
       *this, "spatial-stream-block",
-      llvm::cl::desc("Block (R, C tiles per core) for every edge in "
-                     "spatial-streams.")};
+      llvm::cl::desc("Block (R, C tiles per core) for every streaming edge.")};
+  Option<std::string> spatialStreamPolicy{
+      *this, "spatial-stream-policy",
+      llvm::cl::desc("Streaming policy: none (only the edges spatial-streams "
+                     "names) or auto (every spatial edge streams with depth 2; "
+                     "the ones that cannot fall back to a whole-tensor "
+                     "handoff)."),
+      llvm::cl::init("none")};
 
   ListOption<int64_t> spatialSkipGenerics{
       *this, "spatial-skip-generics",

@@ -31,6 +31,9 @@ namespace mlir::tt::d2m {
 
 namespace {
 
+// The ring depth `stream-policy=auto` gives every edge: double buffering.
+constexpr int64_t kAutoStreamDepth = 2;
+
 struct GenericDAGNode {
   GenericOp generic;
   SmallVector<unsigned> predecessors;
@@ -233,7 +236,8 @@ public:
       signalPassFailure();
       return;
     }
-    if (!greedy && !given && loads.empty() && streams.empty()) {
+    if (!greedy && !given && loads.empty() && streams.empty() &&
+        streamPolicy == "none") {
       markAllAnalysesPreserved();
     }
   }
@@ -606,11 +610,19 @@ LogicalResult D2MSpatialPlanningPass::applyGivenGroups(ModuleOp module,
 }
 
 // Records on each generic `streams` names which inputs should stream:
-// (generic, operand, depth) per input, plus the `stream-block` shape.
+// (generic, operand, depth) per input, plus the `stream-block` shape. With
+// `stream-policy=auto`, also marks every grouped generic so that all of its
+// edges stream (d2m.spatial_stream_all).
 LogicalResult D2MSpatialPlanningPass::applyGivenStreams(ModuleOp module) {
-  if (streams.empty()) {
+  bool all = streamPolicy == "auto";
+  if (!all && streamPolicy != "none") {
+    return module.emitError("stream-policy must be none or auto, got ")
+           << streamPolicy;
+  }
+  if (streams.empty() && !all) {
     if (!streamBlock.empty()) {
-      return module.emitError("stream-block needs streams");
+      return module.emitError("stream-block needs streams or "
+                              "stream-policy=auto");
     }
     return success();
   }
@@ -630,6 +642,15 @@ LogicalResult D2MSpatialPlanningPass::applyGivenStreams(ModuleOp module) {
     for (Block &block : func.getBody()) {
       for (const GenericDAGNode &node : buildGenericDAG(block)) {
         generics.push_back(node.generic);
+      }
+    }
+  }
+  if (all) {
+    for (GenericOp generic : generics) {
+      if (generic->hasAttr(kSpatialGroupAttr)) {
+        generic->setAttr(kSpatialStreamAllAttr,
+                         DenseI64ArrayAttr::get(&getContext(),
+                                                {kAutoStreamDepth, rows, cols}));
       }
     }
   }
@@ -676,7 +697,8 @@ LogicalResult D2MSpatialPlanningPass::applyGivenStreams(ModuleOp module) {
 }
 
 // The iteration order for a load whose inputs `inputs` the consumers read
-// as streams (an input named in the consumer's d2m.spatial_streams): the
+// as streams (an input named in the consumer's d2m.spatial_streams, or any
+// input of a consumer with d2m.spatial_stream_all): the
 // copy's dims, slowest-varying in the consumer's loops first, as the load's
 // indexing map (copy dim r = load loop position). nullopt when no input
 // streams, when the streaming consumers disagree, or when the order is the
@@ -686,15 +708,13 @@ streamedLoadOrder(ArrayRef<OpOperand *> inputs) {
   std::optional<SmallVector<unsigned>> order;
   for (OpOperand *input : inputs) {
     auto consumer = mlir::cast<GenericOp>(input->getOwner());
-    auto streams =
-        consumer->getAttrOfType<DenseI64ArrayAttr>(kSpatialStreamsAttr);
-    if (!streams) {
-      continue;
-    }
-    bool streamed = false;
-    ArrayRef<int64_t> list = streams.asArrayRef();
-    for (size_t i = 0; i + 3 < list.size(); i += 4) {
-      streamed |= list[i] == input->getOperandNumber();
+    bool streamed = consumer->hasAttr(kSpatialStreamAllAttr);
+    if (auto streams =
+            consumer->getAttrOfType<DenseI64ArrayAttr>(kSpatialStreamsAttr)) {
+      ArrayRef<int64_t> list = streams.asArrayRef();
+      for (size_t i = 0; i + 3 < list.size(); i += 4) {
+        streamed |= list[i] == input->getOperandNumber();
+      }
     }
     if (!streamed) {
       continue;
@@ -852,8 +872,8 @@ LogicalResult D2MSpatialPlanningPass::insertGivenLoads(ModuleOp module) {
       outputs.push_back(builder.create<EmptyOp>(
           loc, type.getShape(), type.getElementType(), l1Layout));
     }
-    // A load whose copies stream to their consumers (d2m.spatial_streams on
-    // the consumer, set by `streams`) walks its blocks in the order the
+    // A load whose copies stream to their consumers (d2m.spatial_streams or
+    // d2m.spatial_stream_all on the consumer) walks its blocks in the order the
     // consumers read them, so that the copy streams (d2m-reblock-generics
     // gives it the consumers' blocks): its outer loop is the copy's dim that
     // the consumer's loops vary slowest. Otherwise it keeps the identity

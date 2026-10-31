@@ -24,6 +24,13 @@ inline constexpr llvm::StringLiteral kSpatialRangeAttr = "d2m.spatial_range";
 inline constexpr llvm::StringLiteral kSpatialStreamsAttr =
     "d2m.spatial_streams";
 
+// Every input of a grouped generic that becomes an edge streams, unless
+// d2m.spatial_streams names it: an i64 array (depth, block rows, block cols).
+// Set by d2m-spatial-planning (`stream-policy=auto`), consumed and removed by
+// d2m-materialize-spatial-groups.
+inline constexpr llvm::StringLiteral kSpatialStreamAllAttr =
+    "d2m.spatial_stream_all";
+
 // True when `a` and `b` describe the same tensor apart from where it lives:
 // equal device shape and element type, and layouts that differ at most in
 // memory space and in collapsed_intervals with logical rank <= 2 (where any

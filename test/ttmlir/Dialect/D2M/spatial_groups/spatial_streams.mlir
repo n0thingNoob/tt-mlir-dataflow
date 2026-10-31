@@ -39,7 +39,7 @@
 // ERR-DEPTH: error: 'd2m.generic' op streams asks for depth 9 on input 0 of generic #2; it must be in [1, 8]
 // ERR-TWICE: error: 'd2m.generic' op streams names input 0 of generic #2 twice
 // ERR-BLOCK: error: stream-block takes two positive values (R, C)
-// ERR-NOSTREAMS: error: stream-block needs streams
+// ERR-NOSTREAMS: error: stream-block needs streams or stream-policy=auto
 // ERR-NOTEDGE: error: 'd2m.generic' op d2m.spatial_streams names input 0, which does not read another member of spatial group 0
 func.func @glu(%x: tensor<32x256xbf16>, %wg: tensor<256x256xbf16>, %wu: tensor<256x256xbf16>, %wd: tensor<256x256xbf16>) -> tensor<32x256xbf16> {
   %g = "ttir.matmul"(%x, %wg) : (tensor<32x256xbf16>, tensor<256x256xbf16>) -> tensor<32x256xbf16>

@@ -232,6 +232,13 @@ An edge may ask for a second handoff protocol:
   `spatial-stream-block` (R, C) adds `block = RxC` to all of them. Planning
   records them on the generic (`d2m.spatial_streams`) and
   d2m-materialize-spatial-groups puts them on the edges that input becomes.
+- Automatically: `spatial-stream-policy=auto` (`stream-policy` on
+  d2m-spatial-planning) marks every grouped generic
+  (`d2m.spatial_stream_all`), so every edge gets `stream<depth = 2>` (and
+  `spatial-stream-block`, if given), except the inputs `spatial-streams`
+  names, which keep their own fields. The checks below demote the edges that
+  cannot stream. The default, `none`, streams only what `spatial-streams`
+  names.
 - d2m-materialize-spatial-streams (after d2m-reblock-generics) checks, from
   the blocking loops, block factors and views, that the consumer reads the
   producer's final writes one block at a time in the producer's order, with

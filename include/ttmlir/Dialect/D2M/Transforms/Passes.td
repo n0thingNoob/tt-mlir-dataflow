@@ -60,6 +60,12 @@ def D2MSpatialPlanning : Pass<"d2m-spatial-planning", "::mlir::ModuleOp"> {
     blocks in the order its consumers read them (its outer loop is the copy
     dim the consumer's loops vary slowest). `stream-block` (R, C) adds
     `block = RxC` to all of them.
+
+    `stream-policy=auto` asks for every edge of every group to stream with
+    depth 2 (and `stream-block`), except the inputs `streams` names; the
+    edges that cannot stream fall back to a whole-tensor handoff in
+    d2m-materialize-spatial-streams, with a remark. The default, none, streams
+    only what `streams` names.
   }];
   let options = [
     Option<"policy", "policy", "std::string", /*default=*/"\"none\"",
@@ -75,7 +81,9 @@ def D2MSpatialPlanning : Pass<"d2m-spatial-planning", "::mlir::ModuleOp"> {
     ListOption<"streams", "streams", "int64_t",
                "Streaming edges given by hand: (generic, operand, depth) per input of a grouped generic, generic indices as in groups.">,
     ListOption<"streamBlock", "stream-block", "int64_t",
-               "Block (R, C tiles per core) for every edge in streams; empty leaves it to d2m-reblock-generics.">,
+               "Block (R, C tiles per core) for every streaming edge; empty leaves it to d2m-reblock-generics.">,
+    Option<"streamPolicy", "stream-policy", "std::string", /*default=*/"\"none\"",
+           "Streaming policy: none (only the edges streams names) or auto (every edge; the ones that cannot stream fall back).">,
     Option<"maxCbs", "max-cbs", "int64_t", /*default=*/"32",
            "CBs available per core.">,
     Option<"maxSemaphores", "max-semaphores", "int64_t", /*default=*/"16",
