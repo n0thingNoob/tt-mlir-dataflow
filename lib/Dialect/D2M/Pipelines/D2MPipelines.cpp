@@ -126,12 +126,20 @@ void createD2MFrontendPipeline(OpPassManager &pm,
         llvm::to_vector(options.spatialExcludeCores);
     d2m::D2MSpatialPlanningOptions planningOptions;
     {
-      planningOptions.policy = "greedy";
+      planningOptions.policy = options.spatialPolicy;
+      planningOptions.groups = llvm::to_vector(options.spatialGroups);
       planningOptions.excludeCores = excludeCores;
       planningOptions.skipGenerics =
           llvm::to_vector(options.spatialSkipGenerics);
       planningOptions.remarks = options.spatialRemarks;
       planningOptions.ttnnMode = options.ttnnMode;
+    }
+    if (options.spatialFuseElementwise) {
+      // Before GridSelection every generic still has the 1x1 grid TTIRToD2M
+      // gives it, so elementwise chains are fusable once the device-host
+      // round trips between them are folded.
+      pm.addPass(createCanonicalizerPassWithOptions(options));
+      pm.addPass(d2m::createD2MGenericFusion());
     }
     pm.addPass(d2m::createD2MSpatialPlanning(planningOptions));
     d2m::D2MMaterializeSpatialGroupsOptions groupOptions;

@@ -28,6 +28,28 @@ struct D2MPipelineOptions : public PassPipelineOptions<D2MPipelineOptions> {
                      "d2m.spatial_group attributes)")),
       llvm::cl::init(D2MExecutionStrategy::Temporal)};
 
+  Option<std::string> spatialPolicy{
+      *this, "spatial-policy",
+      llvm::cl::desc("Spatial planning policy: greedy (group automatically) "
+                     "or none (only the groups given by spatial-groups or "
+                     "already in the IR)."),
+      llvm::cl::init("greedy")};
+
+  Option<bool> spatialFuseElementwise{
+      *this, "spatial-fuse-elementwise",
+      llvm::cl::desc("With execution-strategy=spatial, fuse elementwise "
+                     "generics (d2m-generic-fusion, after a canonicalization "
+                     "that folds the to_layout round trips between them) "
+                     "before spatial planning, so a chain of elementwise ops "
+                     "takes one region."),
+      llvm::cl::init(false)};
+
+  ListOption<int64_t> spatialGroups{
+      *this, "spatial-groups",
+      llvm::cl::desc("Spatial groups given by hand: (group, generic, y0, x0, "
+                     "y1, x1) per generic, generic indices as in "
+                     "spatial-skip-generics.")};
+
   ListOption<int64_t> spatialSkipGenerics{
       *this, "spatial-skip-generics",
       llvm::cl::desc("Indices (module order) of top-level generics that "
