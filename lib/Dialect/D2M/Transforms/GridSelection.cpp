@@ -679,6 +679,57 @@ static void applySpatialEdgeUpdate(const OperandGridInfo &info, bool ttnnMode) {
       info, mlir::cast<RankedTensorType>(arg.getType()), ttnnMode));
 }
 
+// Read a d2m.spatial edge that its producer laid out on another grid: keep the
+// block argument at the producer's type and give the consumer generic a view
+// of it reblocked to `grid` (the same mapping LowerToLayout's L1 reshard
+// uses, without the copy).
+static LogicalResult insertSpatialEdgeReshardView(d2m::GenericOp genericOp,
+                                                  unsigned operandIndex,
+                                                  ArrayRef<int64_t> grid,
+                                                  const OperandGridInfo &info,
+                                                  OpBuilder &builder) {
+  OpOperand &operand = genericOp->getOpOperand(operandIndex);
+  Value edge = operand.get();
+  auto edgeType = mlir::cast<RankedTensorType>(edge.getType());
+  auto edgeLayout = mlir::cast<ttcore::MetalLayoutAttr>(edgeType.getEncoding());
+  // The view keeps the edge's layout (logical shape, alignments, collapse) and
+  // only changes the grid, so the remapping is a pure block reblock in the
+  // edge's device space (tiles stay tiles; a layout change would need an
+  // untilize/tilize, which a view cannot do).
+  llvm::SmallVector<int64_t> tileShape;
+  if (auto tileType =
+          mlir::dyn_cast<ttcore::TileType>(edgeType.getElementType())) {
+    tileShape = llvm::to_vector(tileType.getShape());
+  }
+  llvm::SmallVector<int64_t> physicalShape =
+      edgeLayout.getPhysicalShape(tileShape);
+  if (physicalShape.size() != grid.size() ||
+      llvm::any_of(llvm::zip_equal(physicalShape, grid), [](auto pair) {
+        return std::get<0>(pair) % std::get<1>(pair) != 0;
+      })) {
+    return genericOp.emitOpError()
+           << "operand " << operandIndex
+           << " is a d2m.spatial edge laid out on grid "
+           << ttmlir::utils::formatIterable(info.selectedGrid, "x")
+           << " by its producer; its blocks do not divide evenly over grid "
+           << ttmlir::utils::formatIterable(grid, "x");
+  }
+  auto viewType =
+      RankedTensorType::get(edgeLayout.getDeviceShape(grid, tileShape),
+                            edgeType.getElementType(), edgeLayout);
+  AffineMap remapping = ttmlir::utils::calculateReblockMap(
+      edgeType.getShape(), viewType.getShape(), builder.getContext());
+  builder.setInsertionPoint(genericOp);
+  auto view = builder.create<d2m::ViewLayoutOp>(genericOp.getLoc(), viewType,
+                                                edge, remapping,
+                                                /*reinterpretLayout=*/false);
+  // The operand and the generic body's loads of it.
+  edge.replaceUsesWithIf(view.getResult(), [&](OpOperand &use) {
+    return genericOp->isAncestor(use.getOwner());
+  });
+  return success();
+}
+
 // Recreate the d2m.generic with updated operands.
 // After updating ToLayout and ViewLayout ops, the generic's operands have
 // new types with the selected grids. The generic grid is still anchored by
@@ -734,18 +785,6 @@ static LogicalResult applyGridDecisions(d2m::GenericOp genericOp,
              "Expected 2D effective target grid shape");
   TT_assertv(effectiveTargetGridRange.offset.size() == 2u,
              "Expected 2D effective target grid offset");
-  if (!result.mismatchedEdgeOperands.empty()) {
-    unsigned operandIndex = result.mismatchedEdgeOperands.front();
-    return genericOp.emitOpError()
-           << "operand " << operandIndex
-           << " is a d2m.spatial edge laid out on grid "
-           << ttmlir::utils::formatIterable(
-                  result.operandInfos[operandIndex].selectedGrid, "x")
-           << " by its producer, but this generic needs grid "
-           << ttmlir::utils::formatIterable(
-                  result.normalizedOperandGrids[operandIndex], "x")
-           << "; resharding an edge is not supported";
-  }
   OpBuilder builder(genericOp->getContext());
 
   // Classify operands upfront: once apply* mutates IR, defining ops for
@@ -826,6 +865,18 @@ static LogicalResult applyGridDecisions(d2m::GenericOp genericOp,
   for (auto [info, kind] : llvm::zip_equal(result.operandInfos, kinds)) {
     if (kind == Kind::ViewLayout) {
       applyViewLayoutUpdate(info, ttnnMode, builder);
+    }
+  }
+
+  // An edge laid out on another grid by its producer: read it through a view
+  // that reblocks it to this generic's grid (the consumer pulls each block
+  // from the producer cores that hold it).
+  for (unsigned operandIndex : result.mismatchedEdgeOperands) {
+    if (failed(insertSpatialEdgeReshardView(
+            genericOp, operandIndex,
+            result.normalizedOperandGrids[operandIndex],
+            result.operandInfos[operandIndex], builder))) {
+      return failure();
     }
   }
 

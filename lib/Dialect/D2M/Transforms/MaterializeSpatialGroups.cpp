@@ -174,10 +174,15 @@ LogicalResult D2MMaterializeSpatialGroupsPass::materialize(Group &group,
 
   // Classify every member input: an edge from another member (through a
   // foldable to_layout / no-op mask chain) or a value from outside.
+  // A composite_view operand (a concatenation) is classified per input: each
+  // input read from a member is its own edge (`compositeInput` is its index
+  // in the view; -1 for a plain operand), and the view is rebuilt inside the
+  // consumer region over the edges' block arguments.
   struct EdgeUse {
     unsigned operandIndex;
     unsigned producer;
     unsigned producerResult;
+    int compositeInput = -1;
   };
   SmallVector<SmallVector<EdgeUse>> edgeUses(group.members.size());
   for (auto [c, generic] : llvm::enumerate(group.members)) {
@@ -188,31 +193,44 @@ LogicalResult D2MMaterializeSpatialGroupsPass::materialize(Group &group,
       if (!readsMember) {
         continue;
       }
-      OpResult src = traceEdgeSource(operand.get());
-      if (!src || !memberIndex.contains(src.getOwner())) {
-        return generic.emitOpError("input ")
-               << operand.getOperandNumber()
-               << " reads another member of spatial group " << group.id
-               << " through ops that cannot be an edge (only to_layout and "
-                  "no-op mask are folded)";
+      SmallVector<std::pair<Value, int>> sources = {{operand.get(), -1}};
+      if (auto composite = operand.get().getDefiningOp<CompositeViewOp>()) {
+        sources.clear();
+        for (auto [i, input] : llvm::enumerate(composite.getInputs())) {
+          if (llvm::any_of(producerGenerics(input, block), [&](Operation *p) {
+                return memberIndex.contains(p);
+              })) {
+            sources.push_back({input, static_cast<int>(i)});
+          }
+        }
       }
-      Type dst = operand.get().getType();
-      if (!isL1Layout(src.getType()) ||
-          (!isL1Layout(dst) && !isDRAMLayout(dst))) {
-        return generic.emitOpError("input ")
-               << operand.getOperandNumber() << " reads another member of "
-               << "spatial group " << group.id
-               << " outside L1; an edge buffer must stay in L1";
+      for (auto [source, compositeInput] : sources) {
+        OpResult src = traceEdgeSource(source);
+        if (!src || !memberIndex.contains(src.getOwner())) {
+          return generic.emitOpError("input ")
+                 << operand.getOperandNumber()
+                 << " reads another member of spatial group " << group.id
+                 << " through ops that cannot be an edge (only to_layout, "
+                    "no-op mask and a composite_view of such chains)";
+        }
+        Type dst = source.getType();
+        if (!isL1Layout(src.getType()) ||
+            (!isL1Layout(dst) && !isDRAMLayout(dst))) {
+          return generic.emitOpError("input ")
+                 << operand.getOperandNumber() << " reads another member of "
+                 << "spatial group " << group.id
+                 << " outside L1; an edge buffer must stay in L1";
+        }
+        if (!sameLayoutExceptMemorySpace(src.getType(), dst)) {
+          return generic.emitOpError("input ")
+                 << operand.getOperandNumber()
+                 << " needs a layout change from its producer in spatial group "
+                 << group.id << "; resharding an edge is not supported";
+        }
+        edgeUses[c].push_back({operand.getOperandNumber(),
+                               memberIndex[src.getOwner()],
+                               src.getResultNumber(), compositeInput});
       }
-      if (!sameLayoutExceptMemorySpace(src.getType(), dst)) {
-        return generic.emitOpError("input ")
-               << operand.getOperandNumber()
-               << " needs a layout change from its producer in spatial group "
-               << group.id << "; resharding an edge is not supported";
-      }
-      edgeUses[c].push_back({operand.getOperandNumber(),
-                             memberIndex[src.getOwner()],
-                             src.getResultNumber()});
     }
   }
 
@@ -287,6 +305,17 @@ LogicalResult D2MMaterializeSpatialGroupsPass::materialize(Group &group,
             return e.operandIndex == operand.getOperandNumber();
           })) {
         inputs.insert(operand.get());
+      } else if (auto composite =
+                     operand.get().getDefiningOp<CompositeViewOp>()) {
+        for (auto [i, input] : llvm::enumerate(composite.getInputs())) {
+          int inputIndex = static_cast<int>(i);
+          if (llvm::none_of(edgeUses[c], [&](EdgeUse &e) {
+                return e.operandIndex == operand.getOperandNumber() &&
+                       e.compositeInput == inputIndex;
+              })) {
+            inputs.insert(input);
+          }
+        }
       }
     }
   }
@@ -311,6 +340,9 @@ LogicalResult D2MMaterializeSpatialGroupsPass::materialize(Group &group,
     Block *body = builder.createBlock(&spatial->getRegion(c));
     // One block argument per (producer, result) read by this region.
     llvm::MapVector<std::pair<unsigned, unsigned>, BlockArgument> args;
+    // Composite operands: their inputs, with the edge inputs replaced by
+    // block arguments as they are created.
+    llvm::MapVector<unsigned, SmallVector<Value>> compositeInputs;
     for (EdgeUse &use : edgeUses[c]) {
       auto key = std::make_pair(use.producer, use.producerResult);
       OpOperand &operand = generic->getOpOperand(use.operandIndex);
@@ -323,11 +355,30 @@ LogicalResult D2MMaterializeSpatialGroupsPass::materialize(Group &group,
                                              use.producerResult, c,
                                              it->second.getArgNumber()));
       }
+      if (use.compositeInput >= 0) {
+        auto composite = operand.get().getDefiningOp<CompositeViewOp>();
+        auto [entry, first] = compositeInputs.try_emplace(
+            use.operandIndex, llvm::to_vector(composite.getInputs()));
+        entry->second[use.compositeInput] = it->second;
+        continue;
+      }
       // Retype a collapsed_intervals-only or memory-space-only difference to
       // the producer's type (R5 needs equal types on both ends): a DRAM
       // operand then reads the producer's L1 buffer directly.
       Value old = operand.get();
       old.replaceUsesWithIf(it->second, [&](OpOperand &u) {
+        return generic->isAncestor(u.getOwner());
+      });
+      noteMaybeDead(old);
+    }
+    builder.setInsertionPointToEnd(body);
+    for (auto &[operandIndex, viewInputs] : compositeInputs) {
+      Value old = generic->getOperand(operandIndex);
+      auto composite = old.getDefiningOp<CompositeViewOp>();
+      auto view = builder.create<CompositeViewOp>(
+          composite.getLoc(), composite.getType(), viewInputs,
+          composite.getDimAttr(), composite.getLogicalSizesAttr());
+      old.replaceUsesWithIf(view.getResult(), [&](OpOperand &u) {
         return generic->isAncestor(u.getOwner());
       });
       noteMaybeDead(old);
@@ -356,7 +407,8 @@ LogicalResult D2MMaterializeSpatialGroupsPass::materialize(Group &group,
   // no member needs them).
   while (!maybeDead.empty()) {
     Operation *def = maybeDead.pop_back_val();
-    if (!def->use_empty() || !mlir::isa<ToLayoutOp, MaskOp, EmptyOp>(def)) {
+    if (!def->use_empty() ||
+        !mlir::isa<ToLayoutOp, MaskOp, EmptyOp, CompositeViewOp>(def)) {
       continue;
     }
     for (Value operand : def->getOperands()) {

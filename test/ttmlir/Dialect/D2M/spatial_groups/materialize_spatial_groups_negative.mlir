@@ -241,7 +241,7 @@ func.func @real_mask(%arg0: !H) -> (!H) {
   %m0 = d2m.empty() : !O
   %a3 = d2m.mask %a, %m0 logical_shape = [50, 50] fill_value = <zero> : !O into !O -> !O
   %o1 = d2m.empty() : !O
-  // expected-error @+1 {{input 0 reads another member of spatial group 0 through ops that cannot be an edge (only to_layout and no-op mask are folded)}}
+  // expected-error @+1 {{input 0 reads another member of spatial group 0 through ops that cannot be an edge (only to_layout, no-op mask and a composite_view of such chains)}}
   %b = d2m.generic {d2m.spatial_group = 0 : i64, d2m.spatial_range = #ttcore.core_range<(0, 3), (1, 4)>, block_factors = [1, 1], grid = #ttcore.grid<1x1>, indexing_maps = [#id2, #id2], iterator_types = [#parallel, #parallel], threads = [#d2m.thread<unified>]}
       ins(%a3 : !O) outs(%o1 : !O) {
   %blk = tensor.empty() : !S
@@ -278,7 +278,7 @@ func.func @view(%arg0: !H) -> (!H) {
   } : !T
   %v = d2m.view_layout %a remapping = #id4 : !T -> !T
   %o1 = d2m.empty() : !T
-  // expected-error @+1 {{input 0 reads another member of spatial group 0 through ops that cannot be an edge (only to_layout and no-op mask are folded)}}
+  // expected-error @+1 {{input 0 reads another member of spatial group 0 through ops that cannot be an edge (only to_layout, no-op mask and a composite_view of such chains)}}
   %b = d2m.generic {d2m.spatial_group = 0 : i64, d2m.spatial_range = #ttcore.core_range<(0, 3), (1, 4)>, block_factors = [1, 1], grid = #ttcore.grid<1x1>, indexing_maps = [#id2, #id2], iterator_types = [#parallel, #parallel], threads = [#d2m.thread<unified>]}
       ins(%v : !T) outs(%o1 : !T) {
   %blk = tensor.empty() : !S

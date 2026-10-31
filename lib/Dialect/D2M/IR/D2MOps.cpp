@@ -2474,17 +2474,34 @@ static mlir::LogicalResult verifySpatialEdges(d2m::SpatialOp op) {
                << arg.getArgNumber() << " of region " << c
                << " has no incoming edge";
       }
-      for (OpOperand &use : arg.getUses()) {
-        Operation *user = use.getOwner();
-        if (!consumer->isAncestor(user)) {
-          return op.emitOpError("block argument ")
-                 << arg.getArgNumber() << " of region " << c
-                 << " may only be used inside the region's d2m.generic";
-        }
-        if (user == consumer.getOperation() && consumer.isDpsInit(&use)) {
-          return op.emitOpError("block argument ")
-                 << arg.getArgNumber() << " of region " << c
-                 << " must not be an output of the region's d2m.generic";
+      // Uses: the region's generic (as an input, or inside it), possibly
+      // through views (view_layout that is not a reinterpret, composite_view)
+      // that read the edge with another blocking.
+      SmallVector<Value> worklist{arg};
+      while (!worklist.empty()) {
+        Value value = worklist.pop_back_val();
+        for (OpOperand &use : value.getUses()) {
+          Operation *user = use.getOwner();
+          if (user->getBlock() == &region.front() &&
+              user != consumer.getOperation()) {
+            auto view = mlir::dyn_cast<ViewLayoutOp>(user);
+            if ((view && !view.getReinterpretLayout()) ||
+                mlir::isa<CompositeViewOp>(user)) {
+              worklist.push_back(user->getResult(0));
+              continue;
+            }
+          }
+          if (!consumer->isAncestor(user)) {
+            return op.emitOpError("block argument ")
+                   << arg.getArgNumber() << " of region " << c
+                   << " may only be used inside the region's d2m.generic "
+                      "(directly or through views)";
+          }
+          if (user == consumer.getOperation() && consumer.isDpsInit(&use)) {
+            return op.emitOpError("block argument ")
+                   << arg.getArgNumber() << " of region " << c
+                   << " must not be an output of the region's d2m.generic";
+          }
         }
       }
     }
