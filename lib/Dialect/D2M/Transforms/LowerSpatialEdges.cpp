@@ -8,6 +8,7 @@
 #include "ttmlir/Dialect/D2M/IR/D2MOps.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Builders.h"
 #include "llvm/ADT/MapVector.h"
@@ -82,6 +83,32 @@ struct EdgeConsumer {
   bool multicast;
 };
 
+// True when the transaction `tx` of a DMA write is waited on in its thread.
+// Besides a direct d2m.dma_wait this accepts the software-pipelined form a
+// blocked matmul uses: the transaction is yielded out of an scf.for, waited
+// at the start of the next iteration (on the iteration argument) and once
+// more after the loop (on the loop result).
+static bool isWaited(Value tx) {
+  bool direct = llvm::any_of(
+      tx.getUsers(), [](Operation *user) { return isa<DMAWaitOp>(user); });
+  if (direct) {
+    return true;
+  }
+  for (OpOperand &use : tx.getUses()) {
+    auto yield = mlir::dyn_cast<scf::YieldOp>(use.getOwner());
+    auto loop =
+        yield ? mlir::dyn_cast<scf::ForOp>(yield->getParentOp()) : nullptr;
+    if (!loop) {
+      continue;
+    }
+    unsigned i = use.getOperandNumber();
+    if (isWaited(loop.getRegionIterArgs()[i]) && isWaited(loop.getResult(i))) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // Lower the edges that leave one producer output (one per consumer region)
 // with a single semaphore: the producer bumps every consumer core once per
 // writing thread, and every consumer waits for all of those signals.
@@ -112,9 +139,7 @@ static LogicalResult lowerEdgeGroup(SpatialOp spatial,
   // transaction has to be waited on inside its thread.
   for (Region *region : writers) {
     WalkResult result = region->walk([&](DMAWriteOp write) {
-      if (write.getDst() == edgeBuffer &&
-          llvm::none_of(write->getUsers(),
-                        [](Operation *user) { return isa<DMAWaitOp>(user); })) {
+      if (write.getDst() == edgeBuffer && !isWaited(write->getResult(0))) {
         return WalkResult::interrupt();
       }
       return WalkResult::advance();
