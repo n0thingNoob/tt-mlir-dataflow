@@ -30,9 +30,11 @@ struct D2MPipelineOptions : public PassPipelineOptions<D2MPipelineOptions> {
 
   Option<std::string> spatialPolicy{
       *this, "spatial-policy",
-      llvm::cl::desc("Spatial planning policy: greedy (group automatically) "
-                     "or none (only the groups given by spatial-groups or "
-                     "already in the IR)."),
+      llvm::cl::desc("Spatial planning policy: greedy (group automatically), "
+                     "bank (one core per generic, next to the DRAM bank of "
+                     "its weights), bank-load (bank plus a load region per "
+                     "bank) or none (only the groups given by spatial-groups "
+                     "or already in the IR)."),
       llvm::cl::init("greedy")};
 
   Option<bool> spatialFuseElementwise{
