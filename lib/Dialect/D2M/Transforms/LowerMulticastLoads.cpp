@@ -149,26 +149,22 @@ public:
 
     // check size of multicast shape; if unit sized fallback to unicast
     auto outputIndexingMap = genericOp.getOutputIndexingMap();
-    auto operandInvProjectedMap =
-        inverseAndBroadcastProjectedPermutation(operandIndexingMap);
-    auto outputInvProjectedMap =
-        inverseAndBroadcastProjectedPermutation(outputIndexingMap);
-    // find intersection of outputInvMap and operandInvMap where results match
-    for (auto [operandResult, outputResult] :
-         llvm::zip(operandInvProjectedMap.getResults(),
-                   outputInvProjectedMap.getResults())) {
-      if (auto dimExpr = mlir::dyn_cast<AffineDimExpr>(operandResult)) {
-        if (operandResult == outputResult) {
-          // dim position here is orthogonal to the multicast direction on the
-          // compute grid
-          auto operandDimPosition = dimExpr.getPosition();
-          TT_assert(computeGridShape.size() == 2u);
-          auto otherDimPosition = (operandDimPosition == 0) ? 1 : 0;
-          auto multicastComputeGridDim = computeGridShape[otherDimPosition];
-          // if multicast group is unit sized, just do unicast
-          if (multicastComputeGridDim < 2) {
-            implementAsUnicast = true;
-          }
+    // Each loop dim the operand shares with the output fixes the compute grid
+    // dim it is a result of in the output map; the multicast runs along the
+    // other one. Look the position up in the output map: the operand's own
+    // position differs when its map permutes the dims (transpose_b).
+    for (AffineExpr result : operandIndexingMap.getResults()) {
+      auto dimExpr = mlir::dyn_cast<AffineDimExpr>(result);
+      if (!dimExpr) {
+        continue;
+      }
+      if (auto outputPosition = outputIndexingMap.getResultPosition(dimExpr)) {
+        TT_assert(computeGridShape.size() == 2u);
+        auto otherDimPosition = (*outputPosition == 0) ? 1 : 0;
+        auto multicastComputeGridDim = computeGridShape[otherDimPosition];
+        // if multicast group is unit sized, just do unicast
+        if (multicastComputeGridDim < 2) {
+          implementAsUnicast = true;
         }
       }
     }
