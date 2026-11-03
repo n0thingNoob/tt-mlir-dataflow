@@ -25,7 +25,10 @@ struct D2MPipelineOptions : public PassPipelineOptions<D2MPipelineOptions> {
                      "Use the existing D2M pipeline"),
           clEnumValN(D2MExecutionStrategy::Spatial, "spatial",
                      "Group generics into d2m.spatial ops (groups given by "
-                     "d2m.spatial_group attributes)")),
+                     "d2m.spatial_group attributes); also folds a transpose "
+                     "of a matmul's B operand into transpose_b and "
+                     "x * sigmoid(x) into silu (ttir-fusing "
+                     "d2m-patterns-only)")),
       llvm::cl::init(D2MExecutionStrategy::Temporal)};
 
   Option<std::string> spatialPolicy{

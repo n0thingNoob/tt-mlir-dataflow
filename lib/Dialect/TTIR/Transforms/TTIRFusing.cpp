@@ -3389,14 +3389,19 @@ getPermuteOpOperand(mlir::TypedValue<mlir::RankedTensorType> value) {
 //   linear(a, b, bias, !transpose_a, transpose_b)
 // linear(a, transpose(b), bias, transpose_a, transpose_b) ->
 //   linear(a, b, bias, transpose_a, !transpose_b)
+//
+// With `foldA` false only input B is folded (the D2M matmul lowering supports
+// transpose_b but not transpose_a).
 template <typename OpType>
 class PermuteMatmulFusionPattern : public mlir::OpRewritePattern<OpType> {
-  using mlir::OpRewritePattern<OpType>::OpRewritePattern;
-
 public:
+  PermuteMatmulFusionPattern(mlir::MLIRContext *context, bool foldA = true)
+      : mlir::OpRewritePattern<OpType>(context), foldA(foldA) {}
+
   mlir::LogicalResult
   matchAndRewrite(OpType op, mlir::PatternRewriter &rewriter) const override {
-    auto inputACanonical = getPermuteOpOperand(op.getA());
+    auto inputACanonical =
+        foldA ? getPermuteOpOperand(op.getA()) : std::nullopt;
     auto inputBCanonical = getPermuteOpOperand(op.getB());
 
     if (!inputACanonical && !inputBCanonical) {
@@ -3435,6 +3440,9 @@ public:
 
     return mlir::success();
   }
+
+private:
+  bool foldA;
 };
 
 // Pattern to fuse reshape -> broadcast -> reshape into either:
@@ -3636,6 +3644,19 @@ class TTIRFusingPass : public impl::TTIRFusingBase<TTIRFusingPass> {
 public:
   using impl::TTIRFusingBase<TTIRFusingPass>::TTIRFusingBase;
   void runOnOperation() final {
+    if (d2mPatternsOnly) {
+      // The other patterns make ops (linear, softmax, rms_norm, ...) or matmul
+      // forms (concatenated weights, transpose_a) the D2M lowering does not
+      // take.
+      RewritePatternSet patterns(&getContext());
+      patterns.add<PermuteMatmulFusionPattern<MatmulOp>>(&getContext(),
+                                                         /*foldA=*/false);
+      patterns.add<SiluFusionPattern>(&getContext());
+      if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
+        signalPassFailure();
+      }
+      return;
+    }
     {
       RewritePatternSet patterns(&getContext());
       patterns.add<ConvTagWeights<Conv2dOp>>(&getContext());

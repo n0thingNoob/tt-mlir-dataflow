@@ -77,11 +77,12 @@ func.func @decode_mm(%x: tensor<32x256xbf16>, %w1: tensor<256x512xbf16>, %w2: te
 
 // -----
 
-// Decode gated MLP: six 1x8 rows (rows 0-5).
+// Decode gated MLP: five 1x8 rows (rows 0-4). g * sigmoid(g) becomes silu
+// first, so silu(g) * u is one generic.
 // CHECK-LABEL: func.func @decode_glu
-// CHECK: d2m.spatial {{.*}}grid_ranges = [#ttcore.core_range<(0,0), (0,7)>, #ttcore.core_range<(1,0), (1,7)>, #ttcore.core_range<(2,0), (2,7)>, #ttcore.core_range<(3,0), (3,7)>, #ttcore.core_range<(4,0), (4,7)>, #ttcore.core_range<(5,0), (5,7)>]
+// CHECK: d2m.spatial {{.*}}grid_ranges = [#ttcore.core_range<(0,0), (0,7)>, #ttcore.core_range<(1,0), (1,7)>, #ttcore.core_range<(2,0), (2,7)>, #ttcore.core_range<(3,0), (3,7)>, #ttcore.core_range<(4,0), (4,7)>]
 func.func @decode_glu(%x: tensor<32x256xbf16>, %wg: tensor<256x512xbf16>, %wu: tensor<256x512xbf16>, %wd: tensor<512x256xbf16>) -> tensor<32x256xbf16> {
-  // expected-remark @+1 {{spatial group 0: generics #0 #1 #2 #3 #4 #5, 6 edges, 48 cores, 17 CBs, 5 semaphores per core at most}}
+  // expected-remark @+1 {{spatial group 0: generics #0 #1 #2 #3 #4, 4 edges, 40 cores, 14 CBs, 5 semaphores per core at most}}
   %g = "ttir.matmul"(%x, %wg) : (tensor<32x256xbf16>, tensor<256x512xbf16>) -> tensor<32x512xbf16>
   %u = "ttir.matmul"(%x, %wu) : (tensor<32x256xbf16>, tensor<256x512xbf16>) -> tensor<32x512xbf16>
   %s = "ttir.sigmoid"(%g) : (tensor<32x512xbf16>) -> tensor<32x512xbf16>
