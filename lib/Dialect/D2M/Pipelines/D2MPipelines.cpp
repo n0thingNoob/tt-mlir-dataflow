@@ -87,11 +87,12 @@ void createD2MFrontendPipeline(OpPassManager &pm,
   pm.addPass(ttir::createElementTypeNormalization());
   pm.addPass(ttir::createTTIRDecomposeComposites());
   pm.addPass(tt::createTTIRToTTIRDecompositionPass());
-  if (options.executionStrategy == D2MExecutionStrategy::Spatial) {
+  if (options.frontendFusing) {
     // Frontends write y = x W^T as matmul(x, permute(W)) and silu as
     // x * sigmoid(x). Folded, each becomes one generic instead of a separate
     // transpose (run on every call) or elementwise chain the spatial planner
-    // would give cores of their own.
+    // would give cores of their own. Both strategies run it so they lower the
+    // same TTIR.
     ttir::TTIRFusingOptions fusingOptions;
     fusingOptions.d2mPatternsOnly = true;
     pm.addPass(ttir::createTTIRFusing(fusingOptions));
