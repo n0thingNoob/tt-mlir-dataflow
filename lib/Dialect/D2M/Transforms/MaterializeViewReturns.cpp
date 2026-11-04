@@ -85,9 +85,9 @@ computeViewVirtualGridMaps(OpBuilder &builder, Operation *op,
 // View operations are representational (no actual data movement), so when a
 // view is directly returned without being consumed by a generic op, we must
 // insert a datamovement generic that forces the actual tensor transformation to
-// occur.
-Value materializeTensorView(OpBuilder &builder, Location loc,
-                            Value viewResult) {
+// occur. The new storage takes the view's memory space, or DRAM with `dram`.
+Value materializeTensorView(OpBuilder &builder, Location loc, Value viewResult,
+                            bool dram) {
   auto tensorType = mlir::cast<RankedTensorType>(viewResult.getType());
 
   // This pass runs pre-bufferization, so view ops have MetalLayoutAttr.
@@ -99,7 +99,8 @@ Value materializeTensorView(OpBuilder &builder, Location loc,
   // Create a new layout for fresh storage (no remapping on the layout attr).
   auto newLayout = ttcore::MetalLayoutAttr::get(
       builder.getContext(), layout.getLogicalShape(), layout.getDimAlignments(),
-      layout.getCollapsedIntervals(), layout.getMemorySpace(),
+      layout.getCollapsedIntervals(),
+      dram ? ttcore::MemorySpace::DeviceDRAM : layout.getMemorySpace(),
       layout.getMemoryLayout());
   auto emptyOp = builder.create<d2m::EmptyOp>(
       loc, tensorType.getShape(), tensorType.getElementType(), newLayout);
@@ -146,7 +147,7 @@ Value materializeTensorView(OpBuilder &builder, Location loc,
 }
 
 Value materializeMemrefView(OpBuilder &builder, Location loc,
-                            ViewLayoutOp viewOp) {
+                            ViewLayoutOp viewOp, bool dram) {
   Value viewResult = viewOp.getResult();
   auto memrefType = mlir::cast<MemRefType>(viewResult.getType());
   SmallVector<int64_t> gridShape =
@@ -157,9 +158,12 @@ Value materializeMemrefView(OpBuilder &builder, Location loc,
       ttcore::ShardLayoutAttr::get(shardShape, memrefType.getElementType(), 1);
   SmallVector<int64_t> storageShape = gridShape;
   storageShape.append(shardShape.begin(), shardShape.end());
-  auto storageType =
-      MemRefType::get(storageShape, memrefType.getElementType(), storageLayout,
-                      memrefType.getMemorySpace());
+  Attribute storageSpace =
+      dram ? ttcore::MemorySpaceAttr::get(builder.getContext(),
+                                          ttcore::MemorySpace::DeviceDRAM)
+           : memrefType.getMemorySpace();
+  auto storageType = MemRefType::get(storageShape, memrefType.getElementType(),
+                                     storageLayout, storageSpace);
 
   auto storageAlloc = builder.create<memref::AllocOp>(loc, storageType);
 
@@ -226,7 +230,7 @@ Value materializeMemrefView(OpBuilder &builder, Location loc,
 }
 
 std::optional<Value> materializeView(OpBuilder &builder, Location loc,
-                                     Value viewResult) {
+                                     Value viewResult, bool dram) {
   Operation *definingOp = viewResult.getDefiningOp();
   if (!isViewOp(definingOp)) {
     return std::nullopt;
@@ -234,12 +238,12 @@ std::optional<Value> materializeView(OpBuilder &builder, Location loc,
 
   OpBuilder::InsertionGuard guard(builder);
   if (mlir::isa<RankedTensorType>(viewResult.getType())) {
-    return materializeTensorView(builder, loc, viewResult);
+    return materializeTensorView(builder, loc, viewResult, dram);
   }
 
   if (auto viewOp = mlir::dyn_cast<ViewLayoutOp>(definingOp)) {
     if (mlir::isa<MemRefType>(viewResult.getType())) {
-      return materializeMemrefView(builder, loc, viewOp);
+      return materializeMemrefView(builder, loc, viewOp, dram);
     }
   }
 
@@ -248,7 +252,8 @@ std::optional<Value> materializeView(OpBuilder &builder, Location loc,
 
 class MaterializeReturnViewPattern : public OpRewritePattern<func::ReturnOp> {
 public:
-  using OpRewritePattern<func::ReturnOp>::OpRewritePattern;
+  MaterializeReturnViewPattern(MLIRContext *context, bool dram)
+      : OpRewritePattern<func::ReturnOp>(context), dram(dram) {}
 
   LogicalResult matchAndRewrite(func::ReturnOp returnOp,
                                 PatternRewriter &rewriter) const override {
@@ -266,7 +271,7 @@ public:
       // ensures the tensor transformation represented by the view actually
       // occurs, rather than just being a symbolic operation.
       std::optional<Value> materialized =
-          materializeView(rewriter, returnOp.getLoc(), opOperand.get());
+          materializeView(rewriter, returnOp.getLoc(), opOperand.get(), dram);
       if (materialized) {
         replacements.emplace_back(opOperand.getOperandNumber(), *materialized);
       }
@@ -283,12 +288,26 @@ public:
     });
     return success();
   }
+
+private:
+  bool dram;
 };
+
+// Whether the host value that a device-to-host `op` writes (its result, or its
+// output operand once bufferized) is returned by the function. TTIRToD2M also
+// moves values to host between ops; only the returned ones are results.
+bool isReturnedToHost(Operation *op) {
+  Value host = op->getNumResults() > 0 ? op->getResult(0) : op->getOperand(1);
+  return llvm::any_of(host.getUsers(), [](Operation *user) {
+    return mlir::isa<func::ReturnOp>(user);
+  });
+}
 
 template <typename OpTy>
 class MaterializeToHostViewPattern : public OpRewritePattern<OpTy> {
 public:
-  using OpRewritePattern<OpTy>::OpRewritePattern;
+  MaterializeToHostViewPattern(MLIRContext *context, bool dram)
+      : OpRewritePattern<OpTy>(context), dram(dram) {}
 
   LogicalResult matchAndRewrite(OpTy op,
                                 PatternRewriter &rewriter) const override {
@@ -306,8 +325,8 @@ public:
 
     // Materialize the view before the device-to-host transfer.
     rewriter.setInsertionPoint(op);
-    std::optional<Value> materialized =
-        materializeView(rewriter, op->getLoc(), toHostInput);
+    std::optional<Value> materialized = materializeView(
+        rewriter, op->getLoc(), toHostInput, dram && isReturnedToHost(op));
     if (!materialized) {
       return failure();
     }
@@ -315,6 +334,9 @@ public:
     rewriter.modifyOpInPlace(op, [&]() { op->setOperand(0, *materialized); });
     return success();
   }
+
+private:
+  bool dram;
 };
 
 class MaterializeViewReturnsPass
@@ -327,7 +349,8 @@ public:
     RewritePatternSet patterns(&getContext());
     patterns.add<MaterializeReturnViewPattern,
                  MaterializeToHostViewPattern<d2m::ToHostOp>,
-                 MaterializeToHostViewPattern<d2m::ToLayoutOp>>(&getContext());
+                 MaterializeToHostViewPattern<d2m::ToLayoutOp>>(&getContext(),
+                                                                dramReturns);
     walkAndApplyPatterns(getOperation(), std::move(patterns));
   }
 };

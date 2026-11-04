@@ -128,7 +128,11 @@ void createD2MFrontendPipeline(OpPassManager &pm,
         llvm::to_vector(options.overrideDeviceShape);
     gridOptOptions.ttnnMode = options.ttnnMode;
   }
-  pm.addPass(d2m::createD2MMaterializeViewReturns());
+  // With dram-args-and-results, a returned view is copied into DRAM like any
+  // other returned result.
+  d2m::D2MMaterializeViewReturnsOptions viewReturnsOptions;
+  viewReturnsOptions.dramReturns = options.dramArgsAndResults;
+  pm.addPass(d2m::createD2MMaterializeViewReturns(viewReturnsOptions));
   // Spatial grouping runs here rather than right after TTIRToD2M so that it
   // sees the generics GridSelection sees: ScalarizeConstTensors removes
   // splat-fill generics and MaterializeViewReturns adds view copies.
@@ -166,7 +170,7 @@ void createD2MFrontendPipeline(OpPassManager &pm,
   pm.addPass(createCanonicalizerPassWithOptions(options));
   pm.addPass(d2m::createD2MOptimizeMasks());
   pm.addPass(d2m::createD2MLowerToLayout());
-  pm.addPass(d2m::createD2MMaterializeViewReturns());
+  pm.addPass(d2m::createD2MMaterializeViewReturns(viewReturnsOptions));
 
   if (options.enableElementwiseFusion || options.enableEltwiseReductionFusion) {
     d2m::D2MGenericFusionOptions fusionOptions;
@@ -198,7 +202,7 @@ void createD2MFrontendPipeline(OpPassManager &pm,
     reblockGenericsOptions.testBufferSizePolicy = options.testBufferSizePolicy;
   }
   pm.addPass(d2m::createD2MReblockGenerics(reblockGenericsOptions));
-  pm.addPass(d2m::createD2MMaterializeViewReturns());
+  pm.addPass(d2m::createD2MMaterializeViewReturns(viewReturnsOptions));
   // Block factors are final here: decide which streaming edges can stream.
   pm.addPass(d2m::createD2MMaterializeSpatialStreams());
 

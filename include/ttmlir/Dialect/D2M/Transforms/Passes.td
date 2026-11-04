@@ -964,7 +964,17 @@ def D2MMaterializeViewReturns : Pass<"d2m-materialize-view-returns", "::mlir::Mo
     This pass can run before or after bufferization. Tensor views are
     materialized with tensor outputs and memref views are materialized with a
     device allocation plus datamovement-only generic.
+
+    The new storage takes the memory space of the view, except for a value
+    the function returns when dram-returns is set: that one goes to DRAM (the
+    dram-args-and-results pipeline option; a returned view of an L1 tensor
+    would otherwise stay in L1). Views moved to host between ops keep the
+    view's memory space either way.
   }];
+  let options = [
+    Option<"dramReturns", "dram-returns", "bool", /*default=*/"false",
+           "Materialize returned views in DRAM instead of in the view's memory space.">
+  ];
   let dependentDialects = ["::mlir::tt::d2m::D2MDialect", "::mlir::tt::ttcore::TTCoreDialect"];
 }
 
