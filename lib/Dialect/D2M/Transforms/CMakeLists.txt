@@ -13,6 +13,7 @@ add_mlir_dialect_library(MLIRD2MTransforms
         GenericReplaceGlobals.cpp
         GenericTileComputeLoops.cpp
         GridSelection.cpp
+        HoistResidentParameters.cpp
         InsertDstRegisterAccess/Shared.cpp
         InsertDstRegisterAccess/Unscheduled.cpp
         InsertDstRegisterAccess/Scheduled.cpp

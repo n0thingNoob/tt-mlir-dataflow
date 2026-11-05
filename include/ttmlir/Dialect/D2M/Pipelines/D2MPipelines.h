@@ -54,6 +54,25 @@ struct D2MPipelineOptions : public PassPipelineOptions<D2MPipelineOptions> {
                      "takes one region."),
       llvm::cl::init(false)};
 
+  Option<bool> residentParameters{
+      *this, "resident-parameters",
+      llvm::cl::desc("Keep the arguments marked ttcore.argument_type = "
+                     "parameter / constant resident on the device: a "
+                     "`<name>_load` function writes and lays them out once, "
+                     "`<name>` takes the device buffers it returns "
+                     "(d2m-hoist-resident-parameters, before "
+                     "d2m-lower-to-layout). Also writes each argument once per "
+                     "call when several ops read it. Needs "
+                     "dram-args-and-results."),
+      llvm::cl::init(false)};
+
+  Option<int64_t> residentDramBase{
+      *this, "resident-dram-base",
+      llvm::cl::desc("DRAM address where the resident parameters start (0: the "
+                     "unreserved DRAM base); given by hand to keep the "
+                     "parameters of several binaries resident at once."),
+      llvm::cl::init(0)};
+
   Option<bool> spatialBankSplit{
       *this, "spatial-bank-split",
       llvm::cl::desc("With execution-strategy=spatial and "
