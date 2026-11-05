@@ -862,6 +862,10 @@ def D2MAllocate: Pass<"d2m-allocate", "::mlir::ModuleOp"> {
           "test-assume-l1-capacity",
           "std::int64_t", /*default=*/"0",
           "Assume given L1 capacity.">,
+    Option<"residentDramBase",
+          "resident-dram-base",
+          "std::int64_t", /*default=*/"0",
+          "DRAM address where the functions marked d2m.resident_load start allocating (0: the unreserved DRAM base). Lets the resident parameters of several binaries live on one device at once.">,
   ];
 }
 

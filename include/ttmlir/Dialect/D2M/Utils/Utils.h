@@ -49,6 +49,15 @@ constexpr llvm::StringLiteral kStreamRingAttr = "d2m.stream_ring";
 // addresses (getMemoryMap) and the host's buffer placement (the flatbuffer's
 // distribution cores) both apply it.
 constexpr llvm::StringLiteral kDramBankAttr = "d2m.dram_bank";
+// Resident parameters: the function that loads them (writes, tilizes) and
+// returns them as device buffers, and the function that takes them as
+// arguments. Allocate places the run function's DRAM buffers after the load
+// function's results and records `kResidentEndAttr` (end of those results) on
+// the load function and `kDramEndAttr` (end of all its DRAM buffers) on both.
+constexpr llvm::StringLiteral kResidentLoadAttr = "d2m.resident_load";
+constexpr llvm::StringLiteral kResidentRunAttr = "d2m.resident_run";
+constexpr llvm::StringLiteral kResidentEndAttr = "d2m.resident_end";
+constexpr llvm::StringLiteral kDramEndAttr = "d2m.dram_end";
 
 inline bool isReductionScalerBuffer(Operation *op) {
   return op && op->hasAttr(kReductionScalerAttr);
@@ -163,7 +172,8 @@ std::optional<AffineMap> getVirtualGridInverseMapping(Value val);
 std::optional<AffineMap> getVirtualGridForwardMapping(Value val);
 
 // Returns the kDramBankAttr of the buffer under a value, if any. Traces the
-// same def-use chain as getVirtualGridForwardMapping.
+// same def-use chain as getVirtualGridForwardMapping; a function argument
+// carries it as an argument attribute.
 std::optional<int64_t> getDramBank(Value val);
 
 // Copies kDramBankAttr from `from` to `to` (no-op when `from` has none).

@@ -16,6 +16,7 @@
 
 #include "mlir/Dialect/Affine/Utils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
@@ -532,6 +533,17 @@ std::optional<AffineMap> getVirtualGridForwardMapping(Value val) {
 std::optional<int64_t> getDramBank(Value val) {
   Operation *defOp = val.getDefiningOp();
   if (!defOp) {
+    // A device buffer passed in as a function argument (a resident parameter)
+    // carries its bank as an argument attribute.
+    if (auto arg = mlir::dyn_cast<BlockArgument>(val)) {
+      if (auto func =
+              mlir::dyn_cast<func::FuncOp>(arg.getOwner()->getParentOp())) {
+        if (auto bank = func.getArgAttrOfType<IntegerAttr>(arg.getArgNumber(),
+                                                           kDramBankAttr)) {
+          return bank.getInt();
+        }
+      }
+    }
     return std::nullopt;
   }
   if (auto toLayoutOp = mlir::dyn_cast<ToLayoutOp>(defOp)) {

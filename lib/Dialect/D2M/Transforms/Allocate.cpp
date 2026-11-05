@@ -276,6 +276,8 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
   // producer writes them with an explicit store and the consumer reads them
   // remotely, so they are never aliased and always stay in L1.
   llvm::DenseSet<Value> spatialEdgeBuffers;
+  // End of the DRAM buffers the d2m.resident_load functions return.
+  AllocSizeT residentEnd = 0;
   ttcore::MemorySpaceAttr DRAMAttr = nullptr;
 
   [[maybe_unused]] friend std::string to_string(const D2MAllocate &obj) {
@@ -340,15 +342,42 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
     L1Attr = MemorySpaceAttr::get(ctx, MemorySpace::DeviceL1);
     DRAMAttr = MemorySpaceAttr::get(ctx, MemorySpace::DeviceDRAM);
 
-    // Run a sequence of FuncOp-scoped steps:
-
-    if (moduleOp
-            ->walk([&](func::FuncOp funcOp) -> WalkResult {
-              return runOnFunc(funcOp);
-            })
-            .wasInterrupted()) {
-      return signalPassFailure();
+    // Run a sequence of FuncOp-scoped steps. Functions that load resident
+    // parameters go first: the functions that use those parameters place
+    // their DRAM buffers after the loaded ones.
+    SmallVector<func::FuncOp> funcOps;
+    moduleOp->walk([&](func::FuncOp funcOp) { funcOps.push_back(funcOp); });
+    std::stable_partition(
+        funcOps.begin(), funcOps.end(), [](func::FuncOp funcOp) {
+          return funcOp->hasAttr(d2m::utils::kResidentLoadAttr);
+        });
+    const MemorySpaceInfo dramInfo =
+        memSpaces[ordinal(MemorySpace::DeviceDRAM)];
+    for (func::FuncOp funcOp : funcOps) {
+      MemorySpaceInfo &info = memSpaces[ordinal(MemorySpace::DeviceDRAM)];
+      info = dramInfo;
+      if (funcOp->hasAttr(d2m::utils::kResidentLoadAttr) &&
+          residentDramBase > 0) {
+        info.baseAddress = std::max<AllocSizeT>(
+            info.baseAddress, ttmlir::utils::alignUp<AllocSizeT>(
+                                  residentDramBase, info.alignment));
+      }
+      if (funcOp->hasAttr(d2m::utils::kResidentRunAttr)) {
+        info.baseAddress = std::max<AllocSizeT>(
+            info.baseAddress,
+            ttmlir::utils::alignUp<AllocSizeT>(residentEnd, info.alignment));
+      }
+      if (info.baseAddress >= info.maxAddress) {
+        funcOp.emitOpError() << "no DRAM left after the resident parameters "
+                                "(base "
+                             << info.baseAddress << ")";
+        return signalPassFailure();
+      }
+      if (failed(runOnFunc(funcOp))) {
+        return signalPassFailure();
+      }
     }
+    memSpaces[ordinal(MemorySpace::DeviceDRAM)] = dramInfo;
   }
 
   LogicalResult runOnFunc(func::FuncOp funcOp) {
@@ -1240,6 +1269,12 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
 
     IRRewriter rewriter(funcOp->getContext());
 
+    const bool residentLoad = funcOp->hasAttr(d2m::utils::kResidentLoadAttr);
+    const bool resident =
+        residentLoad || funcOp->hasAttr(d2m::utils::kResidentRunAttr);
+    AllocSizeT dramEnd =
+        memSpaces[ordinal(MemorySpace::DeviceDRAM)].baseAddress;
+
     for (auto &[memref, memrefCtx] : analysis.memrefs) {
       if (!isDeviceMemorySpace(memrefCtx.type, MemorySpace::System)) {
         continue;
@@ -1254,10 +1289,28 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
       const MemorySpace remappedMemorySpace = *memrefCtx.remappedMemSpace;
       const auto &solution = analysis.problem(remappedMemorySpace);
       const auto &memInfo = memSpaces[ordinal(remappedMemorySpace)];
+      const auto &request = solution.request(memrefCtx.reqIndex);
 
-      assignAddressAndAlignment(rewriter, allocOp,
-                                solution.request(memrefCtx.reqIndex).offset,
-                                memInfo);
+      assignAddressAndAlignment(rewriter, allocOp, request.offset, memInfo);
+
+      if (resident && remappedMemorySpace == MemorySpace::DeviceDRAM) {
+        const AllocSizeT end =
+            memInfo.baseAddress + request.offset + request.size;
+        dramEnd = std::max(dramEnd, end);
+        if (residentLoad && isReturned(allocOp.getResult())) {
+          residentEnd = std::max(residentEnd, end);
+        }
+      }
+    }
+
+    if (resident) {
+      Builder builder(funcOp->getContext());
+      funcOp->setAttr(d2m::utils::kDramEndAttr,
+                      builder.getI64IntegerAttr(dramEnd));
+      if (residentLoad) {
+        funcOp->setAttr(d2m::utils::kResidentEndAttr,
+                        builder.getI64IntegerAttr(residentEnd));
+      }
     }
 
     return success();
@@ -1673,6 +1726,17 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
     return canAliasOperand(storeOp->getParentOfType<d2m::GenericOp>(),
                            storeOp.getMemref()) &&
            storeOp.getStartDevice().empty() && !storeOp.getSemaphore();
+  }
+
+  // Whether `value`, or a view of it, is returned by its function.
+  static bool isReturned(Value value) {
+    return llvm::any_of(value.getUsers(), [](Operation *user) {
+      if (mlir::isa<func::ReturnOp>(user)) {
+        return true;
+      }
+      auto view = mlir::dyn_cast<d2m::ViewLayoutOp>(user);
+      return view && isReturned(view.getResult());
+    });
   }
 
   static void assignAddressAndAlignment(RewriterBase &rewriter,
