@@ -54,6 +54,16 @@ struct D2MPipelineOptions : public PassPipelineOptions<D2MPipelineOptions> {
                      "takes one region."),
       llvm::cl::init(false)};
 
+  Option<bool> spatialBankSplit{
+      *this, "spatial-bank-split",
+      llvm::cl::desc("With execution-strategy=spatial and "
+                     "dram-args-and-results, split matmul -> elementwise -> "
+                     "matmul chains whose weights are function arguments "
+                     "over the DRAM banks (d2m-split-by-dram-bank, before "
+                     "TTIRToD2M), for spatial-policy=bank or bank-load. "
+                     "Ignored with the default execution strategy."),
+      llvm::cl::init(false)};
+
   ListOption<int64_t> spatialGroups{
       *this, "spatial-groups",
       llvm::cl::desc("Spatial groups given by hand: (group, generic, y0, x0, "

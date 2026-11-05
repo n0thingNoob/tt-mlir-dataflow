@@ -978,6 +978,60 @@ def D2MMaterializeViewReturns : Pass<"d2m-materialize-view-returns", "::mlir::Mo
   let dependentDialects = ["::mlir::tt::d2m::D2MDialect", "::mlir::tt::ttcore::TTCoreDialect"];
 }
 
+def D2MSplitByDramBank : Pass<"d2m-split-by-dram-bank", "::mlir::ModuleOp"> {
+  let summary = "Split matmul chains whose weights are arguments over the DRAM banks";
+  let description = [{
+    Runs on TTIR right before TTIRToD2M (the spatial-bank-split pipeline
+    option). Finds the chain a gated MLP is made of and splits it over the B
+    DRAM banks of the system desc, so that d2m-spatial-planning with
+    policy=bank or bank-load can place bank j's share next to bank j:
+
+    - seeds: ttir.matmul ops (no transpose_a) whose B is a function argument
+      and whose result is [M, F];
+    - elementwise unary and binary ops whose operands and result are [M, F]
+      values of the chain (a binary op may join two seeds, e.g. silu(g) * u);
+    - one end: a ttir.matmul (no transpose_a) whose A is in the chain and whose
+      B is a function argument it contracts over F.
+
+    Every [M, F] value of the chain may only be used inside the chain or by the
+    end. F is split into B parts of whole tiles, the first F/32 mod B parts
+    one tile larger (no padding). Part j reads its slice of every weight
+    through a ttir.slice_static of the argument tagged d2m.dram_bank = j; the
+    seeds are split along N, the end along K, and the B partial results of the
+    end are summed by a chain of ttir.add (the hub).
+
+    Nothing is split, with a remark when `remarks` is set, when:
+    - `dram-args-and-results` is not set (the arguments are not in DRAM);
+    - an argument of the function already carries d2m.dram_bank;
+    - F is not a multiple of 32 with at least one tile per bank;
+    - a chain value is used outside the chain, a chain op has an operand from
+      outside it, or no single end contracts the chain over F.
+
+    Example (two banks, F = 128):
+    ```mlir
+    %g = "ttir.matmul"(%x, %wg) <{transpose_b = true}> : (tensor<32x64xbf16>, tensor<128x64xbf16>) -> tensor<32x128xbf16>
+    %s = "ttir.silu"(%g) : (tensor<32x128xbf16>) -> tensor<32x128xbf16>
+    %y = "ttir.matmul"(%s, %wd) <{transpose_b = true}> : (tensor<32x128xbf16>, tensor<64x128xbf16>) -> tensor<32x64xbf16>
+    ```
+    becomes, for j = 0, 1 (offset o = 64 j):
+    ```mlir
+    %wg_j = "ttir.slice_static"(%wg) <{begins = [o, 0], ends = [o + 64, 64], step = [1, 1]}> {d2m.dram_bank = j} : ... -> tensor<64x64xbf16>
+    %g_j = "ttir.matmul"(%x, %wg_j) <{transpose_b = true}> : ... -> tensor<32x64xbf16>
+    %s_j = "ttir.silu"(%g_j) : ...
+    %wd_j = "ttir.slice_static"(%wd) <{begins = [0, o], ends = [64, o + 64], step = [1, 1]}> {d2m.dram_bank = j} : ... -> tensor<64x64xbf16>
+    %y_j = "ttir.matmul"(%s_j, %wd_j) <{transpose_b = true}> : ... -> tensor<32x64xbf16>
+    ```
+    and %y = "ttir.add"(%y_0, %y_1).
+  }];
+  let options = [
+    Option<"dramArgsAndResults", "dram-args-and-results", "bool", /*default=*/"false",
+           "Function arguments are in DRAM (the pipeline option of the same name); without it nothing is split.">,
+    Option<"remarks", "remarks", "bool", /*default=*/"false",
+           "Report every split and every chain that is not split as a remark.">
+  ];
+  let dependentDialects = ["::mlir::tt::ttir::TTIRDialect"];
+}
+
 def D2MOptimizeMasks : Pass<"d2m-optimize-masks", "::mlir::ModuleOp"> {
   let summary = "Eliminate redundant high-level mask ops";
   let description = [{

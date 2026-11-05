@@ -111,6 +111,13 @@ void createD2MFrontendPipeline(OpPassManager &pm,
     pm.addPass(ttir::createTTIRGlobalDataFormatConversion(globalFormatOptions));
   }
   pm.addPass(ttir::createTTIRDecomposeComplexPermute());
+  if (options.executionStrategy == D2MExecutionStrategy::Spatial &&
+      options.spatialBankSplit) {
+    d2m::D2MSplitByDramBankOptions splitOptions;
+    splitOptions.dramArgsAndResults = options.dramArgsAndResults;
+    splitOptions.remarks = options.spatialRemarks;
+    pm.addPass(d2m::createD2MSplitByDramBank(splitOptions));
+  }
   tt::TTIRToD2MOptions toD2MOptions;
   {
     toD2MOptions.defaultInputMemSpace = options.defaultInputMemSpace;
