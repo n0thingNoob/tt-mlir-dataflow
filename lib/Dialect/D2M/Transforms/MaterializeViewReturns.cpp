@@ -303,6 +303,21 @@ bool isReturnedToHost(Operation *op) {
   });
 }
 
+// A d2m.dram_bank view (a bank slice from TTIRToD2M) whose host value only
+// goes back to the device: canonicalization folds each round trip into one
+// view -> DRAM to_layout, which LowerToLayout tilizes straight from the view.
+bool isBankSliceRoundTrip(Operation *toHost) {
+  if (!toHost->getOperand(0).getDefiningOp()->hasAttr(utils::kDramBankAttr) ||
+      toHost->getNumResults() == 0) {
+    return false;
+  }
+  Value host = toHost->getResult(0);
+  return !host.use_empty() && llvm::all_of(host.getUsers(), [&](Operation *u) {
+    auto toLayout = mlir::dyn_cast<d2m::ToLayoutOp>(u);
+    return toLayout && toLayout.getInput() == host && toLayout.isHostToDevice();
+  });
+}
+
 template <typename OpTy>
 class MaterializeToHostViewPattern : public OpRewritePattern<OpTy> {
 public:
@@ -320,6 +335,9 @@ public:
     Value toHostInput = op->getOperand(0);
     Operation *inputDefiningOp = toHostInput.getDefiningOp();
     if (!isViewOp(inputDefiningOp)) {
+      return failure();
+    }
+    if (isBankSliceRoundTrip(op)) {
       return failure();
     }
 

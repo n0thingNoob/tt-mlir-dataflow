@@ -73,6 +73,17 @@ bool isOuterReduction(TTIRReductionOp op) {
   return false;
 }
 
+// The bank-tagged view under the host value of a d2m.dram_bank slice (see
+// D2MBankSliceRewriter), if `value` is one.
+d2m::ViewLayoutOp getBankSliceView(Value value) {
+  auto toHost = value.getDefiningOp<d2m::ToLayoutOp>();
+  if (!toHost) {
+    return nullptr;
+  }
+  auto view = toHost.getInput().getDefiningOp<d2m::ViewLayoutOp>();
+  return view && view->hasAttr(d2m::utils::kDramBankAttr) ? view : nullptr;
+}
+
 class D2MNamedRewriterCommon {
 protected:
   using base = D2MNamedRewriterCommon;
@@ -88,11 +99,14 @@ protected:
         dramArgsAndResults(dramArgsAndResults) {}
 
   // Memory space of a device copy of input `value`. With dramArgsAndResults,
-  // function arguments go to DRAM and everything else to L1; otherwise the
-  // default input memory space.
+  // function arguments and d2m.dram_bank slices of them go to DRAM and
+  // everything else to L1; otherwise the default input memory space.
   ttcore::MemorySpace inputMemorySpace(Value value) const {
     if (!dramArgsAndResults) {
       return memorySpaces[0];
+    }
+    if (getBankSliceView(value)) {
+      return ttcore::MemorySpace::DeviceDRAM;
     }
     auto arg = mlir::dyn_cast<BlockArgument>(value);
     return arg && mlir::isa<func::FuncOp>(arg.getOwner()->getParentOp())
@@ -460,10 +474,12 @@ protected:
 
     auto emptyOp = rewriter.create<d2m::EmptyOp>(value.getLoc(), shardedShape,
                                                  elementType, layout);
-    // The DRAM copy of a function argument starts at the bank the argument
-    // names (d2m.dram_bank), if any.
+    // The DRAM copy of a function argument, or of a d2m.dram_bank slice of
+    // one, starts at the bank the argument or slice names, if any.
     if (memSpace == ttcore::MemorySpace::DeviceDRAM) {
-      if (auto arg = mlir::dyn_cast<BlockArgument>(value)) {
+      if (d2m::ViewLayoutOp view = getBankSliceView(value)) {
+        d2m::utils::copyDramBank(view, emptyOp);
+      } else if (auto arg = mlir::dyn_cast<BlockArgument>(value)) {
         if (auto func =
                 mlir::dyn_cast<func::FuncOp>(arg.getOwner()->getParentOp())) {
           if (auto bank = func.getArgAttrOfType<IntegerAttr>(
@@ -4697,6 +4713,90 @@ concatenateHeadsLogicalInfo(ttir::ConcatenateHeadsOp op) {
   return {map, canBeTilized};
 }
 
+// A ttir.slice_static tagged with d2m.dram_bank (a tile-aligned 2-D slice of a
+// function argument, checked by the pass) becomes a view of one row-major DRAM
+// staging copy of the argument, shared by all bank slices of it. The view
+// carries the bank; consumers place their tiled copy of the slice in that
+// bank (inputMemorySpace, createOptimalLayoutOp), and after canonicalization
+// each slice is one DRAM view -> DRAM tilize, so the argument is written to
+// the device once however many slices read it.
+class D2MBankSliceRewriter : public OpConversionPattern<ttir::SliceStaticOp>,
+                             D2MNamedRewriterCommon {
+public:
+  D2MBankSliceRewriter(const TypeConverter &typeConverter,
+                       mlir::MLIRContext *ctx,
+                       ttcore::MemorySpace defaultInputMemSpace,
+                       ttcore::MemorySpace defaultOutputMemSpace, bool ttnnMode,
+                       bool collapseTensors, bool enableMulticastInference,
+                       bool dramArgsAndResults)
+      : OpConversionPattern<ttir::SliceStaticOp>(typeConverter, ctx,
+                                                 /*benefit=*/20),
+        D2MNamedRewriterCommon(defaultInputMemSpace, defaultOutputMemSpace,
+                               ttnnMode, collapseTensors,
+                               enableMulticastInference, dramArgsAndResults) {}
+
+  LogicalResult
+  matchAndRewrite(ttir::SliceStaticOp op, ttir::SliceStaticOp::Adaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto bank = op->getAttrOfType<IntegerAttr>(d2m::utils::kDramBankAttr);
+    if (!bank) {
+      return failure();
+    }
+    auto arg = mlir::cast<BlockArgument>(adaptor.getInput());
+    Value staging = getOrCreateStaging(arg, rewriter);
+
+    auto stagingLayout = mlir::cast<ttcore::MetalLayoutAttr>(
+        mlir::cast<RankedTensorType>(staging.getType()).getEncoding());
+    RankedTensorType sliceType = op.getResult().getType();
+    auto layout = ttcore::MetalLayoutAttr::get(
+        rewriter.getContext(), sliceType.getShape(),
+        ttcore::MemorySpace::DeviceDRAM, ttcore::TensorMemoryLayout::Sharded,
+        stagingLayout.getCollapsedIntervals());
+    llvm::SmallVector<int64_t> unitGrid(
+        layout.getPhysicalShape(/*tileShape=*/{}).size(), 1);
+    auto viewType =
+        RankedTensorType::get(layout.getDeviceShape(unitGrid, /*tileShape=*/{}),
+                              sliceType.getElementType(), layout);
+
+    AffineMap deviceMap =
+        D2MTensorManipulationOpRewriter<ttir::SliceStaticOp, sliceLogicalInfo>::
+            projectLogicalMapToUnitDeviceSpace(rewriter,
+                                               sliceLogicalInfo(op).map);
+    auto view = rewriter.create<d2m::ViewLayoutOp>(op.getLoc(), viewType,
+                                                   staging, deviceMap,
+                                                   /*reinterpretLayout=*/false);
+    view->setAttr(d2m::utils::kDramBankAttr, bank);
+
+    rewriter.replaceOp(op,
+                       unLayoutResult(rewriter, view.getResult(), sliceType));
+    return success();
+  }
+
+private:
+  // The staging copy of `arg` an earlier bank slice made (a to_layout of `arg`
+  // used only by bank views), or a new one at the start of the function.
+  Value getOrCreateStaging(BlockArgument arg,
+                           ConversionPatternRewriter &rewriter) const {
+    for (Operation *user : arg.getUsers()) {
+      auto toLayout = mlir::dyn_cast<d2m::ToLayoutOp>(user);
+      if (!toLayout || toLayout.getResult(0).use_empty()) {
+        continue;
+      }
+      if (llvm::all_of(toLayout.getResult(0).getUsers(), [](Operation *use) {
+            return mlir::isa<d2m::ViewLayoutOp>(use) &&
+                   use->hasAttr(d2m::utils::kDramBankAttr);
+          })) {
+        return toLayout.getResult(0);
+      }
+    }
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointToStart(arg.getOwner());
+    return createOptimalLayoutOp(arg, ttcore::MemorySpace::DeviceDRAM,
+                                 /*tiled=*/false, /*noCollapse=*/false,
+                                 rewriter);
+  }
+};
+
 class D2MSliceStaticOpNoCConstraintsRewriter
     : public OpConversionPattern<ttir::SliceStaticOp> {
 public:
@@ -5542,6 +5642,12 @@ void populateTTIRToD2MPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
   // NoC alignment before the generic SliceStatic lowering consumes them.
   patterns.add<D2MSliceStaticOpNoCConstraintsRewriter>(typeConverter, ctx);
 
+  // d2m.dram_bank slices of function arguments, ahead of both slice patterns.
+  patterns.add<D2MBankSliceRewriter>(typeConverter, ctx, defaultInputMemSpace,
+                                     defaultOutputMemSpace, ttnnMode,
+                                     collapseTensors, enableMulticastInference,
+                                     dramArgsAndResults);
+
   // Decompose inner-dim min reductions to neg(max(neg)); runs during
   // TTIRToD2M instead of as a separate pre-pass.
   patterns.add<D2MInnerMinDecompositionRewriter>(typeConverter, ctx);
@@ -5665,6 +5771,49 @@ public:
           return;
         }
       }
+    }
+
+    // d2m.dram_bank on ttir.slice_static: a bank index, on a tile-aligned
+    // unit-step 2-D slice of a function argument, with the arguments in DRAM.
+    WalkResult bankSlices = module.walk([&](ttir::SliceStaticOp op) {
+      Attribute bank = op->getAttr(d2m::utils::kDramBankAttr);
+      if (!bank) {
+        return WalkResult::advance();
+      }
+      auto index = mlir::dyn_cast<IntegerAttr>(bank);
+      if (!index || index.getInt() < 0 ||
+          (numDramBanks > 0 && index.getInt() >= numDramBanks)) {
+        op.emitOpError() << d2m::utils::kDramBankAttr
+                         << " must be a DRAM bank index"
+                         << (numDramBanks > 0
+                                 ? " below " + std::to_string(numDramBanks)
+                                 : std::string());
+        return WalkResult::interrupt();
+      }
+      auto arg = mlir::dyn_cast<BlockArgument>(op.getInput());
+      auto begins = extractFromIntegerArrayAttr<int32_t>(op.getBegins());
+      auto ends = extractFromIntegerArrayAttr<int32_t>(op.getEnds());
+      auto steps = extractFromIntegerArrayAttr<int32_t>(op.getStep());
+      constexpr auto tile =
+          static_cast<int32_t>(ttcore::TileType::getDefaultShape()[0]);
+      bool supported =
+          dramArgsAndResults && !ttnnMode && arg &&
+          mlir::isa<func::FuncOp>(arg.getOwner()->getParentOp()) &&
+          begins.size() == 2 &&
+          llvm::all_of(steps, [](int32_t s) { return s == 1; }) &&
+          llvm::all_of(begins, [&](int32_t b) { return b % tile == 0; }) &&
+          llvm::all_of(ends, [&](int32_t e) { return e % tile == 0; });
+      if (!supported) {
+        op.emitOpError() << d2m::utils::kDramBankAttr
+                         << " needs dram-args-and-results and a tile-aligned "
+                            "unit-step 2-D slice of a function argument";
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    });
+    if (bankSlices.wasInterrupted()) {
+      signalPassFailure();
+      return;
     }
 
     RewritePatternSet patterns(ctx);
