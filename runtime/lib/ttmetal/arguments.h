@@ -63,7 +63,8 @@ std::vector<std::uint32_t> processKernelArgs(
       const target::metal::BufferRef *buffer =
           reinterpret_cast<const target::metal::BufferRef *>(
               argRefs->Get(arg->operand_idx()));
-      LOG_ASSERT(meshBuffers.find(buffer->global_id()) != meshBuffers.end(),
+      auto meshBufferIt = meshBuffers.find(buffer->global_id());
+      LOG_ASSERT(meshBufferIt != meshBuffers.end(),
                  "Buffer id referenced by rt args is no longer alive or was "
                  "never created ",
                  logger::Buffer(buffer->global_id()));
@@ -73,8 +74,13 @@ std::vector<std::uint32_t> processKernelArgs(
                  target::metal::BufferDetail::MetalBuffer);
       const target::metal::MetalBuffer *metalBuffer =
           bufferDesc->buffer_detail_as_MetalBuffer();
-      argsVec.push_back(deviceAddressValidator(buffer->address(),
-                                               metalBuffer->buffer_type()));
+      // The address of the live buffer: a program input that is a device
+      // buffer (e.g. a resident parameter returned by another program) has no
+      // address in the program's BufferRef. For buffers the program creates
+      // the two are the same.
+      argsVec.push_back(deviceAddressValidator(
+          static_cast<std::uint32_t>(meshBufferIt->second->address()),
+          metalBuffer->buffer_type()));
       break;
     }
     case target::metal::KernelArgType::KernelArgLocalSemaphore: {
