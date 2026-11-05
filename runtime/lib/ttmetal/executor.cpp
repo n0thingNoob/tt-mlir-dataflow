@@ -307,9 +307,13 @@ void MCQExecutor::execute(const target::metal::ReturnCommand *command) {
     bool hostBufferFound = hostBufferIter != hostBuffers.end();
     LOG_ASSERT(meshBufferFound != hostBufferFound);
     if (meshBufferFound) {
+      // Same handle type as every other Tensor (a MetalTensor variant), so the
+      // buffer can be passed back as an input of another program.
       outputs.emplace_back(
-          std::static_pointer_cast<void>(meshBufferIter->second), nullptr,
-          DeviceRuntime::TTMetal, std::static_pointer_cast<void>(meshEvent));
+          std::static_pointer_cast<void>(std::make_shared<MetalTensor>(
+              MetalTensor(meshBufferIter->second))),
+          nullptr, DeviceRuntime::TTMetal,
+          std::static_pointer_cast<void>(meshEvent));
     } else {
       outputs.emplace_back(hostBufferIter->second);
       outputs.back().event = Event(std::static_pointer_cast<void>(meshEvent),
