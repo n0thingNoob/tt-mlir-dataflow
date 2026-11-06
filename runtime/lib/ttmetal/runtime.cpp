@@ -764,8 +764,11 @@ void deallocateTensor(Tensor &tensor, bool) {
           [&](const TensorDesc &) { /* no-op */ },
           [&](const HostBuffer &) { /* no-op */ },
           [&](const DistributedHostBuffer &) { /* no-op */ },
-          [&](const MeshBuffer &) {
-            LOG_FATAL("deallocateTensor not yet implemented for MeshBuffer");
+          [&](const MeshBuffer &meshBuffer) {
+            // A device buffer one program returned (e.g. resident parameters
+            // from a load program). Wait for the program that writes it first.
+            ::tt::runtime::ttmetal::wait(tensor.event);
+            meshBuffer->deallocate();
           },
       },
       tensor.as<MetalTensor>(DeviceRuntime::TTMetal));

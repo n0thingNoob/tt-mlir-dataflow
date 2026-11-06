@@ -250,6 +250,60 @@ std::optional<Value> materializeView(OpBuilder &builder, Location loc,
   return std::nullopt;
 }
 
+// The buffer under a view chain whose composed map sends every index of the
+// result to itself (e.g. a generic's output reblocked by
+// d2m-reblock-generics and viewed back), if `value` is one. Checked point by
+// point, up to `kMaxPoints` indices.
+Value identityViewBase(Value value) {
+  constexpr int64_t kMaxPoints = 1 << 20;
+  auto *defOp = value.getDefiningOp();
+  auto memrefType = mlir::dyn_cast<MemRefType>(value.getType());
+  if (!memrefType || !mlir::isa_and_nonnull<ViewLayoutOp>(defOp)) {
+    return nullptr;
+  }
+  Value base = value;
+  while (auto view = base.getDefiningOp<ViewLayoutOp>()) {
+    base = view.getInput();
+  }
+  auto baseType = mlir::dyn_cast<MemRefType>(base.getType());
+  if (!baseType || baseType.getShape() != memrefType.getShape() ||
+      baseType.getElementType() != memrefType.getElementType() ||
+      baseType.getMemorySpace() != memrefType.getMemorySpace()) {
+    return nullptr;
+  }
+  AffineMap map = applyViews(defOp).second;
+  if (map.getNumDims() != memrefType.getRank() ||
+      map.getNumResults() != memrefType.getRank() ||
+      ttmlir::utils::volume<int64_t>(memrefType.getShape()) > kMaxPoints) {
+    return nullptr;
+  }
+  MLIRContext *ctx = value.getContext();
+  SmallVector<int64_t> index(memrefType.getRank(), 0);
+  while (true) {
+    SmallVector<Attribute> operands =
+        llvm::map_to_vector(index, [&](int64_t i) -> Attribute {
+          return IntegerAttr::get(IndexType::get(ctx), i);
+        });
+    SmallVector<Attribute> results;
+    if (failed(map.constantFold(operands, results))) {
+      return nullptr;
+    }
+    for (auto [r, i] : llvm::zip(results, index)) {
+      auto folded = mlir::dyn_cast_if_present<IntegerAttr>(r);
+      if (!folded || folded.getInt() != i) {
+        return nullptr;
+      }
+    }
+    int64_t d = memrefType.getRank() - 1;
+    while (d >= 0 && ++index[d] == memrefType.getDimSize(d)) {
+      index[d--] = 0;
+    }
+    if (d < 0) {
+      return base;
+    }
+  }
+}
+
 class MaterializeReturnViewPattern : public OpRewritePattern<func::ReturnOp> {
 public:
   MaterializeReturnViewPattern(MLIRContext *context, bool dram)
@@ -260,11 +314,22 @@ public:
     rewriter.setInsertionPoint(returnOp);
     SmallVector<std::pair<unsigned, Value>> replacements;
 
+    // A function that loads resident parameters returns its buffers as they
+    // are: a view that maps every index to itself is not copied.
+    bool residentLoad = returnOp->getParentOfType<func::FuncOp>()->hasAttr(
+        utils::kResidentLoadAttr);
+
     // Inspect each return operand to determine if it needs materialization.
     for (OpOperand &opOperand : returnOp->getOpOperands()) {
       Operation *definingOp = opOperand.get().getDefiningOp();
       if (!isViewOp(definingOp)) {
         continue;
+      }
+      if (residentLoad) {
+        if (Value base = identityViewBase(opOperand.get())) {
+          replacements.emplace_back(opOperand.getOperandNumber(), base);
+          continue;
+        }
       }
 
       // Insert a generic op to materialize the view before returning. This

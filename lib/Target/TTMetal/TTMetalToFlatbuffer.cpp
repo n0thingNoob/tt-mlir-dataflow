@@ -894,13 +894,21 @@ tensorValueToFlatbuffer(FlatbufferObjectCache &cache, Value value) {
   assert(device);
   auto memref = mlir::cast<MemRefType>(value.getType());
 
+  // A program input or output is a host tensor, or (resident parameters) a
+  // device buffer another program of the binary produced: then describe its
+  // whole device shape in scalars, tiles expanded.
   Type elementType = memref.getElementType();
-  assert(!mlir::isa<ttcore::TileType>(elementType));
-  ttcore::DataType dtype = ttcore::elementTypeToDataType(elementType);
-
-  assert(!mlir::isa<ttcore::DeviceLayoutInterface>(memref.getLayout()));
   std::vector<int32_t> shape =
       ttmlir::utils::castContainer<std::vector<int32_t>>(memref.getShape());
+  ttcore::DataType dtype;
+  if (auto tileType = mlir::dyn_cast<ttcore::TileType>(elementType)) {
+    assert(shape.size() >= 2);
+    shape[shape.size() - 2] *= tileType.getHeight();
+    shape[shape.size() - 1] *= tileType.getWidth();
+    dtype = tileType.getDataType();
+  } else {
+    dtype = ttcore::elementTypeToDataType(elementType);
+  }
   std::vector<int32_t> meshShape;
   int32_t elementSize = getElementSizeBytes(dtype);
   std::uint64_t size =

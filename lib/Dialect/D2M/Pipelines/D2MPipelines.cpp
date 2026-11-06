@@ -176,6 +176,9 @@ void createD2MFrontendPipeline(OpPassManager &pm,
   pm.addPass(d2m::createD2MBuildTopkChain());
   pm.addPass(createCanonicalizerPassWithOptions(options));
   pm.addPass(d2m::createD2MOptimizeMasks());
+  if (options.residentParameters) {
+    pm.addPass(d2m::createD2MHoistResidentParameters());
+  }
   pm.addPass(d2m::createD2MLowerToLayout());
   pm.addPass(d2m::createD2MMaterializeViewReturns(viewReturnsOptions));
 
@@ -228,6 +231,7 @@ void createD2MFrontendPipeline(OpPassManager &pm,
         options.availableL1AddrRange.end());
     allocateOptions.forceSpillToDramIfLegal = options.forceSpillToDramIfLegal;
     allocateOptions.testAssumeL1Capacity = options.testAssumel1Capacity;
+    allocateOptions.residentDramBase = options.residentDramBase;
   }
   pm.addPass(d2m::createD2MAllocate(allocateOptions));
   pm.addPass(d2m::createD2MLowerMulticastLoads());

@@ -862,6 +862,10 @@ def D2MAllocate: Pass<"d2m-allocate", "::mlir::ModuleOp"> {
           "test-assume-l1-capacity",
           "std::int64_t", /*default=*/"0",
           "Assume given L1 capacity.">,
+    Option<"residentDramBase",
+          "resident-dram-base",
+          "std::int64_t", /*default=*/"0",
+          "DRAM address where the functions marked d2m.resident_load start allocating (0: the unreserved DRAM base). Lets the resident parameters of several binaries live on one device at once.">,
   ];
 }
 
@@ -976,6 +980,37 @@ def D2MMaterializeViewReturns : Pass<"d2m-materialize-view-returns", "::mlir::Mo
            "Materialize returned views in DRAM instead of in the view's memory space.">
   ];
   let dependentDialects = ["::mlir::tt::d2m::D2MDialect", "::mlir::tt::ttcore::TTCoreDialect"];
+}
+
+def D2MHoistResidentParameters : Pass<"d2m-hoist-resident-parameters", "::mlir::ModuleOp"> {
+  let summary = "Load parameters once into device buffers that every call reuses";
+  let description = [{
+    Runs right before d2m-lower-to-layout (the resident-parameters pipeline
+    option), when GridSelection has fixed every layout.
+
+    1. In every public function, the d2m.to_layouts of one argument that have
+       the same result type and write into identically attributed empties are
+       merged into the first: each argument is written and laid out once per
+       call however many ops read it.
+    2. The layout ops that only depend on arguments marked
+       ttcore.argument_type = parameter or constant (to_layout and mask with
+       their empties, and views that nothing else reads) move into a new
+       function `<name>_load` (d2m.resident_load, d2m.resident_params = the
+       original argument numbers it takes). It returns the values `<name>`
+       still reads; `<name>` (d2m.resident_run) takes them as trailing
+       arguments, each with d2m.resident_of (its parameter) and d2m.dram_bank
+       (when the buffer has one), and drops the parameters it no longer uses
+       (d2m.run_inputs = the original numbers of the arguments it keeps).
+
+    A runtime calls `<name>_load` once and `<name>` with the device buffers it
+    returned; d2m-allocate keeps those buffers out of `<name>`'s DRAM. The
+    loaded values must be in DRAM (dram-args-and-results).
+
+    Example: `%w_t = d2m.to_layout %w, %e` (W a parameter) feeding a matmul
+    becomes `func @main_load(%w) -> (tiled W)` returning %w_t, and
+    `func @main(%x, %w_t)` whose matmul reads the argument.
+  }];
+  let dependentDialects = ["::mlir::tt::d2m::D2MDialect", "::mlir::func::FuncDialect"];
 }
 
 def D2MSplitByDramBank : Pass<"d2m-split-by-dram-bank", "::mlir::ModuleOp"> {
