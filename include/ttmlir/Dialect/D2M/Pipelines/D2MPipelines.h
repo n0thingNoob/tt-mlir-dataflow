@@ -28,11 +28,21 @@ struct D2MPipelineOptions : public PassPipelineOptions<D2MPipelineOptions> {
                      "d2m.spatial_group attributes)")),
       llvm::cl::init(D2MExecutionStrategy::Temporal)};
 
+  Option<bool> frontendFusing{
+      *this, "frontend-fusing",
+      llvm::cl::desc("Fold a transpose of a matmul's B operand into "
+                     "transpose_b and x * sigmoid(x) into silu (ttir-fusing "
+                     "d2m-patterns-only) before lowering to D2M, with either "
+                     "execution strategy."),
+      llvm::cl::init(true)};
+
   Option<std::string> spatialPolicy{
       *this, "spatial-policy",
-      llvm::cl::desc("Spatial planning policy: greedy (group automatically) "
-                     "or none (only the groups given by spatial-groups or "
-                     "already in the IR)."),
+      llvm::cl::desc("Spatial planning policy: greedy (group automatically), "
+                     "bank (one core per generic, next to the DRAM bank of "
+                     "its weights), bank-load (bank plus a load region per "
+                     "bank) or none (only the groups given by spatial-groups "
+                     "or already in the IR)."),
       llvm::cl::init("greedy")};
 
   Option<bool> spatialFuseElementwise{

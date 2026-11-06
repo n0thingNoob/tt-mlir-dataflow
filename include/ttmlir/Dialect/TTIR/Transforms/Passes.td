@@ -316,6 +316,10 @@ def TTIRFusing: Pass<"ttir-fusing", "::mlir::ModuleOp">
              "enable-permute-slice-after-matmul-fusion",
              "bool", /*default=*/"true",
              "Push a matmul/linear output slice into the operand producing the sliced dim">,
+      Option<"d2mPatternsOnly",
+             "d2m-patterns-only",
+             "bool", /*default=*/"false",
+             "Only fold a transpose of a matmul's B operand into transpose_b and x * sigmoid(x) into silu, the patterns whose results the D2M lowering takes; ignores the other options">,
   ];
 }
 

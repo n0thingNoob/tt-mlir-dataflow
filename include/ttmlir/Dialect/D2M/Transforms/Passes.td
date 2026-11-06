@@ -42,6 +42,30 @@ def D2MSpatialPlanning : Pass<"d2m-spatial-planning", "::mlir::ModuleOp"> {
     d2m-materialize-spatial-groups turns into d2m.spatial ops. `remarks`
     reports every group and every cut.
 
+    With `policy=bank` it places generics next to the DRAM banks their
+    weights are in (`d2m.dram_bank` on function arguments), one core per
+    generic and one group per block:
+
+    - a generic's bank is the one bank its banked DRAM inputs are in; a
+      generic without one joins the bank all its predecessors share
+      (its cluster), if any;
+    - round robin over the banks in bank order: the k-th generic of every
+      cluster (first the ones that read the bank, then the rest, each in block
+      order) takes the free core nearest (Manhattan distance, then row-major)
+      the bank's worker core in the system desc's
+      dram_bank_to_logical_worker_noc0 table, then the (k+1)-th;
+    - the generics in no cluster (a hub summing several banks' results), in
+      block order, take the free core with the shortest total distance to
+      their placed predecessors.
+
+    `policy=bank-load` also gives every bank a load region (as in `loads`) on
+    the core nearest the bank's core, placed before the cluster's generics.
+    It copies the bank's inputs of the generics that read the bank; inputs of
+    a type other than the first one's stay direct DRAM reads (the outputs of
+    one load generic share a type). Blocks where no generic reads a bank stay
+    ungrouped. Neither combines with `groups` or `loads`; `remarks` prints the
+    values they compute in those options' format.
+
     `groups` sets these attributes by hand before any policy runs, one
     (group, generic, y0, x0, y1, x1) per generic; the planner then numbers its
     own groups after the largest group id already in the module.
@@ -69,7 +93,7 @@ def D2MSpatialPlanning : Pass<"d2m-spatial-planning", "::mlir::ModuleOp"> {
   }];
   let options = [
     Option<"policy", "policy", "std::string", /*default=*/"\"none\"",
-           "Grouping policy: none (preserve the IR) or greedy.">,
+           "Grouping policy: none (preserve the IR), greedy, bank (next to the DRAM banks of the weights) or bank-load (bank plus a load region per bank).">,
     ListOption<"excludeCores", "exclude-cores", "int64_t",
                "Logical cores (y, x pairs) that no region may contain.">,
     ListOption<"skipGenerics", "skip-generics", "int64_t",

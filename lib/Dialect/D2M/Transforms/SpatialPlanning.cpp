@@ -14,12 +14,16 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Transforms/RegionUtils.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 
+#include <cstdlib>
 #include <functional>
+#include <map>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -158,11 +162,29 @@ public:
 
   void runOnOperation() final {
     ModuleOp module = getOperation();
+    if (policy != "none" && policy != "greedy" && policy != "bank" &&
+        policy != "bank-load") {
+      module.emitError("policy must be none, greedy, bank or bank-load, got ")
+          << policy;
+      signalPassFailure();
+      return;
+    }
     bool greedy = policy == "greedy" && !ttnnMode;
+    bool byBank = (policy == "bank" || policy == "bank-load") && !ttnnMode;
+    // policy=bank / bank-load computes the same (group, generic, range) and
+    // load values a user would give in `groups` and `loads`.
+    SmallVector<int64_t> groupValues(groups.begin(), groups.end());
+    SmallVector<int64_t> loadValues(loads.begin(), loads.end());
+    if (byBank && failed(planByBank(module, policy == "bank-load", groupValues,
+                                    loadValues))) {
+      signalPassFailure();
+      return;
+    }
     // Groups given by hand go in first. The planner numbers its own groups
     // after every group already in the module, so the two never share an id.
     bool given = false;
-    if (failed(applyGivenGroups(module, given))) {
+    if (failed(applyGivenGroups(module, groupValues,
+                                byBank ? "bank-placed" : "given", given))) {
       signalPassFailure();
       return;
     }
@@ -232,19 +254,24 @@ public:
     // Streams and load regions go in last, so the generic indices they name
     // are the same as in `groups` and `skip-generics`. Streams first: a load
     // adds a generic but keeps the operand index of the input it replaces.
-    if (failed(applyGivenStreams(module)) || failed(insertGivenLoads(module))) {
+    if (failed(applyGivenStreams(module)) ||
+        failed(insertGivenLoads(module, loadValues))) {
       signalPassFailure();
       return;
     }
-    if (!greedy && !given && loads.empty() && streams.empty() &&
+    if (!greedy && !given && loadValues.empty() && streams.empty() &&
         streamPolicy == "none") {
       markAllAnalysesPreserved();
     }
   }
 
 private:
-  LogicalResult applyGivenGroups(ModuleOp module, bool &applied);
-  LogicalResult insertGivenLoads(ModuleOp module);
+  LogicalResult planByBank(ModuleOp module, bool withLoads,
+                           SmallVector<int64_t> &groupValues,
+                           SmallVector<int64_t> &loadValues);
+  LogicalResult applyGivenGroups(ModuleOp module, ArrayRef<int64_t> groupList,
+                                 StringRef kind, bool &applied);
+  LogicalResult insertGivenLoads(ModuleOp module, ArrayRef<int64_t> loadList);
   LogicalResult applyGivenStreams(ModuleOp module);
   std::optional<NodeCost>
   costOf(GenericOp generic, const GridAnalysis &gridAnalysis, std::string &why);
@@ -550,27 +577,311 @@ std::string D2MSpatialPlanningPass::tryAdd(Group &group, unsigned node,
   return "";
 }
 
+static bool isDramTensor(Value value) {
+  auto type = mlir::dyn_cast<RankedTensorType>(value.getType());
+  auto layout = type ? mlir::dyn_cast_if_present<ttcore::MetalLayoutAttr>(
+                           type.getEncoding())
+                     : nullptr;
+  return layout && layout.getMemorySpace() == ttcore::MemorySpace::DeviceDRAM;
+}
+
+// policy=bank / bank-load (see Passes.td): one group per block, one core per
+// generic, placed around the worker core next to the DRAM bank its weights
+// are in. Fills `groupValues` and `loadValues` in the `groups` / `loads`
+// format.
+LogicalResult
+D2MSpatialPlanningPass::planByBank(ModuleOp module, bool withLoads,
+                                   SmallVector<int64_t> &groupValues,
+                                   SmallVector<int64_t> &loadValues) {
+  if (!groups.empty() || !loads.empty()) {
+    return module.emitError("policy=")
+           << policy << " cannot be combined with groups or loads";
+  }
+  SmallVector<std::pair<int64_t, int64_t>> bankCores;
+  if (ttcore::SystemDescAttr systemDesc =
+          ttcore::getCurrentScopeSystemDesc(module)) {
+    for (ttcore::CoreCoordAttr core :
+         systemDesc.getChipDescs().front().getDramBankToLogicalWorkerNoc0()) {
+      bankCores.push_back({core.getY(), core.getX()});
+    }
+  }
+  if (bankCores.empty()) {
+    return module.emitError("policy=")
+           << policy
+           << " needs the system desc's dram_bank_to_logical_worker_noc0";
+  }
+  ArrayRef<int64_t> grid =
+      ttcore::lookupDevice(module).getWorkerGrid().getShape();
+  int64_t height = grid[0], width = grid[1];
+  int64_t group = 0;
+  module.walk([&](GenericOp generic) {
+    if (auto id = generic->getAttrOfType<IntegerAttr>(kSpatialGroupAttr)) {
+      group = std::max(group, id.getInt() + 1);
+    }
+  });
+  llvm::SmallDenseSet<int64_t> skipped(skipGenerics.begin(),
+                                       skipGenerics.end());
+
+  int64_t base = 0;
+  for (func::FuncOp func : module.getOps<func::FuncOp>()) {
+    for (Block &block : func.getBody()) {
+      GenericDAG dag = buildGenericDAG(block);
+      unsigned n = dag.size();
+      int64_t first = base;
+      base += n;
+      // The bank of each generic (the one bank its banked DRAM inputs are
+      // in), and its cluster: its bank, or else the cluster all its
+      // predecessors share. Generics in no cluster (a hub reading several
+      // banks' results) are placed after all clusters.
+      SmallVector<bool> eligible(n);
+      SmallVector<std::optional<int64_t>> bankOf(n), cluster(n);
+      for (unsigned i = 0; i < n; ++i) {
+        GenericOp generic = dag[i].generic;
+        eligible[i] = !skipped.contains(first + i) &&
+                      !generic->hasAttr(kSpatialGroupAttr);
+        if (!eligible[i]) {
+          continue;
+        }
+        bool mixed = false;
+        for (Value input : generic.getInputs()) {
+          std::optional<int64_t> bank =
+              isDramTensor(input) ? utils::getDramBank(input) : std::nullopt;
+          if (!bank) {
+            continue;
+          }
+          if (*bank < 0 || *bank >= static_cast<int64_t>(bankCores.size())) {
+            return generic.emitOpError("reads DRAM bank ")
+                   << *bank << ", but the system desc has " << bankCores.size()
+                   << " banks";
+          }
+          mixed |= bankOf[i] && *bankOf[i] != *bank;
+          bankOf[i] = bank;
+        }
+        if (mixed) {
+          bankOf[i] = std::nullopt;
+        }
+        if (bankOf[i]) {
+          cluster[i] = bankOf[i];
+          continue;
+        }
+        std::optional<int64_t> shared;
+        bool same = !dag[i].predecessors.empty();
+        for (unsigned p : dag[i].predecessors) {
+          if (!cluster[p] || (shared && *shared != *cluster[p])) {
+            same = false;
+            break;
+          }
+          shared = cluster[p];
+        }
+        if (same) {
+          cluster[i] = shared;
+        }
+      }
+      // Per bank, in this order: the load (bank-load), the generics that
+      // read the bank, then the rest of the cluster, each in block order.
+      std::map<int64_t, SmallVector<int64_t>> slots;
+      for (unsigned i = 0; i < n; ++i) {
+        if (bankOf[i]) {
+          slots[*bankOf[i]].push_back(i);
+        }
+      }
+      if (slots.empty()) {
+        if (remarks && n > 0) {
+          dag.front().generic.emitRemark(
+              "no generic of this block reads a DRAM bank (d2m.dram_bank); "
+              "policy=")
+              << policy << " leaves it ungrouped";
+        }
+        continue;
+      }
+      for (unsigned i = 0; i < n; ++i) {
+        if (cluster[i] && !bankOf[i]) {
+          slots[*cluster[i]].push_back(i);
+        }
+      }
+      // bank-load: the bank's inputs of the generics that read it, copied by
+      // one load generic. Its outputs must share one type, so inputs of
+      // another type than the first stay direct DRAM reads.
+      constexpr int64_t kLoad = -1;
+      std::map<int64_t, SmallVector<std::pair<unsigned, unsigned>>> loadInputs;
+      if (withLoads) {
+        for (auto &[bank, members] : slots) {
+          Type type;
+          for (int64_t i : members) {
+            if (bankOf[i] != bank) {
+              continue;
+            }
+            GenericOp generic = dag[i].generic;
+            for (auto [operand, input] : llvm::enumerate(generic.getInputs())) {
+              if (!isDramTensor(input) || utils::getDramBank(input) != bank) {
+                continue;
+              }
+              if (!type) {
+                type = input.getType();
+              }
+              if (input.getType() != type) {
+                if (remarks) {
+                  generic.emitRemark("input ")
+                      << operand << " of generic #" << first + i
+                      << " stays a direct read of DRAM bank " << bank
+                      << ": its type differs from the bank's load copies";
+                }
+                continue;
+              }
+              loadInputs[bank].push_back(
+                  {static_cast<unsigned>(i), static_cast<unsigned>(operand)});
+            }
+          }
+          if (loadInputs.count(bank)) {
+            members.insert(members.begin(), kLoad);
+          }
+        }
+      }
+
+      SmallVector<SmallVector<bool>> taken(height,
+                                           SmallVector<bool>(width, false));
+      for (size_t k = 0; k + 1 < excludeCores.size(); k += 2) {
+        if (excludeCores[k] >= 0 && excludeCores[k] < height &&
+            excludeCores[k + 1] >= 0 && excludeCores[k + 1] < width) {
+          taken[excludeCores[k]][excludeCores[k + 1]] = true;
+        }
+      }
+      // The free core with the lowest cost, the first in row-major order on
+      // ties.
+      auto take = [&](llvm::function_ref<int64_t(int64_t, int64_t)> cost)
+          -> std::optional<std::pair<int64_t, int64_t>> {
+        std::optional<std::pair<int64_t, int64_t>> best;
+        int64_t bestCost = 0;
+        for (int64_t y = 0; y < height; ++y) {
+          for (int64_t x = 0; x < width; ++x) {
+            if (taken[y][x]) {
+              continue;
+            }
+            int64_t c = cost(y, x);
+            if (!best || c < bestCost) {
+              best = {y, x};
+              bestCost = c;
+            }
+          }
+        }
+        if (best) {
+          taken[best->first][best->second] = true;
+        }
+        return best;
+      };
+      unsigned needed = 0;
+      for (unsigned i = 0; i < n; ++i) {
+        needed += eligible[i];
+      }
+      needed += loadInputs.size();
+      auto noRoom = [&]() {
+        return func.emitOpError("policy=")
+               << policy << " needs " << needed << " cores, one per generic"
+               << (withLoads ? " and load" : "") << ", but only "
+               << height * width - excludeCores.size() / 2 << " are free";
+      };
+      // Round robin over the banks: slot k of every bank takes the free core
+      // nearest that bank's core, then slot k + 1.
+      SmallVector<std::optional<std::pair<int64_t, int64_t>>> where(n);
+      std::map<int64_t, std::pair<int64_t, int64_t>> loadWhere;
+      size_t most = 0;
+      for (auto &[bank, members] : slots) {
+        most = std::max(most, members.size());
+      }
+      for (size_t k = 0; k < most; ++k) {
+        for (auto &[bank, members] : slots) {
+          if (k >= members.size()) {
+            continue;
+          }
+          std::pair<int64_t, int64_t> bankCore = bankCores[bank];
+          auto core = take([&](int64_t y, int64_t x) {
+            return std::abs(y - bankCore.first) + std::abs(x - bankCore.second);
+          });
+          if (!core) {
+            return noRoom();
+          }
+          if (members[k] == kLoad) {
+            loadWhere[bank] = *core;
+          } else {
+            where[members[k]] = core;
+          }
+        }
+      }
+      // The rest in block order: the free core with the shortest total
+      // distance to its placed predecessors.
+      for (unsigned i = 0; i < n; ++i) {
+        if (!eligible[i] || cluster[i]) {
+          continue;
+        }
+        auto core = take([&](int64_t y, int64_t x) {
+          int64_t sum = 0;
+          for (unsigned p : dag[i].predecessors) {
+            if (where[p]) {
+              sum += std::abs(y - where[p]->first) +
+                     std::abs(x - where[p]->second);
+            }
+          }
+          return sum;
+        });
+        if (!core) {
+          return noRoom();
+        }
+        where[i] = core;
+      }
+      if (needed < 2) {
+        continue;
+      }
+      for (unsigned i = 0; i < n; ++i) {
+        if (where[i]) {
+          auto [y, x] = *where[i];
+          groupValues.append({group, first + i, y, x, y, x});
+        }
+      }
+      for (auto &[bank, inputs] : loadInputs) {
+        auto [y, x] = loadWhere[bank];
+        for (auto [i, operand] : inputs) {
+          loadValues.append({first + i, operand, y, x, y, x});
+        }
+      }
+      ++group;
+    }
+  }
+  if (remarks) {
+    std::string text;
+    llvm::raw_string_ostream os(text);
+    os << "policy=" << policy << " gives groups=";
+    llvm::interleave(groupValues, os, ",");
+    os << " loads=";
+    llvm::interleave(loadValues, os, ",");
+    module.emitRemark(text);
+  }
+  return success();
+}
+
 // Sets d2m.spatial_group / d2m.spatial_range on the generics `groups` names:
 // (group, generic, y0, x0, y1, x1) per generic, with generics numbered as in
 // skip-generics and the remarks (top-level tensor generics in module order).
-LogicalResult D2MSpatialPlanningPass::applyGivenGroups(ModuleOp module,
-                                                       bool &applied) {
-  if (groups.empty()) {
+LogicalResult
+D2MSpatialPlanningPass::applyGivenGroups(ModuleOp module,
+                                         ArrayRef<int64_t> groupList,
+                                         StringRef kind, bool &applied) {
+  if (groupList.empty()) {
     return success();
   }
-  if (groups.size() % 6 != 0) {
+  if (groupList.size() % 6 != 0) {
     return module.emitError("groups takes (group, generic, y0, x0, y1, x1) "
                             "per generic, got ")
-           << groups.size() << " values";
+           << groupList.size() << " values";
   }
   MLIRContext *ctx = &getContext();
   llvm::DenseMap<int64_t, std::pair<int64_t, ttcore::CoreRangeAttr>> given;
-  for (size_t i = 0; i < groups.size(); i += 6) {
-    int64_t index = groups[i + 1];
+  for (size_t i = 0; i < groupList.size(); i += 6) {
+    int64_t index = groupList[i + 1];
     auto range = ttcore::CoreRangeAttr::get(
-        ctx, ttcore::CoreCoordAttr::get(ctx, groups[i + 2], groups[i + 3]),
-        ttcore::CoreCoordAttr::get(ctx, groups[i + 4], groups[i + 5]));
-    if (!given.try_emplace(index, groups[i], range).second) {
+        ctx,
+        ttcore::CoreCoordAttr::get(ctx, groupList[i + 2], groupList[i + 3]),
+        ttcore::CoreCoordAttr::get(ctx, groupList[i + 4], groupList[i + 5]));
+    if (!given.try_emplace(index, groupList[i], range).second) {
       return module.emitError("groups names generic #")
              << index << " more than once";
     }
@@ -594,7 +905,7 @@ LogicalResult D2MSpatialPlanningPass::applyGivenGroups(ModuleOp module,
         node.generic->setAttr(kSpatialRangeAttr, range);
         if (remarks) {
           node.generic->emitRemark("generic #")
-              << it->first << " is in given group " << group;
+              << it->first << " is in " << kind << " group " << group;
         }
         given.erase(it);
       }
@@ -649,8 +960,8 @@ LogicalResult D2MSpatialPlanningPass::applyGivenStreams(ModuleOp module) {
     for (GenericOp generic : generics) {
       if (generic->hasAttr(kSpatialGroupAttr)) {
         generic->setAttr(kSpatialStreamAllAttr,
-                         DenseI64ArrayAttr::get(&getContext(),
-                                                {kAutoStreamDepth, rows, cols}));
+                         DenseI64ArrayAttr::get(
+                             &getContext(), {kAutoStreamDepth, rows, cols}));
       }
     }
   }
@@ -749,14 +1060,16 @@ streamedLoadOrder(ArrayRef<OpOperand *> inputs) {
   return AffineMap::get(order->size(), 0, exprs, ctx);
 }
 
-LogicalResult D2MSpatialPlanningPass::insertGivenLoads(ModuleOp module) {
-  if (loads.empty()) {
+LogicalResult
+D2MSpatialPlanningPass::insertGivenLoads(ModuleOp module,
+                                         ArrayRef<int64_t> loadList) {
+  if (loadList.empty()) {
     return success();
   }
-  if (loads.size() % 6 != 0) {
+  if (loadList.size() % 6 != 0) {
     return module.emitError("loads takes (generic, operand, y0, x0, y1, x1) "
                             "per input, got ")
-           << loads.size() << " values";
+           << loadList.size() << " values";
   }
   SmallVector<GenericOp> generics;
   for (func::FuncOp func : module.getOps<func::FuncOp>()) {
@@ -770,8 +1083,8 @@ LogicalResult D2MSpatialPlanningPass::insertGivenLoads(ModuleOp module) {
   // region: regions of a spatial cannot share cores).
   MLIRContext *ctx = &getContext();
   llvm::MapVector<Attribute, SmallVector<OpOperand *>> byRange;
-  for (size_t i = 0; i < loads.size(); i += 6) {
-    int64_t index = loads[i], operand = loads[i + 1];
+  for (size_t i = 0; i < loadList.size(); i += 6) {
+    int64_t index = loadList[i], operand = loadList[i + 1];
     if (index < 0 || index >= static_cast<int64_t>(generics.size())) {
       return module.emitError("loads names generic #")
              << index << ", but the module has only " << generics.size()
@@ -798,8 +1111,8 @@ LogicalResult D2MSpatialPlanningPass::insertGivenLoads(ModuleOp module) {
              << operand << " of generic #" << index << ", which is not in DRAM";
     }
     auto range = ttcore::CoreRangeAttr::get(
-        ctx, ttcore::CoreCoordAttr::get(ctx, loads[i + 2], loads[i + 3]),
-        ttcore::CoreCoordAttr::get(ctx, loads[i + 4], loads[i + 5]));
+        ctx, ttcore::CoreCoordAttr::get(ctx, loadList[i + 2], loadList[i + 3]),
+        ttcore::CoreCoordAttr::get(ctx, loadList[i + 4], loadList[i + 5]));
     byRange[range].push_back(&input);
   }
 
