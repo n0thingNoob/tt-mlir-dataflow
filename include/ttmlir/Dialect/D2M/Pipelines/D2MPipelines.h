@@ -28,6 +28,33 @@ struct D2MPipelineOptions : public PassPipelineOptions<D2MPipelineOptions> {
                      "d2m.spatial_group attributes)")),
       llvm::cl::init(D2MExecutionStrategy::Temporal)};
 
+  Option<std::string> spatialPolicy{
+      *this, "spatial-policy",
+      llvm::cl::desc("Spatial planning policy: greedy (group automatically) "
+                     "or none (only the groups given by spatial-groups or "
+                     "already in the IR)."),
+      llvm::cl::init("greedy")};
+
+  Option<bool> spatialFuseElementwise{
+      *this, "spatial-fuse-elementwise",
+      llvm::cl::desc("With execution-strategy=spatial, fuse elementwise "
+                     "generics (d2m-generic-fusion, after a canonicalization "
+                     "that folds the to_layout round trips between them) "
+                     "before spatial planning, so a chain of elementwise ops "
+                     "takes one region."),
+      llvm::cl::init(false)};
+
+  ListOption<int64_t> spatialGroups{
+      *this, "spatial-groups",
+      llvm::cl::desc("Spatial groups given by hand: (group, generic, y0, x0, "
+                     "y1, x1) per generic, generic indices as in "
+                     "spatial-skip-generics.")};
+  ListOption<int64_t> spatialLoads{
+      *this, "spatial-loads",
+      llvm::cl::desc("Load regions given by hand: (generic, operand, y0, x0, "
+                     "y1, x1) per DRAM input of a generic in spatial-groups; "
+                     "inputs on the same cores share one load generic.")};
+
   ListOption<int64_t> spatialSkipGenerics{
       *this, "spatial-skip-generics",
       llvm::cl::desc("Indices (module order) of top-level generics that "
@@ -137,6 +164,14 @@ struct D2MPipelineOptions : public PassPipelineOptions<D2MPipelineOptions> {
           clEnumValN(ttcore::MemorySpace::DeviceL1, "l1", "L1"),
           clEnumValN(ttcore::MemorySpace::DeviceDRAM, "dram", "DRAM")),
       llvm::cl::init(ttcore::MemorySpace::DeviceL1)};
+  // Per-tensor placement instead of the two defaults above: function
+  // arguments and returned results in DRAM, every other tensor in L1.
+  Option<bool> dramArgsAndResults{
+      *this, "dram-args-and-results",
+      llvm::cl::desc("Put function arguments and returned results in DRAM and "
+                     "every other tensor in L1 (overrides "
+                     "default-input-memspace and default-output-memspace)."),
+      llvm::cl::init(false)};
 
   // This option disables back-to-back ToLayoutOp folding; this is mainly
   // useful for mocking up DMA tests that do 'unnecessary' roundtrip DMA.

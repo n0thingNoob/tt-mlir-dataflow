@@ -529,6 +529,43 @@ std::optional<AffineMap> getVirtualGridForwardMapping(Value val) {
   return std::nullopt;
 }
 
+std::optional<int64_t> getDramBank(Value val) {
+  Operation *defOp = val.getDefiningOp();
+  if (!defOp) {
+    return std::nullopt;
+  }
+  if (auto toLayoutOp = mlir::dyn_cast<ToLayoutOp>(defOp)) {
+    return getDramBank(toLayoutOp.getOutput());
+  }
+  if (auto toDeviceOp = mlir::dyn_cast<ToDeviceOp>(defOp)) {
+    return getDramBank(toDeviceOp.getOutput());
+  }
+  if (auto genericOp = mlir::dyn_cast<GenericOp>(defOp)) {
+    auto result = mlir::cast<OpResult>(val);
+    return getDramBank(genericOp.getOutputs()[result.getResultNumber()]);
+  }
+  if (auto spatialOp = mlir::dyn_cast<SpatialOp>(defOp)) {
+    auto result = mlir::cast<OpResult>(val);
+    return getDramBank(spatialOp.getOutputs()[result.getResultNumber()]);
+  }
+  if (auto viewOp = mlir::dyn_cast<ViewOpInterface>(defOp)) {
+    if (viewOp.isComposite()) {
+      return std::nullopt;
+    }
+    return getDramBank(viewOp.getInput());
+  }
+  if (auto bank = defOp->getAttrOfType<IntegerAttr>(kDramBankAttr)) {
+    return bank.getInt();
+  }
+  return std::nullopt;
+}
+
+void copyDramBank(Operation *from, Operation *to) {
+  if (auto bank = from->getAttr(kDramBankAttr)) {
+    to->setAttr(kDramBankAttr, bank);
+  }
+}
+
 std::optional<std::pair<AffineMap, AffineMap>>
 getGridMapsFromVirtualGridMapping(Value val, ArrayRef<int64_t> gridShape) {
   auto invMap = getVirtualGridInverseMapping(val);
@@ -700,7 +737,8 @@ static AffineMap
 getMemoryMapImpl(ttcore::DeviceAttr device, MemRefType memrefType,
                  size_t pageSize, std::optional<AffineMap> view,
                  size_t baseOffset,
-                 std::optional<AffineMap> storedForwardMap = std::nullopt) {
+                 std::optional<AffineMap> storedForwardMap = std::nullopt,
+                 std::optional<int64_t> dramBank = std::nullopt) {
   ttcore::MemorySpace memorySpace =
       mlir::cast<ttcore::MemorySpaceAttr>(memrefType.getMemorySpace())
           .getValue();
@@ -777,9 +815,23 @@ getMemoryMapImpl(ttcore::DeviceAttr device, MemRefType memrefType,
       symbols.push_back(static_cast<int64_t>(baseOffset));
       symbols.push_back(
           ttcore::getElementSizeBytes(memrefType.getElementType()));
-      return ttmlir::utils::replaceAffineMapSymbols(device.getDramMap(),
-                                                    symbols)
-          .compose(affineMap);
+      AffineMap dramMap =
+          ttmlir::utils::replaceAffineMapSymbols(device.getDramMap(), symbols)
+              .compose(affineMap);
+      if (dramBank && *dramBank != 0) {
+        // Shard i starts at bank (bank + i) mod banks (kDramBankAttr): rotate
+        // the bank result; the address within the bank does not change.
+        int64_t numBanks =
+            ttmlir::utils::volume(device.getDramGrid().getShape());
+        // A DRAM map puts the bank in the core x position.
+        constexpr int64_t bankIdx = ttcore::MemoryMapResultIdx::CoreCoordX;
+        SmallVector<AffineExpr> results(dramMap.getResults());
+        results[bankIdx] = (results[bankIdx] + *dramBank) % numBanks;
+        dramMap = mlir::simplifyAffineMap(
+            AffineMap::get(dramMap.getNumDims(), dramMap.getNumSymbols(),
+                           results, dramMap.getContext()));
+      }
+      return dramMap;
     }
     default: {
       llvm_unreachable("Unsupported memory space");
@@ -847,7 +899,7 @@ AffineMap getMemoryMap(ttcore::DeviceAttr device, Value memrefValue,
   }
 
   return getMemoryMapImpl(device, memrefType, pageSize, view, baseOffset,
-                          storedForwardMap);
+                          storedForwardMap, getDramBank(memrefValue));
 }
 
 AffineMap getMemoryMap(ttcore::DeviceAttr device,

@@ -80,10 +80,42 @@ protected:
   D2MNamedRewriterCommon(ttcore::MemorySpace defaultInputMemSpace,
                          ttcore::MemorySpace defaultOutputMemSpace,
                          bool ttnnMode, bool collapseTensors,
-                         bool enableMulticastInference)
+                         bool enableMulticastInference,
+                         bool dramArgsAndResults = false)
       : memorySpaces{defaultInputMemSpace, defaultOutputMemSpace},
         ttnnMode(ttnnMode), collapseTensors(collapseTensors),
-        enableMulticastInference(enableMulticastInference) {}
+        enableMulticastInference(enableMulticastInference),
+        dramArgsAndResults(dramArgsAndResults) {}
+
+  // Memory space of a device copy of input `value`. With dramArgsAndResults,
+  // function arguments go to DRAM and everything else to L1; otherwise the
+  // default input memory space.
+  ttcore::MemorySpace inputMemorySpace(Value value) const {
+    if (!dramArgsAndResults) {
+      return memorySpaces[0];
+    }
+    auto arg = mlir::dyn_cast<BlockArgument>(value);
+    return arg && mlir::isa<func::FuncOp>(arg.getOwner()->getParentOp())
+               ? ttcore::MemorySpace::DeviceDRAM
+               : ttcore::MemorySpace::DeviceL1;
+  }
+
+  // Memory space of the device buffer that becomes result `index` of `op`
+  // (nullptr: a temporary). With dramArgsAndResults, a result returned by the
+  // function goes to DRAM and everything else to L1; otherwise the default
+  // output memory space.
+  ttcore::MemorySpace outputMemorySpace(Operation *op, unsigned index) const {
+    if (!dramArgsAndResults) {
+      return memorySpaces[1];
+    }
+    bool returned =
+        op && index < op->getNumResults() &&
+        llvm::any_of(op->getResult(index).getUsers(), [](Operation *user) {
+          return mlir::isa<func::ReturnOp>(user);
+        });
+    return returned ? ttcore::MemorySpace::DeviceDRAM
+                    : ttcore::MemorySpace::DeviceL1;
+  }
 
   /// Attributes required to lower any `TTIR_ReductionOp` to D2M (used by both
   /// `D2MNamedAccumReductionRewriter` and
@@ -428,6 +460,19 @@ protected:
 
     auto emptyOp = rewriter.create<d2m::EmptyOp>(value.getLoc(), shardedShape,
                                                  elementType, layout);
+    // The DRAM copy of a function argument starts at the bank the argument
+    // names (d2m.dram_bank), if any.
+    if (memSpace == ttcore::MemorySpace::DeviceDRAM) {
+      if (auto arg = mlir::dyn_cast<BlockArgument>(value)) {
+        if (auto func =
+                mlir::dyn_cast<func::FuncOp>(arg.getOwner()->getParentOp())) {
+          if (auto bank = func.getArgAttrOfType<IntegerAttr>(
+                  arg.getArgNumber(), d2m::utils::kDramBankAttr)) {
+            emptyOp->setAttr(d2m::utils::kDramBankAttr, bank);
+          }
+        }
+      }
+    }
 
     // For ND tensors (logicalShape.size() > 2), set placeholder virtual grid
     // mappings on the EmptyOp.  These will be replaced when GridSelection
@@ -457,22 +502,27 @@ protected:
   // Insert ToLayout operations for a genericOp's operands and results,
   // including sharding and tilizing, with simple 1x1 grids; grid optimization
   // happens later in the D2MGridSelection pass.
+  // `resultsOf` is the op whose results the outputs become (nullptr when the
+  // outputs are temporaries); it decides the outputs' memory space.
   std::array<mlir::SmallVector<Value>, 2> toLayoutOperandsAndResults(
-      mlir::ConversionPatternRewriter &rewriter,
+      mlir::ConversionPatternRewriter &rewriter, Operation *resultsOf,
       std::array<mlir::SmallVector<Value>, 2> operandsAndResults, bool tiled,
-      bool noCollapse, ttcore::OOBVal oobVal) const {
+      bool noCollapse = false,
+      ttcore::OOBVal oobVal = ttcore::OOBVal::Undef) const {
     std::array<mlir::SmallVector<Value>, 2> result;
 
     for (Value operand : operandsAndResults[0]) {
-      result[0].push_back(createOptimalLayoutOp(operand, memorySpaces[0], tiled,
-                                                noCollapse, rewriter, oobVal));
+      result[0].push_back(
+          createOptimalLayoutOp(operand, inputMemorySpace(operand), tiled,
+                                noCollapse, rewriter, oobVal));
     }
     // Outputs always use Undef: they are destination buffers being written
     // into, so their padding fill value is irrelevant.  Only inputs need
     // identity-element OOB to prevent padded tiles from corrupting reductions.
-    for (Value operand : operandsAndResults[1]) {
-      result[1].push_back(createOptimalLayoutOp(operand, memorySpaces[1], tiled,
-                                                noCollapse, rewriter));
+    for (auto [index, operand] : llvm::enumerate(operandsAndResults[1])) {
+      result[1].push_back(
+          createOptimalLayoutOp(operand, outputMemorySpace(resultsOf, index),
+                                tiled, noCollapse, rewriter));
     }
 
     return result;
@@ -481,9 +531,19 @@ protected:
   std::array<mlir::SmallVector<Value>, 2> toLayoutOperandsAndResults(
       mlir::ConversionPatternRewriter &rewriter,
       std::array<mlir::SmallVector<Value>, 2> operandsAndResults, bool tiled,
+      bool noCollapse, ttcore::OOBVal oobVal) const {
+    return toLayoutOperandsAndResults(rewriter, /*resultsOf=*/nullptr,
+                                      operandsAndResults, tiled, noCollapse,
+                                      oobVal);
+  }
+
+  std::array<mlir::SmallVector<Value>, 2> toLayoutOperandsAndResults(
+      mlir::ConversionPatternRewriter &rewriter,
+      std::array<mlir::SmallVector<Value>, 2> operandsAndResults, bool tiled,
       bool noCollapse = false) const {
-    return toLayoutOperandsAndResults(rewriter, operandsAndResults, tiled,
-                                      noCollapse, ttcore::OOBVal::Undef);
+    return toLayoutOperandsAndResults(rewriter, /*resultsOf=*/nullptr,
+                                      operandsAndResults, tiled, noCollapse,
+                                      ttcore::OOBVal::Undef);
   }
 
   Operation *unLayoutResult(mlir::ConversionPatternRewriter &rewriter,
@@ -876,6 +936,11 @@ protected:
 
   // Enable automatic multicast inference for reduction operations.
   bool enableMulticastInference;
+
+  // Put function arguments and returned results in DRAM and every other
+  // tensor in L1 (overrides memorySpaces; see inputMemorySpace and
+  // outputMemorySpace).
+  bool dramArgsAndResults;
 };
 } // namespace
 
@@ -933,11 +998,12 @@ public:
       const TypeConverter &typeConverter, mlir::MLIRContext *ctx,
       ttcore::MemorySpace defaultInputMemSpace,
       ttcore::MemorySpace defaultOutputMemSpace, bool ttnnMode,
-      bool collapseTensors, bool enableMulticastInference)
+      bool collapseTensors, bool enableMulticastInference,
+      bool dramArgsAndResults = false)
       : OpConversionPattern<ConcreteOp>(typeConverter, ctx),
         D2MNamedRewriterCommon(defaultInputMemSpace, defaultOutputMemSpace,
                                ttnnMode, collapseTensors,
-                               enableMulticastInference) {}
+                               enableMulticastInference, dramArgsAndResults) {}
 
 private:
   // Build outer (per-shard) implicit-broadcast indexing maps in `physicalRank`,
@@ -1237,7 +1303,7 @@ private:
                      [](mlir::AffineMap map) { return !map.isIdentity(); });
 
     auto [inputs, outputs] =
-        toLayoutOperandsAndResults(rewriter, {origInputs, origOutputs},
+        toLayoutOperandsAndResults(rewriter, op, {origInputs, origOutputs},
                                    /*tiled*/ true, isImplicitBcast);
     const std::size_t numInputs = inputs.size();
     const std::size_t numOutputs = outputs.size();
@@ -1385,11 +1451,12 @@ public:
                        mlir::MLIRContext *ctx,
                        ttcore::MemorySpace defaultInputMemSpace,
                        ttcore::MemorySpace defaultOutputMemSpace, bool ttnnMode,
-                       bool collapseTensors, bool enableMulticastInference)
+                       bool collapseTensors, bool enableMulticastInference,
+                       bool dramArgsAndResults = false)
       : OpConversionPattern<ttir::BroadcastOp>(typeConverter, ctx),
         D2MNamedRewriterCommon(defaultInputMemSpace, defaultOutputMemSpace,
                                ttnnMode, collapseTensors,
-                               enableMulticastInference) {}
+                               enableMulticastInference, dramArgsAndResults) {}
 
 private:
   RankedTensorType getUnitGridLayoutType(RankedTensorType logicalType,
@@ -1537,10 +1604,12 @@ private:
     Location loc = op.getLoc();
     auto outputType = mlir::cast<RankedTensorType>(op.getResult().getType());
 
+    // The view keeps the input's memory space (a view cannot change it).
+    ttcore::MemorySpace inputSpace = inputMemorySpace(adaptor.getInput());
     Value input =
-        createOptimalLayoutOp(adaptor.getInput(), memorySpaces[0],
+        createOptimalLayoutOp(adaptor.getInput(), inputSpace,
                               /*tiled=*/true, /*noCollapse=*/true, rewriter);
-    auto viewType = getUnitGridLayoutType(outputType, memorySpaces[0],
+    auto viewType = getUnitGridLayoutType(outputType, inputSpace,
                                           /*tiled=*/true, rewriter);
     auto remapping = buildOuterBcastViewMap(
         rewriter, mlir::cast<RankedTensorType>(input.getType()), viewType);
@@ -1613,7 +1682,7 @@ private:
         createDpsOutputs(loc, rewriter, {op.getResult().getType()});
 
     auto [inputs, outputs] =
-        toLayoutOperandsAndResults(rewriter, {origInputs, origOutputs},
+        toLayoutOperandsAndResults(rewriter, op, {origInputs, origOutputs},
                                    /*tiled=*/true, /*noCollapse=*/true);
     assert(inputs.size() == 1);
     assert(outputs.size() == 1);
@@ -1682,11 +1751,12 @@ public:
                                  ttcore::MemorySpace defaultInputMemSpace,
                                  ttcore::MemorySpace defaultOutputMemSpace,
                                  bool ttnnMode, bool collapseTensors,
-                                 bool enableMulticastInference)
+                                 bool enableMulticastInference,
+                                 bool dramArgsAndResults = false)
       : OpConversionPattern<ConcreteOp>(typeConverter, ctx, /*benefit=*/10),
         D2MNamedRewriterCommon(defaultInputMemSpace, defaultOutputMemSpace,
                                ttnnMode, collapseTensors,
-                               enableMulticastInference) {}
+                               enableMulticastInference, dramArgsAndResults) {}
 
 private:
   static mlir::RankedTensorType
@@ -1811,7 +1881,7 @@ private:
         createDpsOutputs(loc, rewriter, {outputType});
     bool noCollapse = inputType.getRank() > 2;
     auto [inputs, outputs] = toLayoutOperandsAndResults(
-        rewriter, {origInputs, origOutputs},
+        rewriter, op, {origInputs, origOutputs},
         /*tiled=*/true, noCollapse, getReductionOOBVal());
 
     const std::size_t numInputs = inputs.size();
@@ -2095,11 +2165,12 @@ public:
       const TypeConverter &typeConverter, mlir::MLIRContext *ctx,
       ttcore::MemorySpace defaultInputMemSpace,
       ttcore::MemorySpace defaultOutputMemSpace, bool ttnnMode,
-      bool collapseTensors, bool enableMulticastInference)
+      bool collapseTensors, bool enableMulticastInference,
+      bool dramArgsAndResults = false)
       : OpConversionPattern<ConcreteOp>(typeConverter, ctx),
         D2MNamedRewriterCommon(defaultInputMemSpace, defaultOutputMemSpace,
                                ttnnMode, collapseTensors,
-                               enableMulticastInference) {}
+                               enableMulticastInference, dramArgsAndResults) {}
 
 private:
   static constexpr bool kIntSupported = !std::is_void_v<IntTileOp>;
@@ -2150,7 +2221,7 @@ private:
     bool noCollapse = (inputTensorType.getRank() > 2);
 
     auto [inputs, outputs] = toLayoutOperandsAndResults(
-        rewriter, {newInputs, origOutputs},
+        rewriter, op, {newInputs, origOutputs},
         /*tiled*/ true, noCollapse, getReductionOOBVal());
 
     const std::size_t numInputs = inputs.size();
@@ -2439,11 +2510,12 @@ public:
   D2MMatmulRewriter(const TypeConverter &typeConverter, mlir::MLIRContext *ctx,
                     ttcore::MemorySpace defaultInputMemSpace,
                     ttcore::MemorySpace defaultOutputMemSpace, bool ttnnMode,
-                    bool collapseTensors, bool enableMulticastInference)
+                    bool collapseTensors, bool enableMulticastInference,
+                    bool dramArgsAndResults = false)
       : OpConversionPattern<ConcreteOp>(typeConverter, ctx),
         D2MNamedRewriterCommon(defaultInputMemSpace, defaultOutputMemSpace,
                                ttnnMode, collapseTensors,
-                               enableMulticastInference) {}
+                               enableMulticastInference, dramArgsAndResults) {}
 
 private:
   LogicalResult
@@ -2471,7 +2543,7 @@ private:
     bool noCollapse = (inputTensorType.getRank() > 2);
 
     auto [inputs, outputs] = toLayoutOperandsAndResults(
-        rewriter, {origInputs, origOutputs}, /*tiled*/ true, noCollapse);
+        rewriter, op, {origInputs, origOutputs}, /*tiled*/ true, noCollapse);
 
     const std::size_t numInputs = inputs.size();
     const std::size_t numOutputs = outputs.size();
@@ -2733,11 +2805,12 @@ public:
   D2MPermuteRewriter(const TypeConverter &typeConverter, mlir::MLIRContext *ctx,
                      ttcore::MemorySpace defaultInputMemSpace,
                      ttcore::MemorySpace defaultOutputMemSpace, bool ttnnMode,
-                     bool /*collapseTensors*/, bool enableMulticastInference)
+                     bool /*collapseTensors*/, bool enableMulticastInference,
+                     bool dramArgsAndResults = false)
       : OpConversionPattern<ConcreteOp>(typeConverter, ctx, /*benefit=*/2),
         D2MNamedRewriterCommon(defaultInputMemSpace, defaultOutputMemSpace,
                                ttnnMode, /*collapseTensors*/ false,
-                               enableMulticastInference) {}
+                               enableMulticastInference, dramArgsAndResults) {}
 
   LogicalResult
   matchAndRewrite(ttir::PermuteOp op, typename ConcreteOp::Adaptor adaptor,
@@ -2782,7 +2855,7 @@ public:
         createDpsOutputs(loc, rewriter, {op.getResult().getType()});
 
     auto [inputs, outputs] =
-        toLayoutOperandsAndResults(rewriter, {origInputs, origOutputs},
+        toLayoutOperandsAndResults(rewriter, op, {origInputs, origOutputs},
                                    /*tiled*/ true);
 
     const auto inputTensorType =
@@ -2941,11 +3014,12 @@ public:
                     ttcore::MemorySpace defaultInputMemSpace,
                     ttcore::MemorySpace defaultOutputMemSpace,
                     bool /*ttnnMode*/, bool /*collapseTensors*/,
-                    bool enableMulticastInference)
+                    bool enableMulticastInference,
+                    bool dramArgsAndResults = false)
       : OpConversionPattern<ttir::ConcatOp>(typeConverter, ctx),
         D2MNamedRewriterCommon(defaultInputMemSpace, defaultOutputMemSpace,
                                /*ttnnMode=*/false, /*collapseTensors=*/false,
-                               enableMulticastInference) {}
+                               enableMulticastInference, dramArgsAndResults) {}
 
   LogicalResult
   matchAndRewrite(ttir::ConcatOp op, ttir::ConcatOp::Adaptor adaptor,
@@ -3047,7 +3121,7 @@ public:
     auto origOutputs = createDpsOutputs(loc, rewriter, {effectiveOutputType});
 
     auto [inputs, outputs] = toLayoutOperandsAndResults(
-        rewriter, {effectiveInputs, origOutputs},
+        rewriter, op, {effectiveInputs, origOutputs},
         /*tiled=*/!concatRowMajor, /*noCollapse=*/true);
 
     auto compositeView = rewriter.create<d2m::CompositeViewOp>(
@@ -3272,11 +3346,12 @@ public:
                             ttcore::MemorySpace defaultInputMemSpace,
                             ttcore::MemorySpace defaultOutputMemSpace,
                             bool ttnnMode, bool collapseTensors,
-                            bool enableMulticastInference)
+                            bool enableMulticastInference,
+                            bool dramArgsAndResults = false)
       : OpConversionPattern<ConcreteOp>(typeConverter, ctx),
         D2MNamedRewriterCommon(defaultInputMemSpace, defaultOutputMemSpace,
                                ttnnMode, collapseTensors,
-                               enableMulticastInference) {}
+                               enableMulticastInference, dramArgsAndResults) {}
 
   LogicalResult
   matchAndRewrite(ConcreteOp op, typename ConcreteOp::Adaptor adaptor,
@@ -3311,11 +3386,12 @@ public:
   D2MRandOpRewriter(const TypeConverter &typeConverter, mlir::MLIRContext *ctx,
                     ttcore::MemorySpace defaultInputMemSpace,
                     ttcore::MemorySpace defaultOutputMemSpace, bool ttnnMode,
-                    bool collapseTensors, bool enableMulticastInference)
+                    bool collapseTensors, bool enableMulticastInference,
+                    bool dramArgsAndResults = false)
       : OpConversionPattern<ttir::RandOp>(typeConverter, ctx),
         D2MNamedRewriterCommon(defaultInputMemSpace, defaultOutputMemSpace,
                                ttnnMode, collapseTensors,
-                               enableMulticastInference) {}
+                               enableMulticastInference, dramArgsAndResults) {}
 
   LogicalResult
   matchAndRewrite(ttir::RandOp op, ttir::RandOp::Adaptor adaptor,
@@ -3486,11 +3562,12 @@ public:
                       mlir::MLIRContext *ctx,
                       ttcore::MemorySpace defaultInputMemSpace,
                       ttcore::MemorySpace defaultOutputMemSpace, bool ttnnMode,
-                      bool collapseTensors, bool enableMulticastInference)
+                      bool collapseTensors, bool enableMulticastInference,
+                      bool dramArgsAndResults = false)
       : OpConversionPattern<ttir::ArangeOp>(typeConverter, ctx),
         D2MNamedRewriterCommon(defaultInputMemSpace, defaultOutputMemSpace,
                                ttnnMode, collapseTensors,
-                               enableMulticastInference) {}
+                               enableMulticastInference, dramArgsAndResults) {}
 
   LogicalResult
   matchAndRewrite(ttir::ArangeOp op, ttir::ArangeOp::Adaptor adaptor,
@@ -3513,7 +3590,7 @@ public:
         createDpsOutputs(loc, rewriter, {resultType});
     SmallVector<Value> emptyInputs;
     auto [inputs, outputs] = toLayoutOperandsAndResults(
-        rewriter, {emptyInputs, origOutputs}, /*tiled*/ true);
+        rewriter, op, {emptyInputs, origOutputs}, /*tiled*/ true);
     Value output = outputs[0];
 
     auto outputTensorType = mlir::cast<RankedTensorType>(output.getType());
@@ -3609,11 +3686,12 @@ public:
   D2MTopKRewriter(const TypeConverter &typeConverter, mlir::MLIRContext *ctx,
                   ttcore::MemorySpace defaultInputMemSpace,
                   ttcore::MemorySpace defaultOutputMemSpace, bool ttnnMode,
-                  bool collapseTensors, bool enableMulticastInference)
+                  bool collapseTensors, bool enableMulticastInference,
+                  bool dramArgsAndResults = false)
       : OpConversionPattern<ttir::TopKOp>(typeConverter, ctx, /*benefit=*/10),
         D2MNamedRewriterCommon(defaultInputMemSpace, defaultOutputMemSpace,
                                ttnnMode, collapseTensors,
-                               enableMulticastInference) {}
+                               enableMulticastInference, dramArgsAndResults) {}
 
   LogicalResult
   matchAndRewrite(ttir::TopKOp op, ttir::TopKOp::Adaptor adaptor,
@@ -3647,7 +3725,8 @@ public:
     // Placeholder leaf: d2m-grid-selection plans padding/transpose/extract,
     // and d2m-build-topk-chain replaces this leaf with the planned chain.
     Value layoutedInput = createOptimalLayoutOp(
-        adaptor.getInputTensor(), memorySpaces[0], /*tiled=*/true,
+        adaptor.getInputTensor(), inputMemorySpace(adaptor.getInputTensor()),
+        /*tiled=*/true,
         /*noCollapse=*/false, rewriter, ttcore::OOBVal::NegInf);
 
     auto [topkVals, topkIdx] = d2m::utils::emitLeafTopk(
@@ -3767,11 +3846,12 @@ public:
                          ttcore::MemorySpace defaultInputMemSpace,
                          ttcore::MemorySpace defaultOutputMemSpace,
                          bool ttnnMode, bool collapseTensors,
-                         bool enableMulticastInference)
+                         bool enableMulticastInference,
+                         bool dramArgsAndResults = false)
       : OpConversionPattern<ttir::EmbeddingOp>(typeConverter, ctx),
         D2MNamedRewriterCommon(defaultInputMemSpace, defaultOutputMemSpace,
                                ttnnMode, collapseTensors,
-                               enableMulticastInference) {}
+                               enableMulticastInference, dramArgsAndResults) {}
 
   LogicalResult
   matchAndRewrite(ttir::EmbeddingOp op, ttir::EmbeddingOp::Adaptor,
@@ -3805,13 +3885,14 @@ public:
 
     Location loc = op.getLoc();
     Value weightInput =
-        createOptimalLayoutOp(op.getWeight(), memorySpaces[0],
+        createOptimalLayoutOp(op.getWeight(), inputMemorySpace(op.getWeight()),
                               /*tiled=*/false, /*noCollapse=*/false, rewriter);
+    ttcore::MemorySpace indicesSpace = inputMemorySpace(op.getInput());
     Value indicesBoundaryInput =
-        createOptimalLayoutOp(op.getInput(), memorySpaces[0],
+        createOptimalLayoutOp(op.getInput(), indicesSpace,
                               /*tiled=*/false, /*noCollapse=*/false, rewriter);
     Value indicesInput =
-        memorySpaces[0] == ttcore::MemorySpace::DeviceL1
+        indicesSpace == ttcore::MemorySpace::DeviceL1
             ? indicesBoundaryInput
             : createOptimalLayoutOp(
                   indicesBoundaryInput, ttcore::MemorySpace::DeviceL1,
@@ -3821,7 +3902,7 @@ public:
     SmallVector<Value> origOutputs =
         createDpsOutputs(loc, rewriter, {resultType});
     SmallVector<Value> outputs{
-        createOptimalLayoutOp(origOutputs[0], memorySpaces[1],
+        createOptimalLayoutOp(origOutputs[0], outputMemorySpace(op, 0),
                               /*tiled=*/false, /*noCollapse=*/false, rewriter)};
 
     const std::size_t physicalRank =
@@ -3892,11 +3973,12 @@ public:
                                 ttcore::MemorySpace defaultInputMemSpace,
                                 ttcore::MemorySpace defaultOutputMemSpace,
                                 bool ttnnMode, bool collapseTensors,
-                                bool enableMulticastInference)
+                                bool enableMulticastInference,
+                                bool dramArgsAndResults = false)
       : OpConversionPattern<d2m::TileMatmulBlockOp>(typeConverter, ctx),
         D2MNamedRewriterCommon(defaultInputMemSpace, defaultOutputMemSpace,
                                ttnnMode, collapseTensors,
-                               enableMulticastInference) {}
+                               enableMulticastInference, dramArgsAndResults) {}
 
 private:
   LogicalResult
@@ -3976,11 +4058,12 @@ public:
                        mlir::MLIRContext *ctx,
                        ttcore::MemorySpace defaultInputMemSpace,
                        ttcore::MemorySpace defaultOutputMemSpace, bool ttnnMode,
-                       bool collapseTensors, bool enableMulticastInference)
+                       bool collapseTensors, bool enableMulticastInference,
+                       bool dramArgsAndResults = false)
       : OpConversionPattern<ttir::AllGatherOp>(typeConverter, ctx),
         D2MNamedRewriterCommon(defaultInputMemSpace, defaultOutputMemSpace,
                                ttnnMode, collapseTensors,
-                               enableMulticastInference) {}
+                               enableMulticastInference, dramArgsAndResults) {}
   Value createToLayoutOp(Value originalValue,
                          mlir::ConversionPatternRewriter &rewriter,
                          llvm::SmallVector<int64_t> workerGridShape) const {
@@ -4320,11 +4403,12 @@ public:
                                   ttcore::MemorySpace defaultInputMemSpace,
                                   ttcore::MemorySpace defaultOutputMemSpace,
                                   bool ttnnMode, bool /*collapseTensors*/,
-                                  bool enableMulticastInference)
+                                  bool enableMulticastInference,
+                                  bool dramArgsAndResults = false)
       : OpConversionPattern<TensorManipulationOp>(typeConverter, ctx),
         D2MNamedRewriterCommon(defaultInputMemSpace, defaultOutputMemSpace,
                                ttnnMode, /*collapse*/ false,
-                               enableMulticastInference) {}
+                               enableMulticastInference, dramArgsAndResults) {}
 
   LogicalResult
   matchAndRewrite(TensorManipulationOp op,
@@ -4347,14 +4431,20 @@ public:
         createDpsOutputs(op.getLoc(), rewriter, {op.getResult().getType()});
 
     auto [inputs, outputs] =
-        toLayoutOperandsAndResults(rewriter, {origInputs, origOutputs},
+        toLayoutOperandsAndResults(rewriter, op, {origInputs, origOutputs},
                                    /*tiled*/ info.canBeTilized);
     assert(outputs.size() == 1);
 
     auto outTy = mlir::cast<RankedTensorType>(outputs[0].getType());
     auto layout = mlir::cast<ttcore::MetalLayoutAttr>(outTy.getEncoding());
+    // A view cannot change the memory space: keep the input's, which differs
+    // from the output's when inputs and outputs are placed apart.
+    ttcore::MemorySpace inputSpace =
+        mlir::cast<ttcore::MetalLayoutAttr>(
+            mlir::cast<RankedTensorType>(inputs[0].getType()).getEncoding())
+            .getMemorySpace();
     auto newLayout = ttcore::MetalLayoutAttr::get(
-        layout.getContext(), layout.getLogicalShape(), layout.getMemorySpace(),
+        layout.getContext(), layout.getLogicalShape(), inputSpace,
         layout.getMemoryLayout(), layout.getCollapsedIntervals(),
         layout.getDimAlignments());
     auto newOutTy = RankedTensorType::get(outTy.getShape(),
@@ -4767,11 +4857,12 @@ public:
   D2MArgMaxRewriter(const TypeConverter &typeConverter, mlir::MLIRContext *ctx,
                     ttcore::MemorySpace defaultInputMemSpace,
                     ttcore::MemorySpace defaultOutputMemSpace, bool ttnnMode,
-                    bool collapseTensors, bool enableMulticastInference)
+                    bool collapseTensors, bool enableMulticastInference,
+                    bool dramArgsAndResults = false)
       : OpConversionPattern<ttir::ArgMaxOp>(typeConverter, ctx),
         D2MNamedRewriterCommon(defaultInputMemSpace, defaultOutputMemSpace,
                                ttnnMode, collapseTensors,
-                               enableMulticastInference) {}
+                               enableMulticastInference, dramArgsAndResults) {}
 
 private:
   static d2m::ReduceDim dimArgAsReduceDim(ttir::ArgMaxOp op,
@@ -5165,7 +5256,7 @@ private:
         /*tiled=*/true, false, ttcore::OOBVal::NegInf);
 
     Value rowMajorValues = createOptimalLayoutOp(
-        argMaxInput, memorySpaces[0], /*tiled=*/false,
+        argMaxInput, inputMemorySpace(argMaxInput), /*tiled=*/false,
         /*noCollapse=*/false, rewriter, ttcore::OOBVal::NegInf);
 
     // The LLK needs row-major bytes, but the d2m.generic/linalg.generic
@@ -5347,7 +5438,8 @@ void populateTTIRToD2MPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
                                ttcore::MemorySpace defaultInputMemSpace,
                                ttcore::MemorySpace defaultOutputMemSpace,
                                bool ttnnMode, bool collapseTensors,
-                               bool enableMulticastInference) {
+                               bool enableMulticastInference,
+                               bool dramArgsAndResults) {
   // clang-format off
   patterns.add<
     // Elementwise.
@@ -5444,7 +5536,7 @@ void populateTTIRToD2MPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
     D2MConstantFillOpRewriter<ttir::OnesOp>,
     // CCL
     D2MAllGatherRewriter
-  >(typeConverter, ctx, defaultInputMemSpace, defaultOutputMemSpace, ttnnMode, collapseTensors, enableMulticastInference);
+  >(typeConverter, ctx, defaultInputMemSpace, defaultOutputMemSpace, ttnnMode, collapseTensors, enableMulticastInference, dramArgsAndResults);
 
   // Handle SliceStatic cases that need a transpose-based rewrite to satisfy
   // NoC alignment before the generic SliceStatic lowering consumes them.
@@ -5464,27 +5556,29 @@ void populateTTIRToD2MPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
   patterns.add<D2MMeshShardOpRewriter>(typeConverter, ctx);
 
   // Matmul.
-  patterns.add<D2MMatmulRewriter<d2m::TileMatmulOp>>(typeConverter, ctx, defaultInputMemSpace, defaultOutputMemSpace,  ttnnMode, collapseTensors, enableMulticastInference);
+  patterns.add<D2MMatmulRewriter<d2m::TileMatmulOp>>(typeConverter, ctx, defaultInputMemSpace, defaultOutputMemSpace,  ttnnMode, collapseTensors, enableMulticastInference, dramArgsAndResults);
 
   // Arange.
   patterns.add<D2MArangeOpRewriter>(typeConverter, ctx, defaultInputMemSpace,
                                     defaultOutputMemSpace, ttnnMode,
-                                    collapseTensors, enableMulticastInference);
+                                    collapseTensors, enableMulticastInference,
+                                    dramArgsAndResults);
 
   // TopK.
   patterns.add<D2MTopKRewriter>(typeConverter, ctx, defaultInputMemSpace,
                                 defaultOutputMemSpace, ttnnMode,
-                                collapseTensors, enableMulticastInference);
+                                collapseTensors, enableMulticastInference,
+                                dramArgsAndResults);
 
   // Embedding.
   patterns.add<D2MEmbeddingOpRewriter>(
     typeConverter, ctx, defaultInputMemSpace, defaultOutputMemSpace, ttnnMode,
-    collapseTensors, enableMulticastInference);
+    collapseTensors, enableMulticastInference, dramArgsAndResults);
 
   // Rand.
   patterns.add<D2MRandOpRewriter>(typeConverter, ctx, defaultInputMemSpace,
     defaultOutputMemSpace, ttnnMode,
-    collapseTensors, enableMulticastInference);
+    collapseTensors, enableMulticastInference, dramArgsAndResults);
 
   // clang-format on
 }
@@ -5506,6 +5600,7 @@ public:
     this->ttnnMode = options.ttnnMode;
     this->collapseTensorsTo2D = options.collapseTensorsTo2D;
     this->enableMulticastInference = options.enableMulticastInference;
+    this->dramArgsAndResults = options.dramArgsAndResults;
   }
 
   TTIRToD2MPass(const TTIRToD2MPass &rhs) : Base(rhs) {
@@ -5516,6 +5611,7 @@ public:
     this->ttnnMode = rhs.ttnnMode;
     this->collapseTensorsTo2D = rhs.collapseTensorsTo2D;
     this->enableMulticastInference = rhs.enableMulticastInference;
+    this->dramArgsAndResults = rhs.dramArgsAndResults;
   }
 
   void runOnOperation() override {
@@ -5545,11 +5641,37 @@ public:
       return;
     }
 
+    // d2m.dram_bank on a function argument: a bank index.
+    int64_t numDramBanks = 0;
+    if (ttcore::SystemDescAttr systemDesc =
+            ttcore::getCurrentScopeSystemDesc(module)) {
+      numDramBanks = systemDesc.getChipDescs().front().getNumDramChannels();
+    }
+    for (func::FuncOp func : module.getOps<func::FuncOp>()) {
+      for (unsigned i = 0; i < func.getNumArguments(); ++i) {
+        Attribute bank = func.getArgAttr(i, d2m::utils::kDramBankAttr);
+        if (!bank) {
+          continue;
+        }
+        auto index = mlir::dyn_cast<IntegerAttr>(bank);
+        if (!index || index.getInt() < 0 ||
+            (numDramBanks > 0 && index.getInt() >= numDramBanks)) {
+          func.emitOpError("argument ")
+              << i << ": " << d2m::utils::kDramBankAttr
+              << " must be a DRAM bank index"
+              << (numDramBanks > 0 ? " below " + std::to_string(numDramBanks)
+                                   : std::string());
+          signalPassFailure();
+          return;
+        }
+      }
+    }
+
     RewritePatternSet patterns(ctx);
     populateTTIRToD2MPatterns(ctx, patterns, typeConverter,
                               defaultInputMemSpace, defaultOutputMemSpace,
                               ttnnMode, collapseTensorsTo2D,
-                              enableMulticastInference);
+                              enableMulticastInference, dramArgsAndResults);
 
     ConversionTarget target(*ctx);
     target.addIllegalDialect<mlir::tt::ttir::TTIRDialect>();

@@ -26,7 +26,9 @@ static d2m::GenericOp getSingleGenericOpFromSpatialRegion(Region &region) {
 }
 
 // Hoist every op except d2m.generic out of each spatial region: prefix ops
-// move before the spatial (forward moveBefore order), suffix ops (after generic
+// move before the spatial (forward moveBefore order) unless they read a region
+// block argument (a spatial edge, e.g. a view reblocking it for the generic),
+// suffix ops (after generic
 // until an optional d2m.spatial_yield or block end) move after the spatial
 // with generic-result uses rewired to spatial results. Any existing
 // d2m.spatial_yield ops in the region are erased, then a fresh yield of the
@@ -64,7 +66,14 @@ static void hoistNonGenericOpsAroundSpatial(d2m::SpatialOp spatialOp) {
       yieldOp.erase();
     }
 
+    llvm::SmallPtrSet<Value, 4> fromEdges(regionBlock.args_begin(),
+                                          regionBlock.args_end());
     for (Operation *prefixOp : beforeOps) {
+      if (llvm::any_of(prefixOp->getOperands(),
+                       [&](Value v) { return fromEdges.contains(v); })) {
+        fromEdges.insert(prefixOp->result_begin(), prefixOp->result_end());
+        continue;
+      }
       prefixOp->moveBefore(spatialOp);
     }
 
@@ -112,8 +121,9 @@ static void hoistNonGenericOpsAroundSpatial(d2m::SpatialOp spatialOp) {
 // matches outs, update each spatial result's type from the corresponding out
 // value only when that out is a ranked tensor (spatial results are tensors;
 // outs may be memref). Generic inputs that are the spatial's own region block
-// arguments (edge sinks) are not visible outside the spatial and are skipped.
-// Edges index generic outputs per region, so they need no remapping here.
+// arguments (edge sinks), or values defined in the region (views of them), are
+// not visible outside the spatial and are skipped. Edges index generic outputs
+// per region, so they need no remapping here.
 static void rebuildSpatialOpInsOutsAndResultTypes(d2m::SpatialOp spatialOp) {
   llvm::SetVector<Value> inputs;
   llvm::SmallVector<Value> outputs;
@@ -122,6 +132,10 @@ static void rebuildSpatialOpInsOutsAndResultTypes(d2m::SpatialOp spatialOp) {
     for (Value input : genericOp.getInputs()) {
       auto blockArg = mlir::dyn_cast<BlockArgument>(input);
       if (blockArg && blockArg.getOwner()->getParentOp() == spatialOp) {
+        continue;
+      }
+      if (Operation *def = input.getDefiningOp();
+          def && spatialOp->isProperAncestor(def)) {
         continue;
       }
       inputs.insert(input);

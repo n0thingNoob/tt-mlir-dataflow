@@ -36,6 +36,14 @@ constexpr llvm::StringLiteral kVirtualGridForwardMappingAttr =
     "d2m.virtualGridForwardMapping";
 constexpr llvm::StringLiteral kReductionScalerAttr = "d2m.reduction_scaler";
 
+// Discardable attribute (i64) on a DRAM buffer (d2m.empty, memref.alloc,
+// ttmetal.create_buffer) and on a function argument whose device copy is such
+// a buffer: shard i of the buffer lives in DRAM bank (bank + i) mod the number
+// of banks instead of bank i mod the number of banks. The kernels' DRAM
+// addresses (getMemoryMap) and the host's buffer placement (the flatbuffer's
+// distribution cores) both apply it.
+constexpr llvm::StringLiteral kDramBankAttr = "d2m.dram_bank";
+
 inline bool isReductionScalerBuffer(Operation *op) {
   return op && op->hasAttr(kReductionScalerAttr);
 }
@@ -147,6 +155,13 @@ std::optional<AffineMap> getVirtualGridInverseMapping(Value val);
 // associated with a value, if any.  Traces the same def-use chain as
 // getVirtualGridInverseMapping but returns the forward map attribute.
 std::optional<AffineMap> getVirtualGridForwardMapping(Value val);
+
+// Returns the kDramBankAttr of the buffer under a value, if any. Traces the
+// same def-use chain as getVirtualGridForwardMapping.
+std::optional<int64_t> getDramBank(Value val);
+
+// Copies kDramBankAttr from `from` to `to` (no-op when `from` has none).
+void copyDramBank(Operation *from, Operation *to);
 
 // Derive GridAttr-compatible virtual grid maps for `gridShape` from the full
 // tensor/memref virtual grid mapping carried by `val`. Returns std::nullopt
