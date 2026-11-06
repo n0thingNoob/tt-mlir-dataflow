@@ -101,6 +101,36 @@ bool canUseReinterpretLayoutView(const PlanState &current,
              target.getLayout()->getMemoryLayout();
 }
 
+bool hasSamePlacement(const PlanState &current, const PlanState &target) {
+  return current.getGridShape() == target.getGridShape() &&
+         current.getLayout()->getLogicalShape() ==
+             target.getLayout()->getLogicalShape() &&
+         current.getLayout()->getCollapsedIntervals() ==
+             target.getLayout()->getCollapsedIntervals() &&
+         current.getLayout()->getDimAlignments() ==
+             target.getLayout()->getDimAlignments() &&
+         current.getLayout()->getMemoryLayout() ==
+             target.getLayout()->getMemoryLayout();
+}
+
+// A scalar DRAM view tilized into an unremapped DRAM buffer with the same
+// placement. The tilize generic reads its shard through the view, which
+// consumes the remapping, and stores the tiles into the target buffer, so
+// neither an L1 bounce of the whole view nor a rebuffer is needed.
+bool isDramViewTilize(const PlanState &current, const PlanState &target) {
+  if (!current.hasLayout() || !target.hasLayout() || !current.isDRAM() ||
+      !target.isDRAM()) {
+    return false;
+  }
+  bool currentHasRemapping = current.remapping && !current.remapping.isEmpty();
+  bool targetHasRemapping = target.remapping && !target.remapping.isEmpty();
+  bool sameVgm = current.vgmForward == target.vgmForward &&
+                 current.vgmInverse == target.vgmInverse;
+  return currentHasRemapping && !targetHasRemapping && sameVgm &&
+         !ttcore::isTiled(current.type) && ttcore::isTiled(target.type) &&
+         hasSamePlacement(current, target);
+}
+
 // Metadata-only DRAM layout changes are legal in-place. DRAM copy/reblock
 // generics that only move data cannot read and write DRAM directly, so they
 // must bounce through L1. Same-placement format conversions are also legal
@@ -121,15 +151,7 @@ bool needsDramBounce(const PlanState &current, const PlanState &target) {
     return false;
   }
 
-  bool samePlacement = current.getGridShape() == target.getGridShape() &&
-                       current.getLayout()->getLogicalShape() ==
-                           target.getLayout()->getLogicalShape() &&
-                       current.getLayout()->getCollapsedIntervals() ==
-                           target.getLayout()->getCollapsedIntervals() &&
-                       current.getLayout()->getDimAlignments() ==
-                           target.getLayout()->getDimAlignments() &&
-                       current.getLayout()->getMemoryLayout() ==
-                           target.getLayout()->getMemoryLayout();
+  bool samePlacement = hasSamePlacement(current, target);
   bool onlyFormatConversion =
       sameVgm && sameRemapping && samePlacement &&
       ttcore::isTiled(current.type) != ttcore::isTiled(target.type);
@@ -343,6 +365,14 @@ Plan canonicalize(const PlanState &src, const PlanState &tgt,
     auto output = makeOutputSpec(scalarType, tgt.vgmForward, tgt.vgmInverse);
     plan.push_back(HostToDeviceStep{output});
     updateStateFromOutput(current, output);
+  }
+
+  // DRAM view → DRAM tilize: a single format-conversion generic.
+  if (isDramViewTilize(current, tgt)) {
+    plan.push_back(TilizeStep{
+        llvm::to_vector(ttcore::getTensorTileShape(tgt.type)), current.type,
+        makeOutputSpec(tgt.type, tgt.vgmForward, tgt.vgmInverse)});
+    return plan;
   }
 
   // DRAM → DRAM materialization: stage through an equivalent L1 buffer before

@@ -22,6 +22,7 @@ add_mlir_dialect_library(MLIRD2MTransforms
         LowerToLayout/LowerToLayout.cpp
         LowerToLayout/Plan.cpp
         MaterializeViewReturns.cpp
+        SplitByDramBank.cpp
         OptimizeMasks.cpp
         OpScheduler.cpp
         PythonRewritesPass.cpp
