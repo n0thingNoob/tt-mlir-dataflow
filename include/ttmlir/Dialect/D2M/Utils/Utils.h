@@ -36,10 +36,10 @@ constexpr llvm::StringLiteral kVirtualGridForwardMappingAttr =
     "d2m.virtualGridForwardMapping";
 constexpr llvm::StringLiteral kReductionScalerAttr = "d2m.reduction_scaler";
 
-// Unit attribute on the memref.alloc of a streaming spatial edge's ring
-// (d2m-materialize-spatial-streams): the ring lives in the consumer's L1 but is
-// the producer generic's output, which the GenericOp verifier allows only for
-// such rings.
+// Attribute on the memref.alloc of a streaming spatial edge's ring
+// (d2m-materialize-spatial-streams), an i64 array naming the edge
+// (P, I, C, J): the ring lives in the consumer's L1 but the producer writes it,
+// which the GenericOp verifier allows only for such rings.
 constexpr llvm::StringLiteral kStreamRingAttr = "d2m.stream_ring";
 
 // Discardable attribute (i64) on a DRAM buffer (d2m.empty, memref.alloc,

@@ -237,7 +237,8 @@ LogicalResult D2MMaterializeSpatialGroupsPass::materialize(Group &group,
   // Streaming requests (d2m.spatial_streams, set by d2m-spatial-planning):
   // per member, the stream fields of each incoming edge, keyed by (producer,
   // result). Every named input must become an edge, and inputs that share an
-  // edge must ask for the same stream.
+  // edge must ask for the same stream. A member with d2m.spatial_stream_all
+  // also streams every other incoming edge.
   struct StreamRequest {
     unsigned depth;
     SmallVector<int64_t, 2> block;
@@ -247,10 +248,10 @@ LogicalResult D2MMaterializeSpatialGroupsPass::materialize(Group &group,
   for (auto [c, generic] : llvm::enumerate(group.members)) {
     auto requests =
         generic->getAttrOfType<DenseI64ArrayAttr>(kSpatialStreamsAttr);
-    if (!requests) {
-      continue;
+    ArrayRef<int64_t> list;
+    if (requests) {
+      list = requests.asArrayRef();
     }
-    ArrayRef<int64_t> list = requests.asArrayRef();
     if (list.size() % 4 != 0) {
       return generic.emitOpError(kSpatialStreamsAttr)
              << " takes (operand, depth, rows, cols) entries";
@@ -279,6 +280,21 @@ LogicalResult D2MMaterializeSpatialGroupsPass::materialize(Group &group,
                << " names input " << list[i]
                << ", which does not read another member of spatial group "
                << group.id;
+      }
+    }
+    if (auto all =
+            generic->getAttrOfType<DenseI64ArrayAttr>(kSpatialStreamAllAttr)) {
+      if (all.size() != 3) {
+        return generic.emitOpError(kSpatialStreamAllAttr)
+               << " takes (depth, rows, cols)";
+      }
+      StreamRequest request{static_cast<unsigned>(all[0]), {}};
+      if (all[1] != 0 || all[2] != 0) {
+        request.block = {all[1], all[2]};
+      }
+      for (EdgeUse &use : edgeUses[c]) {
+        streamOf[c].try_emplace(
+            std::make_pair(use.producer, use.producerResult), request);
       }
     }
   }
@@ -456,6 +472,7 @@ LogicalResult D2MMaterializeSpatialGroupsPass::materialize(Group &group,
     generic->removeAttr(kSpatialGroupAttr);
     generic->removeAttr(kSpatialRangeAttr);
     generic->removeAttr(kSpatialStreamsAttr);
+    generic->removeAttr(kSpatialStreamAllAttr);
   }
 
   // Erase what the fold left dead, then move every op before the spatial

@@ -6,12 +6,15 @@
 
 // 1024x1024: ReblockGenerics gives both generics [8, 8], so every core
 // writes and reads 64 blocks of 2x2 tiles in the same row-major order.
-// Streaming between multi-core regions is not lowered yet, so the edge keeps
-// the whole-tensor handoff.
+// Each exp core gets a ring of 2 blocks; block (d0, d1) of the 16x16 block
+// grid belongs to core (d0 / 8, d1 / 8) and is block 8 * (d0 mod 8) + (d1 mod 8)
+// on it, so its slot is d1 mod 2.
 // CHECK: remark: edge 0:0 -> 1:0 can stream: 4 core pairs, 64 blocks of 2x2 tiles each, in the producer's order
-// CHECK: remark: edge 0:0 -> 1:0 stays a whole-tensor handoff: streaming between multi-core regions is not lowered yet
+// CHECK: remark: edge 0:0 -> 1:0 streams through a ring of 2 blocks of 2x2 tiles in the L1 of each of the 4 consumer cores, from (0, 2)
 // CHECK-LABEL: IR Dump After D2MMaterializeSpatialStreams
-// CHECK: d2m.spatial {edges = [#d2m.spatial_edge<0:0 -> 1:0>]
+// CHECK: %[[RING:.*]] = memref.alloc() {d2m.stream_ring = array<i64: 0, 0, 1, 0>, {{.*}}} : memref<2x2x4x2x!ttcore.tile<32x32, bf16>
+// CHECK: d2m.spatial {edges = [#d2m.spatial_edge<0:0 -> 1:0, stream<depth = 2>>]
+// CHECK: d2m.view_layout %[[RING]] remapping = affine_map<(d0, d1, d2, d3) -> (d0 floordiv 8, d1 floordiv 8, (d1 mod 2) * 2 + d2, d3)>
 func.func @chain_1024(%x: tensor<1024x1024xbf16>) -> tensor<1024x1024xbf16> {
   %t = "ttir.tanh"(%x) : (tensor<1024x1024xbf16>) -> tensor<1024x1024xbf16>
   %e = "ttir.exp"(%t) : (tensor<1024x1024xbf16>) -> tensor<1024x1024xbf16>

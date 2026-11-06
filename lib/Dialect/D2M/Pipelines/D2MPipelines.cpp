@@ -132,6 +132,7 @@ void createD2MFrontendPipeline(OpPassManager &pm,
       planningOptions.loads = llvm::to_vector(options.spatialLoads);
       planningOptions.streams = llvm::to_vector(options.spatialStreams);
       planningOptions.streamBlock = llvm::to_vector(options.spatialStreamBlock);
+      planningOptions.streamPolicy = options.spatialStreamPolicy;
       planningOptions.excludeCores = excludeCores;
       planningOptions.skipGenerics =
           llvm::to_vector(options.spatialSkipGenerics);

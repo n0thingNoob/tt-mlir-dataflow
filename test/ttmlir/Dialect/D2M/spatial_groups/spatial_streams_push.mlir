@@ -11,8 +11,8 @@
 // CHECK-DAG: remark: edge 1:0 -> 2:0 streams through a ring of 2 blocks of 1x4 tiles in the L1 of consumer core (0, 2)
 // CHECK-LABEL: IR Dump After D2MMaterializeSpatialStreams
 // The rings replace the edge buffers: 2 x (1x4) tiles on the consumer's core.
-// CHECK: %[[R0:.*]] = memref.alloc() {d2m.stream_ring, d2m.virtualGridForwardMapping = affine_map<(d0, d1, d2, d3) -> (d0 + 1, d1 + 1, d2, d3)>, d2m.virtualGridInverseMapping = affine_map<(d0, d1) -> (0, d0 - 1, d1 - 1)>} : memref<1x1x2x4x!ttcore.tile<32x32, bf16>, #ttcore.shard<8192x2048, 1>, #ttcore.memory_space<l1>>
-// CHECK: %[[R1:.*]] = memref.alloc() {d2m.stream_ring, d2m.virtualGridForwardMapping = affine_map<(d0, d1, d2, d3) -> (d0, d1 + 2, d2, d3)>, d2m.virtualGridInverseMapping = affine_map<(d0, d1) -> (0, d0, d1 - 2)>} : memref<1x1x2x4x!ttcore.tile<32x32, bf16>, #ttcore.shard<8192x2048, 1>, #ttcore.memory_space<l1>>
+// CHECK: %[[R0:.*]] = memref.alloc() {d2m.stream_ring = array<i64: 0, 0, 1, 0>, d2m.virtualGridForwardMapping = affine_map<(d0, d1, d2, d3) -> (d0 + 1, d1 + 1, d2, d3)>, d2m.virtualGridInverseMapping = affine_map<(d0, d1) -> (0, d0 - 1, d1 - 1)>} : memref<1x1x2x4x!ttcore.tile<32x32, bf16>, #ttcore.shard<8192x2048, 1>, #ttcore.memory_space<l1>>
+// CHECK: %[[R1:.*]] = memref.alloc() {d2m.stream_ring = array<i64: 1, 0, 2, 0>, d2m.virtualGridForwardMapping = affine_map<(d0, d1, d2, d3) -> (d0, d1 + 2, d2, d3)>, d2m.virtualGridInverseMapping = affine_map<(d0, d1) -> (0, d0, d1 - 2)>} : memref<1x1x2x4x!ttcore.tile<32x32, bf16>, #ttcore.shard<8192x2048, 1>, #ttcore.memory_space<l1>>
 // CHECK: d2m.spatial {edges = [#d2m.spatial_edge<0:0 -> 1:0, stream<depth = 2>>, #d2m.spatial_edge<1:0 -> 2:0, stream<depth = 2>>]
 // CHECK-NEXT: ins(
 // CHECK-NEXT: outs(%[[R0]], %[[R1]], %{{.*}} :

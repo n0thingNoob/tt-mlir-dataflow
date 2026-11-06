@@ -16,7 +16,10 @@
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
 
+#include <functional>
 #include <map>
+#include <memory>
+#include <numeric>
 #include <string>
 
 namespace mlir::tt::d2m {
@@ -331,6 +334,7 @@ public:
                       " reads it from more than one producer core");
         }
       }
+      pairs.push_back({writerOf.lookup(owner), c});
       auto [it, inserted] = readerOf.try_emplace(owner, c);
       if (!inserted) {
         return fail("consumer cores " + coreString(reads->cores[it->second]) +
@@ -391,6 +395,9 @@ public:
   Value storeMemref, loadMemref;
   AccessTrace writeTrace, readTrace;
   bool storeInReduction = false;
+  // (producer core, consumer core) of every pair, as indices into the traces'
+  // core lists (row-major over each generic's grid).
+  SmallVector<std::pair<size_t, size_t>> pairs;
 
 private:
   bool fail(const std::string &why) {
@@ -613,41 +620,103 @@ static std::string edgeName(SpatialEdgeAttr edge) {
          std::to_string(edge.getConsumerArg());
 }
 
-// The block ordinal (position in the access's sequence) as an affine function
-// of the access's block coordinates: base + sum_d stride_d * coord_d. Fitted on
-// steps of one coordinate and checked on every block.
-static std::optional<std::pair<SmallVector<int64_t>, int64_t>>
-fitOrdinal(ArrayRef<Block> blocks) {
-  size_t rank = blocks.front().coord.size();
-  std::map<SmallVector<int64_t>, int64_t> ordinalOf;
-  for (auto [j, block] : llvm::enumerate(blocks)) {
-    ordinalOf[block.coord] = j;
+// How an access's block coordinates split into a core and a block on it, and
+// the block's ordinal on its core: along view dim d, core c_d / B_d and local
+// block c_d mod B_d, with ordinal = base + sum_d stride_d * local_d, the same
+// on every core. Fitted on core 0 and checked on every block of every core.
+struct BlockFit {
+  SmallVector<int64_t> perCore; // B_d
+  SmallVector<int64_t> stride;
+  int64_t base = 0;
+};
+
+static std::optional<BlockFit> fitBlocks(const AccessTrace &trace,
+                                         ArrayRef<int64_t> grid) {
+  ArrayRef<Block> first = trace.perCore.front();
+  size_t rank = first.front().coord.size();
+  if (rank != grid.size()) {
+    return std::nullopt;
   }
-  SmallVector<int64_t> stride(rank, 0);
+  BlockFit fit;
+  fit.perCore.assign(rank, 1);
+  for (const Block &block : first) {
+    for (size_t d = 0; d < rank; ++d) {
+      if (block.coord[d] < 0) {
+        return std::nullopt;
+      }
+      fit.perCore[d] = std::max(fit.perCore[d], block.coord[d] + 1);
+    }
+  }
+  auto local = [&](const Block &block) {
+    SmallVector<int64_t> l;
+    for (size_t d = 0; d < rank; ++d) {
+      l.push_back(block.coord[d] % fit.perCore[d]);
+    }
+    return l;
+  };
+  std::map<SmallVector<int64_t>, int64_t> ordinalOf;
+  for (auto [j, block] : llvm::enumerate(first)) {
+    ordinalOf[local(block)] = j;
+  }
+  fit.stride.assign(rank, 0);
   for (size_t d = 0; d < rank; ++d) {
-    for (auto [j, block] : llvm::enumerate(blocks)) {
-      SmallVector<int64_t> next = block.coord;
+    for (auto [j, block] : llvm::enumerate(first)) {
+      SmallVector<int64_t> next = local(block);
       ++next[d];
       if (auto it = ordinalOf.find(next); it != ordinalOf.end()) {
-        stride[d] = it->second - static_cast<int64_t>(j);
+        fit.stride[d] = it->second - static_cast<int64_t>(j);
         break;
       }
     }
   }
-  int64_t base = 0;
+  SmallVector<int64_t> origin = local(first.front());
   for (size_t d = 0; d < rank; ++d) {
-    base -= stride[d] * blocks.front().coord[d];
+    fit.base -= fit.stride[d] * origin[d];
   }
-  for (auto [j, block] : llvm::enumerate(blocks)) {
-    int64_t ordinal = base;
-    for (size_t d = 0; d < rank; ++d) {
-      ordinal += stride[d] * block.coord[d];
-    }
-    if (ordinal != static_cast<int64_t>(j)) {
-      return std::nullopt;
+  for (auto [k, blocks] : llvm::enumerate(trace.perCore)) {
+    for (auto [j, block] : llvm::enumerate(blocks)) {
+      int64_t ordinal = fit.base;
+      SmallVector<int64_t> l = local(block);
+      for (size_t d = 0; d < rank; ++d) {
+        if (block.coord[d] / fit.perCore[d] != trace.cores[k][d]) {
+          return std::nullopt;
+        }
+        ordinal += fit.stride[d] * l[d];
+      }
+      if (ordinal != static_cast<int64_t>(j)) {
+        return std::nullopt;
+      }
     }
   }
-  return std::make_pair(stride, base);
+  return fit;
+}
+
+// True when `generic`'s virtual grid is its physical cores shifted by a
+// constant, so that "the same virtual core" of two such grids differ by a
+// constant on the device.
+static bool isTranslatedGrid(GenericOp generic) {
+  ttcore::GridAttr grid = generic.getGrid();
+  AffineMap virtToPhys = grid.getVirtToPhysicalMap();
+  if (virtToPhys.isEmpty()) {
+    return true;
+  }
+  ArrayRef<int64_t> shape = grid.getShape();
+  if (shape.size() != 2) {
+    return false;
+  }
+  std::optional<std::pair<int64_t, int64_t>> shift;
+  for (int64_t y = 0; y < shape[0]; ++y) {
+    for (int64_t x = 0; x < shape[1]; ++x) {
+      SmallVector<int64_t> phys = virtToPhys.compose({y, x});
+      std::pair<int64_t, int64_t> d = {phys[phys.size() - 2] - y,
+                                       phys[phys.size() - 1] - x};
+      if (shift && *shift != d) {
+        return false;
+      }
+      shift = d;
+    }
+  }
+  return true;
 }
 
 // Values from `view` down its view chain, excluding the root.
@@ -660,108 +729,199 @@ static SmallVector<Value> viewChain(Value view) {
   return chain;
 }
 
-// Replaces the edge buffer of a streaming edge by a ring of `depth` blocks in
-// the consumer core's L1, and both accesses by views of the ring whose block
-// coordinate selects slot (ordinal mod depth). Returns a reason, and changes
-// nothing, when the edge needs something not lowered yet.
-static std::optional<std::string> materializeRing(SpatialOp spatial,
-                                                  SpatialEdgeAttr edge,
-                                                  EdgeAnalysis &analysis,
-                                                  std::string &placed) {
-  auto genericOf = [&](unsigned region) {
-    return *spatial.getRegion(region).getOps<GenericOp>().begin();
-  };
-  GenericOp producer = genericOf(edge.getProducerRegion());
-  GenericOp consumer = genericOf(edge.getConsumerRegion());
-  if (producer.getGrid().getGridVolume() != 1 ||
-      consumer.getGrid().getGridVolume() != 1) {
-    return std::string("streaming between multi-core regions");
+// One streaming edge group: the edges that leave one producer output (one per
+// consumer region), with their analyses.
+struct StreamGroup {
+  std::pair<unsigned, unsigned> source;
+  SmallVector<unsigned> members; // indices into the spatial's edges
+  SmallVector<std::unique_ptr<EdgeAnalysis>> analyses;
+};
+
+static GenericOp genericOf(SpatialOp spatial, unsigned region) {
+  return *spatial.getRegion(region).getOps<GenericOp>().begin();
+}
+
+// What the lowering does not support yet, for a group whose edges can all
+// stream; nullopt when it is supported. Supported: every consumer region has
+// the producer's grid, producer core k feeds consumer core k, both virtual
+// grids are shifted copies of their cores, the edge buffer is reached only
+// through the accesses' views, and all ends move blocks of one shape.
+static std::optional<std::string> unsupported(SpatialOp spatial,
+                                              ArrayRef<SpatialEdgeAttr> edges,
+                                              const StreamGroup &group) {
+  GenericOp producer = genericOf(spatial, group.source.first);
+  ArrayRef<int64_t> grid = producer.getGrid().getShape();
+  if (!isTranslatedGrid(producer)) {
+    return std::string("a region whose virtual grid is not a shifted copy of "
+                       "its cores");
   }
-  if (analysis.storeInReduction) {
-    return std::string("a producer that writes it inside a reduction loop");
-  }
-  Value buffer = spatial.getEdgeBuffer(edge);
+  const EdgeAnalysis &first = *group.analyses.front();
+  Value buffer = spatial.getEdgeBuffer(edges[group.members.front()]);
   auto alloc = buffer.getDefiningOp<memref::AllocOp>();
-  Value storeView = analysis.storeMemref, loadView = analysis.loadMemref;
-  if (!alloc || storeView == buffer || loadView == buffer) {
+  if (!alloc || first.storeMemref == buffer) {
     return std::string("an edge buffer that is not reached through views");
   }
-  SmallVector<Value> chains = viewChain(storeView);
-  llvm::append_range(chains, viewChain(loadView));
-  for (OpOperand &use : buffer.getUses()) {
-    Operation *user = use.getOwner();
-    if (user == spatial.getOperation() || mlir::isa<memref::DeallocOp>(user) ||
-        llvm::is_contained(chains, user->getResult(0))) {
-      continue;
-    }
-    return std::string("an edge buffer with other uses");
-  }
-  auto storeType = mlir::cast<MemRefType>(storeView.getType());
-  auto loadType = mlir::cast<MemRefType>(loadView.getType());
-  ArrayRef<int64_t> block = storeType.getShape().drop_front(2);
-  if (block != loadType.getShape().drop_front(2)) {
-    return std::string("blocks of different shapes at the two ends");
-  }
-  auto writeOrdinal = fitOrdinal(analysis.writeTrace.perCore.front());
-  auto readOrdinal = fitOrdinal(analysis.readTrace.perCore.front());
-  if (!writeOrdinal || !readOrdinal) {
+  SmallVector<Value> chains = viewChain(first.storeMemref);
+  ArrayRef<int64_t> block = mlir::cast<MemRefType>(first.storeMemref.getType())
+                                .getShape()
+                                .drop_front(2);
+  if (!fitBlocks(first.writeTrace, grid)) {
     return std::string("a block order that is not affine in the views");
   }
+  for (auto [k, analysis] : llvm::enumerate(group.analyses)) {
+    GenericOp consumer =
+        genericOf(spatial, edges[group.members[k]].getConsumerRegion());
+    if (consumer.getGrid().getShape() != grid ||
+        analysis->pairs.size() != consumer.getGrid().getGridVolume() ||
+        llvm::any_of(analysis->pairs,
+                     [](auto pair) { return pair.first != pair.second; })) {
+      return std::string("a core pairing other than core k to core k");
+    }
+    if (!isTranslatedGrid(consumer)) {
+      return std::string("a region whose virtual grid is not a shifted copy "
+                         "of its cores");
+    }
+    if (analysis->loadMemref == buffer) {
+      return std::string("an edge buffer that is not reached through views");
+    }
+    if (mlir::cast<MemRefType>(analysis->loadMemref.getType())
+            .getShape()
+            .drop_front(2) != block) {
+      return std::string("blocks of different shapes at the two ends");
+    }
+    if (!fitBlocks(analysis->readTrace, grid)) {
+      return std::string("a block order that is not affine in the views");
+    }
+    llvm::append_range(chains, viewChain(analysis->loadMemref));
+  }
+  for (OpOperand &use : buffer.getUses()) {
+    Operation *user = use.getOwner();
+    if (user != spatial.getOperation() && !mlir::isa<memref::DeallocOp>(user) &&
+        !llvm::is_contained(chains, user->getResult(0))) {
+      return std::string("an edge buffer with other uses");
+    }
+  }
+  return std::nullopt;
+}
 
-  // The ring: one core (the consumer's), `depth` blocks stacked by rows.
+// Replaces the edge buffer of a supported streaming group by one ring of
+// `depth` blocks per consumer region, in that region's cores' L1: the
+// producer's access becomes a view of the first ring (the lowering adds the
+// writes to the others), every consumer's access a view of its own ring. In
+// the views a block coordinate selects the core and the slot (ordinal on that
+// core mod depth). Fills `placed` with one description per edge.
+static void materializeRings(SpatialOp spatial, ArrayRef<SpatialEdgeAttr> edges,
+                             const StreamGroup &group,
+                             SmallVector<std::string> &placed) {
   MLIRContext *ctx = spatial.getContext();
-  int64_t depth = edge.getStreamDepth();
+  GenericOp producer = genericOf(spatial, group.source.first);
+  ArrayRef<int64_t> grid = producer.getGrid().getShape();
+  SpatialEdgeAttr firstEdge = edges[group.members.front()];
+  const EdgeAnalysis &first = *group.analyses.front();
+  Value buffer = spatial.getEdgeBuffer(firstEdge);
+  auto alloc = buffer.getDefiningOp<memref::AllocOp>();
+  Value storeView = first.storeMemref;
+  SmallVector<Value> chains = viewChain(storeView);
+  ArrayRef<int64_t> block =
+      mlir::cast<MemRefType>(storeView.getType()).getShape().drop_front(2);
+  int64_t depth = firstEdge.getStreamDepth();
   int64_t rows = block[0], cols = block[1];
   auto bufferType = mlir::cast<MemRefType>(buffer.getType());
   SmallVector<int64_t> shard = {depth * rows, cols};
-  SmallVector<int64_t> ringShape = {1, 1, depth * rows, cols};
+  SmallVector<int64_t> ringShape = {grid[0], grid[1], depth * rows, cols};
   auto ringType = MemRefType::get(
       ringShape, bufferType.getElementType(),
       ttcore::ShardLayoutAttr::get(shard, bufferType.getElementType(), 1),
       bufferType.getMemorySpace());
-  OpBuilder builder(alloc);
-  auto ring = builder.create<memref::AllocOp>(alloc.getLoc(), ringType);
-  ring->setAttr(utils::kStreamRingAttr, UnitAttr::get(ctx));
-  ttcore::GridAttr grid = consumer.getGrid();
-  AffineMap physToVirt = grid.getPhysicalToVirtMap();
-  if (!physToVirt.isEmpty()) {
-    AffineMap virtToPhys = grid.getVirtToPhysicalMap();
-    unsigned n = virtToPhys.getNumResults();
-    AffineMap forward = AffineMap::get(
-        4, 0,
-        {virtToPhys.getResult(n - 2), virtToPhys.getResult(n - 1),
-         getAffineDimExpr(2, ctx), getAffineDimExpr(3, ctx)},
-        ctx);
-    ring->setAttr(utils::kVirtualGridForwardMappingAttr,
-                  AffineMapAttr::get(forward));
-    ring->setAttr(utils::kVirtualGridInverseMappingAttr,
-                  AffineMapAttr::get(physToVirt));
-  }
 
   // A view with the access's type: block (d0, d1), tile (d2, d3) of it ->
-  // slot ((base + s0 d0 + s1 d1) mod depth), row slot * rows + d2.
-  auto ringView = [&](Value access,
-                      const std::pair<SmallVector<int64_t>, int64_t> &fit) {
-    auto [stride, base] = fit;
-    AffineExpr ordinal = getAffineConstantExpr(base, ctx);
+  // core (d0 / B0, d1 / B1) of the ring, slot
+  // ((base + s0 (d0 mod B0) + s1 (d1 mod B1)) mod depth), row slot * rows + d2.
+  // Along a grid dim of size 1 the core is 0 and the local block is d.
+  auto ringView = [&](Value ring, Value access, const BlockFit &fit) {
+    AffineExpr ordinal = getAffineConstantExpr(fit.base, ctx);
+    SmallVector<AffineExpr> results;
     for (unsigned d = 0; d < 2; ++d) {
-      ordinal = ordinal + getAffineDimExpr(d, ctx) * stride[d];
+      AffineExpr dim = getAffineDimExpr(d, ctx);
+      bool split = grid[d] > 1;
+      results.push_back(split ? dim.floorDiv(fit.perCore[d])
+                              : getAffineConstantExpr(0, ctx));
+      ordinal = ordinal + (split ? dim % fit.perCore[d] : dim) * fit.stride[d];
     }
-    AffineExpr zero = getAffineConstantExpr(0, ctx);
-    AffineMap map = AffineMap::get(
-        4, 0,
-        {zero, zero, (ordinal % depth) * rows + getAffineDimExpr(2, ctx),
-         getAffineDimExpr(3, ctx)},
-        ctx);
+    results.push_back((ordinal % depth) * rows + getAffineDimExpr(2, ctx));
+    results.push_back(getAffineDimExpr(3, ctx));
+    AffineMap map = AffineMap::get(4, 0, results, ctx);
     OpBuilder b(access.getDefiningOp());
-    Value view = b.create<ViewLayoutOp>(access.getLoc(), access.getType(),
-                                        ring.getResult(), map,
-                                        /*reinterpretLayout=*/false);
+    Value view =
+        b.create<ViewLayoutOp>(access.getLoc(), access.getType(), ring, map,
+                               /*reinterpretLayout=*/false);
     access.replaceAllUsesWith(view);
   };
-  ringView(storeView, *writeOrdinal);
-  ringView(loadView, *readOrdinal);
-  buffer.replaceUsesWithIf(ring.getResult(), [&](OpOperand &use) {
+
+  OpBuilder builder(alloc);
+  SmallVector<memref::DeallocOp> deallocs;
+  for (Operation *user : buffer.getUsers()) {
+    if (auto dealloc = mlir::dyn_cast<memref::DeallocOp>(user)) {
+      deallocs.push_back(dealloc);
+    }
+  }
+  Value firstRing;
+  for (auto [k, index] : llvm::enumerate(group.members)) {
+    const EdgeAnalysis &analysis = *group.analyses[k];
+    GenericOp consumer = genericOf(spatial, edges[index].getConsumerRegion());
+    auto ring = builder.create<memref::AllocOp>(alloc.getLoc(), ringType);
+    // The ring names its edge (P, I, C, J) so that the lowering finds every
+    // consumer's ring of a group.
+    SpatialEdgeAttr edge = edges[index];
+    ring->setAttr(utils::kStreamRingAttr,
+                  DenseI64ArrayAttr::get(
+                      ctx, {edge.getProducerRegion(), edge.getProducerOutput(),
+                            edge.getConsumerRegion(), edge.getConsumerArg()}));
+    ttcore::GridAttr consumerGrid = consumer.getGrid();
+    AffineMap physToVirt = consumerGrid.getPhysicalToVirtMap();
+    if (!physToVirt.isEmpty()) {
+      AffineMap virtToPhys = consumerGrid.getVirtToPhysicalMap();
+      unsigned n = virtToPhys.getNumResults();
+      AffineMap forward = AffineMap::get(
+          4, 0,
+          {virtToPhys.getResult(n - 2), virtToPhys.getResult(n - 1),
+           getAffineDimExpr(2, ctx), getAffineDimExpr(3, ctx)},
+          ctx);
+      ring->setAttr(utils::kVirtualGridForwardMappingAttr,
+                    AffineMapAttr::get(forward));
+      ring->setAttr(utils::kVirtualGridInverseMappingAttr,
+                    AffineMapAttr::get(physToVirt));
+    }
+    chains.append(viewChain(analysis.loadMemref));
+    ringView(ring.getResult(), analysis.loadMemref,
+             *fitBlocks(analysis.readTrace, grid));
+    if (k == 0) {
+      firstRing = ring.getResult();
+      ringView(firstRing, storeView, *fitBlocks(first.writeTrace, grid));
+    } else {
+      for (memref::DeallocOp dealloc : deallocs) {
+        OpBuilder after(dealloc);
+        after.setInsertionPointAfter(dealloc);
+        after.create<memref::DeallocOp>(dealloc.getLoc(), ring.getResult());
+      }
+    }
+    SmallVector<int64_t> core =
+        physToVirt.isEmpty()
+            ? SmallVector<int64_t>{0, 0}
+            : llvm::to_vector(llvm::drop_begin(
+                  consumerGrid.getVirtToPhysicalMap().compose({0, 0})));
+    std::string text = "a ring of " + std::to_string(depth) + " blocks of " +
+                       std::to_string(rows) + "x" + std::to_string(cols) +
+                       " tiles in the L1 of ";
+    if (consumerGrid.getGridVolume() == 1) {
+      text += "consumer core " + coreString(core);
+    } else {
+      text += "each of the " + std::to_string(consumerGrid.getGridVolume()) +
+              " consumer cores, from " + coreString(core);
+    }
+    placed.push_back(text);
+  }
+  buffer.replaceUsesWithIf(firstRing, [&](OpOperand &use) {
     return mlir::isa<SpatialOp, memref::DeallocOp>(use.getOwner());
   });
   // The old access views are now dead; erase them, then the buffer.
@@ -782,14 +942,6 @@ static std::optional<std::string> materializeRing(SpatialOp spatial,
   if (buffer.use_empty()) {
     alloc.erase();
   }
-  SmallVector<int64_t> core =
-      physToVirt.isEmpty() ? SmallVector<int64_t>{0, 0}
-                           : llvm::to_vector(llvm::drop_begin(
-                                 grid.getVirtToPhysicalMap().compose({0, 0})));
-  placed = "a ring of " + std::to_string(depth) + " blocks of " +
-           std::to_string(rows) + "x" + std::to_string(cols) +
-           " tiles in the L1 of consumer core " + coreString(core);
-  return std::nullopt;
 }
 
 class D2MMaterializeSpatialStreams
@@ -800,7 +952,6 @@ public:
       D2MMaterializeSpatialStreams>::D2MMaterializeSpatialStreamsBase;
 
   void runOnOperation() final {
-    MLIRContext *ctx = &getContext();
     SmallVector<SpatialOp> spatials;
     getOperation()->walk([&](SpatialOp spatial) {
       if (spatial.hasEdges()) {
@@ -808,69 +959,206 @@ public:
       }
     });
     for (SpatialOp spatial : spatials) {
-      SmallVector<SpatialEdgeAttr> edges =
-          llvm::to_vector(spatial.getEdgesAttr().getAsRange<SpatialEdgeAttr>());
-      // Edges that leave one output share one protocol (R11): they stream
-      // together or not at all.
-      llvm::MapVector<std::pair<unsigned, unsigned>, SmallVector<unsigned>>
-          groups;
-      for (auto [index, edge] : llvm::enumerate(edges)) {
-        if (edge.isStream()) {
-          groups[{edge.getProducerRegion(), edge.getProducerOutput()}]
-              .push_back(index);
-        }
-      }
-      bool changed = false;
-      for (auto &[source, members] : groups) {
-        std::string failure;
-        for (unsigned index : members) {
-          EdgeAnalysis analysis(spatial, edges[index]);
-          if (!analysis.run()) {
-            failure = "edge " + edgeName(edges[index]) +
-                      " stays a whole-tensor handoff: " + analysis.reason;
-            break;
-          }
-          spatial.emitRemark("edge " + edgeName(edges[index]) +
-                             " can stream: " + analysis.summary);
-          // Not lowered yet: these keep the whole-tensor handoff.
-          std::optional<std::string> missing;
-          std::string placed;
-          if (members.size() > 1) {
-            missing = "a streaming edge with fan-out";
-          } else {
-            missing = materializeRing(spatial, edges[index], analysis, placed);
-          }
-          if (missing) {
-            failure = "edge " + edgeName(edges[index]) +
-                      " stays a whole-tensor handoff: " + *missing +
-                      " is not lowered yet";
-            break;
-          }
-          spatial.emitRemark("edge " + edgeName(edges[index]) +
-                             " streams through " + placed);
-        }
-        if (failure.empty()) {
-          continue;
-        }
-        if (members.size() > 1) {
-          failure += " (so do the other edges that leave output " +
-                     std::to_string(source.second) + " of region " +
-                     std::to_string(source.first) + ")";
-        }
-        spatial.emitRemark(failure);
-        for (unsigned index : members) {
-          SpatialEdgeAttr edge = edges[index];
-          edges[index] = SpatialEdgeAttr::get(
-              ctx, edge.getProducerRegion(), edge.getProducerOutput(),
-              edge.getConsumerRegion(), edge.getConsumerArg());
-        }
-        changed = true;
-      }
-      if (changed) {
-        spatial.setEdgesAttr(
-            ArrayAttr::get(ctx, llvm::to_vector_of<Attribute>(edges)));
+      runOnSpatial(spatial);
+    }
+  }
+
+private:
+  void runOnSpatial(SpatialOp spatial) {
+    MLIRContext *ctx = &getContext();
+    SmallVector<SpatialEdgeAttr> edges =
+        llvm::to_vector(spatial.getEdgesAttr().getAsRange<SpatialEdgeAttr>());
+    // Edges that leave one output share one protocol (R11): they stream
+    // together or not at all.
+    llvm::MapVector<std::pair<unsigned, unsigned>, SmallVector<unsigned>>
+        sources;
+    for (auto [index, edge] : llvm::enumerate(edges)) {
+      if (edge.isStream()) {
+        sources[{edge.getProducerRegion(), edge.getProducerOutput()}].push_back(
+            index);
       }
     }
+    bool changed = false;
+    auto demote = [&](const StreamGroup &group, std::string why) {
+      if (group.members.size() > 1) {
+        why += " (so do the other edges that leave output " +
+               std::to_string(group.source.second) + " of region " +
+               std::to_string(group.source.first) + ")";
+      }
+      spatial.emitRemark(why);
+      for (unsigned index : group.members) {
+        SpatialEdgeAttr edge = edges[index];
+        edges[index] = SpatialEdgeAttr::get(
+            ctx, edge.getProducerRegion(), edge.getProducerOutput(),
+            edge.getConsumerRegion(), edge.getConsumerArg());
+      }
+      changed = true;
+    };
+
+    // 1. Which groups can stream, and which of those the lowering supports.
+    SmallVector<StreamGroup> candidates;
+    for (auto &[source, members] : sources) {
+      StreamGroup group;
+      group.source = source;
+      group.members = members;
+      std::string failure;
+      for (unsigned index : members) {
+        auto analysis = std::make_unique<EdgeAnalysis>(spatial, edges[index]);
+        if (!analysis->run()) {
+          failure = "edge " + edgeName(edges[index]) +
+                    " stays a whole-tensor handoff: " + analysis->reason;
+          break;
+        }
+        spatial.emitRemark("edge " + edgeName(edges[index]) +
+                           " can stream: " + analysis->summary);
+        group.analyses.push_back(std::move(analysis));
+      }
+      if (failure.empty()) {
+        if (std::optional<std::string> missing =
+                unsupported(spatial, edges, group)) {
+          failure = "edge " + edgeName(edges[members.front()]) +
+                    " stays a whole-tensor handoff: " + *missing +
+                    " is not lowered yet";
+        }
+      }
+      if (!failure.empty()) {
+        demote(group, failure);
+        continue;
+      }
+      candidates.push_back(std::move(group));
+    }
+
+    // 2. Drop groups that could deadlock (see removeDeadlocks).
+    removeDeadlocks(spatial, edges, candidates, demote);
+
+    // 3. Build the rings.
+    for (const StreamGroup &group : candidates) {
+      SmallVector<std::string> placed;
+      materializeRings(spatial, edges, group, placed);
+      for (auto [k, index] : llvm::enumerate(group.members)) {
+        spatial.emitRemark("edge " + edgeName(edges[index]) +
+                           " streams through " + placed[k]);
+      }
+    }
+    if (changed) {
+      spatial.setEdgesAttr(
+          ArrayAttr::get(ctx, llvm::to_vector_of<Attribute>(edges)));
+    }
+  }
+
+  // Keeps the streaming groups whose rings cannot deadlock and demotes the
+  // others (sufficient conditions, design.md section 2.6):
+  //  - the streaming edges, taken undirected over the regions, form a forest:
+  //    each producer waits only for its own consumers, so a tree of bounded
+  //    rings always drains;
+  //  - no whole-tensor edge joins two regions of one streaming tree (the
+  //    consumer would wait for the producer's end, which waits for the tree
+  //    to drain through that consumer), and whole-tensor edges between trees
+  //    form a DAG.
+  // Groups are taken in order; one that would break a condition is demoted.
+  template <typename Demote>
+  void removeDeadlocks(SpatialOp spatial, ArrayRef<SpatialEdgeAttr> edges,
+                       SmallVector<StreamGroup> &candidates, Demote demote) {
+    unsigned numRegions = spatial.getNumRegions();
+    // Union-find over regions: the streaming trees of a set of groups.
+    std::function<unsigned(SmallVector<unsigned> &, unsigned)> find =
+        [&](SmallVector<unsigned> &parent, unsigned r) {
+          return parent[r] == r ? r : parent[r] = find(parent, parent[r]);
+        };
+    auto trees = [&](ArrayRef<const StreamGroup *> groups) {
+      SmallVector<unsigned> parent(numRegions);
+      std::iota(parent.begin(), parent.end(), 0u);
+      for (const StreamGroup *g : groups) {
+        for (unsigned index : g->members) {
+          parent[find(parent, edges[index].getConsumerRegion())] =
+              find(parent, g->source.first);
+        }
+      }
+      return parent;
+    };
+    SmallVector<StreamGroup> kept;
+    for (StreamGroup &group : candidates) {
+      SmallVector<const StreamGroup *> trial;
+      for (const StreamGroup &k : kept) {
+        trial.push_back(&k);
+      }
+      SmallVector<unsigned> parent = trees(trial);
+      // Forest: adding the group must not close a loop.
+      bool loop = false;
+      llvm::SmallDenseSet<unsigned> seen = {find(parent, group.source.first)};
+      for (unsigned index : group.members) {
+        if (!seen.insert(find(parent, edges[index].getConsumerRegion()))
+                 .second) {
+          loop = true;
+        }
+      }
+      if (loop) {
+        demote(group, "edge " + edgeName(edges[group.members.front()]) +
+                          " stays a whole-tensor handoff: with the streaming "
+                          "edges before it, it would close a loop of "
+                          "streaming edges between regions, which could "
+                          "deadlock");
+        continue;
+      }
+      // Whole-tensor edges: none inside a tree, and a DAG between trees.
+      trial.push_back(&group);
+      SmallVector<unsigned> withGroup = trees(trial);
+      llvm::DenseSet<unsigned> streamIndices;
+      for (const StreamGroup *g : trial) {
+        streamIndices.insert(g->members.begin(), g->members.end());
+      }
+      SmallVector<SmallVector<unsigned>> succ(numRegions);
+      SmallVector<unsigned> inDegree(numRegions, 0);
+      bool inside = false;
+      for (auto [index, edge] : llvm::enumerate(edges)) {
+        if (streamIndices.contains(index)) {
+          continue;
+        }
+        unsigned from = find(withGroup, edge.getProducerRegion());
+        unsigned to = find(withGroup, edge.getConsumerRegion());
+        if (from == to) {
+          inside = true;
+          break;
+        }
+        succ[from].push_back(to);
+        ++inDegree[to];
+      }
+      bool cyclic = false;
+      if (!inside) {
+        SmallVector<unsigned> ready;
+        unsigned roots = 0, visited = 0;
+        for (unsigned r = 0; r < numRegions; ++r) {
+          if (find(withGroup, r) == r) {
+            ++roots;
+            if (inDegree[r] == 0) {
+              ready.push_back(r);
+            }
+          }
+        }
+        while (!ready.empty()) {
+          unsigned r = ready.pop_back_val();
+          ++visited;
+          for (unsigned s : succ[r]) {
+            if (--inDegree[s] == 0) {
+              ready.push_back(s);
+            }
+          }
+        }
+        cyclic = visited != roots;
+      }
+      if (inside || cyclic) {
+        demote(group,
+               "edge " + edgeName(edges[group.members.front()]) +
+                   " stays a whole-tensor handoff: with the streaming edges "
+                   "before it, a whole-tensor edge would " +
+                   (inside ? "join two regions of one streaming tree"
+                           : "close a loop between streaming trees") +
+                   ", which could deadlock");
+        continue;
+      }
+      kept.push_back(std::move(group));
+    }
+    candidates = std::move(kept);
   }
 };
 

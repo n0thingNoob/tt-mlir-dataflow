@@ -56,8 +56,16 @@ def D2MSpatialPlanning : Pass<"d2m-spatial-planning", "::mlir::ModuleOp"> {
     per input of a grouped generic: the edge that input becomes gets
     `stream<depth = depth>` (d2m-materialize-spatial-groups reads the
     `d2m.spatial_streams` attribute this sets). Load copies keep the index of
-    the input they replace. `stream-block` (R, C) adds `block = RxC` to all of
-    them.
+    the input they replace, and a load whose copies stream iterates its
+    blocks in the order its consumers read them (its outer loop is the copy
+    dim the consumer's loops vary slowest). `stream-block` (R, C) adds
+    `block = RxC` to all of them.
+
+    `stream-policy=auto` asks for every edge of every group to stream with
+    depth 2 (and `stream-block`), except the inputs `streams` names; the
+    edges that cannot stream fall back to a whole-tensor handoff in
+    d2m-materialize-spatial-streams, with a remark. The default, none, streams
+    only what `streams` names.
   }];
   let options = [
     Option<"policy", "policy", "std::string", /*default=*/"\"none\"",
@@ -73,7 +81,9 @@ def D2MSpatialPlanning : Pass<"d2m-spatial-planning", "::mlir::ModuleOp"> {
     ListOption<"streams", "streams", "int64_t",
                "Streaming edges given by hand: (generic, operand, depth) per input of a grouped generic, generic indices as in groups.">,
     ListOption<"streamBlock", "stream-block", "int64_t",
-               "Block (R, C tiles per core) for every edge in streams; empty leaves it to d2m-reblock-generics.">,
+               "Block (R, C tiles per core) for every streaming edge; empty leaves it to d2m-reblock-generics.">,
+    Option<"streamPolicy", "stream-policy", "std::string", /*default=*/"\"none\"",
+           "Streaming policy: none (only the edges streams names) or auto (every edge; the ones that cannot stream fall back).">,
     Option<"maxCbs", "max-cbs", "int64_t", /*default=*/"32",
            "CBs available per core.">,
     Option<"maxSemaphores", "max-semaphores", "int64_t", /*default=*/"16",
@@ -723,6 +733,13 @@ def D2MReblockGenerics : Pass<"d2m-reblock-generics", "::mlir::ModuleOp"> {
     This pass uses
     BlockFactorAnalysis to select block factors for affine blocked d2m.generic
     ops, then rebuilds those generics with the selected factors.
+
+    In a d2m.spatial, a streaming edge with `block = RxC` sets the factors of
+    the loop dims that index the edge at either end to (shard extent / block
+    extent), so both ends move blocks of R x C tiles per core. A
+    data-movement generic (such as a load region) that produces a streaming
+    edge without `block` takes its consumer's blocks instead. Generics with
+    several outputs (only data-movement ones) get one return view per output.
   }];
   let dependentDialects = [
     "::mlir::tt::d2m::D2MDialect",
@@ -1520,12 +1537,23 @@ def D2MMaterializeSpatialStreams : Pass<"d2m-materialize-spatial-streams", "::ml
     the whole-tensor handoff: its `stream` fields are dropped. A remark says
     why, or, for an edge that can stream, its blocks.
 
-    An edge that can stream and is supported so far (one producer core, one
-    consumer core, no reduction loop around the producer's write, no fan-out)
-    gets its ring: the edge buffer is replaced by a `memref.alloc` of `depth`
-    blocks with the consumer's virtual grid mapping and `d2m.stream_ring`, so
-    d2m-allocate places it in the consumer's L1, and both accesses read and
-    write views of it whose block coordinates select slot (ordinal mod depth).
+    An edge that can stream and is supported so far gets its ring. Supported:
+    producer core k feeds consumer core k (equal grids, whose virtual grids
+    are shifted copies of their cores); the producer may write the edge
+    inside a reduction loop, and one output may feed several consumer regions
+    (fan-out). Every consumer region gets a `memref.alloc` of `depth` blocks
+    per core with its virtual grid mapping and `d2m.stream_ring` (naming the
+    edge), so d2m-allocate places it in that region's L1. The producer's
+    access becomes a view of the first ring, each consumer's a view of its
+    own, in which a block coordinate selects the core (coordinate / blocks per
+    core) and the slot (ordinal on that core mod depth).
+
+    Before building rings it drops groups that could deadlock, keeping these
+    sufficient conditions: the streaming edges, undirected over the regions,
+    form a forest, no whole-tensor edge joins two regions of one streaming
+    tree, and the whole-tensor edges between trees form a DAG. Groups are taken
+    in order and one that would break a condition keeps the whole-tensor
+    handoff, with a remark.
     The producer then writes into the consumer's L1. Other edges that can
     stream keep the whole-tensor handoff for now, with a remark.
     d2m-lower-spatial-edges adds the per-block synchronization.
@@ -1560,8 +1588,15 @@ def D2MLowerSpatialEdges : Pass<"d2m-lower-spatial-edges", "::mlir::ModuleOp"> {
     the consumer's count; the consumer's reading thread waits until n + 1
     blocks were written, reads, waits for the read and increments the
     producer's count. The producer finally waits until all blocks were read.
-    The waits are `semaphore_wait ... min`. A streaming edge without a ring
-    gets the whole-tensor handoff and a remark.
+    The waits are `semaphore_wait ... min`. Between multi-core regions, core k
+    signals core k of the other region (its core index plus the constant
+    offset between the two grids). A producer that writes the edge inside a
+    reduction loop writes the ring and signals only in the last iteration of
+    those loops; the other iterations yield a null transaction. With fan-out
+    to K consumer regions, the producer writes every block into each
+    region's ring (copies of its write, moved to that region's cores), waits
+    for K credits per block and signals every region. A streaming edge
+    without a ring gets the whole-tensor handoff and a remark.
 
     Lowered edges are removed from `edges`; the attribute is dropped once
     empty. With `ttnn-mode` the pass does nothing (the TTNN lowering does not

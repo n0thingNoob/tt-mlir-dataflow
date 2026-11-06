@@ -199,6 +199,13 @@ public:
     return operand;
   }
 
+  // True for a view of a streaming spatial edge's ring
+  // (d2m-materialize-spatial-streams).
+  static bool isStreamRing(Value value) {
+    Operation *root = d2m::SpatialOp::stripViews(value).getDefiningOp();
+    return root && root->hasAttr(d2m::utils::kStreamRingAttr);
+  }
+
   LogicalResult
   matchAndRewrite(d2m::GenericOp op, d2m::GenericOpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const final {
@@ -226,6 +233,12 @@ public:
       } else if (mlir::isa<ttmetal::LocalSemaphoreType>(operand.getType())) {
         argMapping[operandIndex] = args.size();
         args.push_back(operand);
+      } else if (mlir::isa<MemRefType>(operand.getType()) &&
+                 isStreamRing(op.getOperands()[operandIndex])) {
+        // The ring of a streaming spatial edge that the producer writes
+        // besides its output: passed by address, like the inputs and outputs.
+        argMapping[operandIndex] = args.size();
+        args.push_back(getUnderlyingMemref(operand));
       } else if (auto memrefType =
                      mlir::dyn_cast_if_present<MemRefType>(operand.getType());
                  memrefType) {
