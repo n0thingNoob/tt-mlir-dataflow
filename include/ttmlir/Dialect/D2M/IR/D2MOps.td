@@ -518,6 +518,15 @@ def D2M_SpatialOp: D2M_Op<"spatial",
       // bufferized, the buffer after).
       ::mlir::Value getEdgeSource(SpatialEdgeAttr edge);
 
+      // The buffer `edge` lives in, after bufferization: getEdgeSource with
+      // any d2m.view_layout chain stripped. d2m-reblock-generics rebuilds a
+      // generic on views of its operands, so the producer may write, and the
+      // consumer read, the edge buffer through a view of it.
+      ::mlir::Value getEdgeBuffer(SpatialEdgeAttr edge);
+
+      // `value` with any chain of d2m.view_layout ops stripped.
+      static ::mlir::Value stripViews(::mlir::Value value);
+
       // Emit "edges are not yet supported by <passName>" on every spatial with
       // edges under `root` (inclusive); fails if there is one. Used by passes
       // that would otherwise lower an edge without synchronization.

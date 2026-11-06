@@ -8,6 +8,7 @@
 #include "ttmlir/Dialect/D2M/IR/D2MOps.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Builders.h"
 #include "llvm/ADT/MapVector.h"
@@ -82,6 +83,51 @@ struct EdgeConsumer {
   bool multicast;
 };
 
+// True when the transaction `tx` of a DMA write is waited on in its thread.
+// Besides a direct d2m.dma_wait this accepts the software-pipelined form a
+// blocked matmul uses: the transaction is yielded out of an scf.for, waited
+// at the start of the next iteration (on the iteration argument) and once
+// more after the loop (on the loop result).
+static bool isWaited(Value tx) {
+  bool direct = llvm::any_of(
+      tx.getUsers(), [](Operation *user) { return isa<DMAWaitOp>(user); });
+  if (direct) {
+    return true;
+  }
+  for (OpOperand &use : tx.getUses()) {
+    auto yield = mlir::dyn_cast<scf::YieldOp>(use.getOwner());
+    auto loop =
+        yield ? mlir::dyn_cast<scf::ForOp>(yield->getParentOp()) : nullptr;
+    if (!loop) {
+      continue;
+    }
+    unsigned i = use.getOperandNumber();
+    if (isWaited(loop.getRegionIterArgs()[i]) && isWaited(loop.getResult(i))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// True when a write barrier follows `write` in its thread: a d2m.dma_wait on
+// a write transaction in the thread's top-level block, after the op that
+// holds the write. A write dma_wait lowers to noc_async_write_barrier, which
+// waits for every write the thread issued before it. This covers transactions
+// carried out of nested loops and scf.if (a reblocked generic) that isWaited
+// does not follow.
+static bool isFollowedByWriteBarrier(DMAWriteOp write, Region &thread) {
+  Operation *top = thread.front().findAncestorOpInBlock(*write);
+  for (Operation *op = top ? top->getNextNode() : nullptr; op;
+       op = op->getNextNode()) {
+    auto wait = mlir::dyn_cast<DMAWaitOp>(op);
+    if (wait && mlir::cast<MemTxType>(wait.getMemTx().getType()).getDmaType() ==
+                    DMAType::Write) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // Lower the edges that leave one producer output (one per consumer region)
 // with a single semaphore: the producer bumps every consumer core once per
 // writing thread, and every consumer waits for all of those signals.
@@ -92,7 +138,12 @@ static LogicalResult lowerEdgeGroup(SpatialOp spatial,
     return *spatial.getRegion(region).getOps<GenericOp>().begin();
   };
   GenericOp producer = getGeneric(edges.front().getProducerRegion());
-  Value edgeBuffer = spatial.getEdgeSource(edges.front());
+  // Either end may access the edge buffer through a view of it (a reblocked
+  // generic), so DMA operands are compared with their views stripped.
+  Value edgeBuffer = spatial.getEdgeBuffer(edges.front());
+  auto isEdgeBuffer = [&](Value value) {
+    return SpatialOp::stripViews(value) == edgeBuffer;
+  };
   auto missingAccess = [&](SpatialEdgeAttr edge) {
     return spatial.emitOpError("edge ")
            << edge
@@ -103,7 +154,7 @@ static LogicalResult lowerEdgeGroup(SpatialOp spatial,
   SmallVector<Region *> writers =
       getDatamovementRegions(producer, [&](Operation *op) {
         auto write = mlir::dyn_cast<DMAWriteOp>(op);
-        return write && write.getDst() == edgeBuffer;
+        return write && isEdgeBuffer(write.getDst());
       });
   if (writers.empty()) {
     return missingAccess(edges.front());
@@ -112,9 +163,8 @@ static LogicalResult lowerEdgeGroup(SpatialOp spatial,
   // transaction has to be waited on inside its thread.
   for (Region *region : writers) {
     WalkResult result = region->walk([&](DMAWriteOp write) {
-      if (write.getDst() == edgeBuffer &&
-          llvm::none_of(write->getUsers(),
-                        [](Operation *user) { return isa<DMAWaitOp>(user); })) {
+      if (isEdgeBuffer(write.getDst()) && !isWaited(write->getResult(0)) &&
+          !isFollowedByWriteBarrier(write, *region)) {
         return WalkResult::interrupt();
       }
       return WalkResult::advance();
@@ -135,7 +185,7 @@ static LogicalResult lowerEdgeGroup(SpatialOp spatial,
     EdgeConsumer &consumer = consumers.emplace_back();
     consumer.readers = getDatamovementRegions(generic, [&](Operation *op) {
       auto read = mlir::dyn_cast<DMAReadOp>(op);
-      return read && read.getSrc() == edgeBuffer;
+      return read && isEdgeBuffer(read.getSrc());
     });
     if (consumer.readers.empty()) {
       return missingAccess(edge);
