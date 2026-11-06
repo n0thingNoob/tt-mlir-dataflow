@@ -93,6 +93,85 @@ void ThreadAttr::print(::mlir::AsmPrinter &printer) const {
   printer << ">";
 }
 
+mlir::Attribute SpatialEdgeAttr::parse(::mlir::AsmParser &parser,
+                                       ::mlir::Type) {
+  unsigned producerRegion, producerOutput, consumerRegion, consumerArg;
+  if (parser.parseLess() || parser.parseInteger(producerRegion) ||
+      parser.parseColon() || parser.parseInteger(producerOutput) ||
+      parser.parseArrow() || parser.parseInteger(consumerRegion) ||
+      parser.parseColon() || parser.parseInteger(consumerArg)) {
+    return {};
+  }
+
+  // Optional `, stream<depth = D (, block = RxC)?>`.
+  unsigned streamDepth = 0;
+  SmallVector<int64_t> streamBlock;
+  if (parser.parseOptionalComma().succeeded()) {
+    if (parser.parseKeyword("stream") || parser.parseLess() ||
+        parser.parseKeyword("depth") || parser.parseEqual() ||
+        parser.parseInteger(streamDepth)) {
+      return {};
+    }
+    // Depth 0 is the whole-tensor handoff, which is written without `stream`.
+    if (streamDepth == 0) {
+      parser.emitError(parser.getCurrentLocation(),
+                       "stream depth must be in [1, ")
+          << SpatialEdgeAttr::kMaxStreamDepth << "], got 0";
+      return {};
+    }
+    if (parser.parseOptionalComma().succeeded()) {
+      if (parser.parseKeyword("block") || parser.parseEqual() ||
+          parser.parseDimensionList(streamBlock, /*allowDynamic=*/false,
+                                    /*withTrailingX=*/false)) {
+        return {};
+      }
+    }
+    if (parser.parseGreater()) {
+      return {};
+    }
+  }
+
+  if (parser.parseGreater()) {
+    return {};
+  }
+  return parser.getChecked<SpatialEdgeAttr>(
+      parser.getContext(), producerRegion, producerOutput, consumerRegion,
+      consumerArg, streamDepth, streamBlock);
+}
+
+void SpatialEdgeAttr::print(::mlir::AsmPrinter &printer) const {
+  printer << "<" << getProducerRegion() << ":" << getProducerOutput() << " -> "
+          << getConsumerRegion() << ":" << getConsumerArg();
+  if (isStream()) {
+    printer << ", stream<depth = " << getStreamDepth();
+    if (!getStreamBlock().empty()) {
+      printer << ", block = ";
+      llvm::interleave(getStreamBlock(), printer, "x");
+    }
+    printer << ">";
+  }
+  printer << ">";
+}
+
+::mlir::LogicalResult SpatialEdgeAttr::verify(
+    ::llvm::function_ref<::mlir::InFlightDiagnostic()> emitError, unsigned,
+    unsigned, unsigned, unsigned, unsigned streamDepth,
+    ::llvm::ArrayRef<int64_t> streamBlock) {
+  if (streamDepth > kMaxStreamDepth) {
+    return emitError() << "stream depth must be in [1, " << kMaxStreamDepth
+                       << "], got " << streamDepth;
+  }
+  if (streamDepth == 0 && !streamBlock.empty()) {
+    return emitError() << "a stream block needs a stream depth";
+  }
+  if (!streamBlock.empty() &&
+      (streamBlock.size() != 2 ||
+       llvm::any_of(streamBlock, [](int64_t d) { return d <= 0; }))) {
+    return emitError() << "stream block must be RxC tiles with R, C > 0";
+  }
+  return ::mlir::success();
+}
+
 #include "ttmlir/Dialect/D2M/IR/D2MOpsDialect.cpp.inc"
 
 struct D2MDialectFoldInterface : public DialectFoldInterface {

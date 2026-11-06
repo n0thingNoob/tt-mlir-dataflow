@@ -1877,6 +1877,17 @@ void GetBlockFactorOp::inferResultRanges(
                  getIndexRange(0, std::numeric_limits<uint32_t>::max()));
 }
 //===----------------------------------------------------------------------===//
+// SemaphoreWaitOp
+//===----------------------------------------------------------------------===//
+
+::mlir::LogicalResult SemaphoreWaitOp::verify() {
+  if (getMin() && getResetValue()) {
+    return emitOpError("a min wait cannot reset the semaphore");
+  }
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // CoreIndexOp
 //===----------------------------------------------------------------------===//
 

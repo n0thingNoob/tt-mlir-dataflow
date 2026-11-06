@@ -234,6 +234,55 @@ LogicalResult D2MMaterializeSpatialGroupsPass::materialize(Group &group,
     }
   }
 
+  // Streaming requests (d2m.spatial_streams, set by d2m-spatial-planning):
+  // per member, the stream fields of each incoming edge, keyed by (producer,
+  // result). Every named input must become an edge, and inputs that share an
+  // edge must ask for the same stream.
+  struct StreamRequest {
+    unsigned depth;
+    SmallVector<int64_t, 2> block;
+  };
+  SmallVector<llvm::DenseMap<std::pair<unsigned, unsigned>, StreamRequest>>
+      streamOf(group.members.size());
+  for (auto [c, generic] : llvm::enumerate(group.members)) {
+    auto requests =
+        generic->getAttrOfType<DenseI64ArrayAttr>(kSpatialStreamsAttr);
+    if (!requests) {
+      continue;
+    }
+    ArrayRef<int64_t> list = requests.asArrayRef();
+    if (list.size() % 4 != 0) {
+      return generic.emitOpError(kSpatialStreamsAttr)
+             << " takes (operand, depth, rows, cols) entries";
+    }
+    for (size_t i = 0; i < list.size(); i += 4) {
+      StreamRequest request{static_cast<unsigned>(list[i + 1]), {}};
+      if (list[i + 2] != 0 || list[i + 3] != 0) {
+        request.block = {list[i + 2], list[i + 3]};
+      }
+      bool found = false;
+      for (EdgeUse &use : edgeUses[c]) {
+        if (use.operandIndex != list[i]) {
+          continue;
+        }
+        found = true;
+        auto key = std::make_pair(use.producer, use.producerResult);
+        auto [it, inserted] = streamOf[c].try_emplace(key, request);
+        if (!inserted && (it->second.depth != request.depth ||
+                          it->second.block != request.block)) {
+          return generic.emitOpError("inputs that read the same edge ask for "
+                                     "different streams");
+        }
+      }
+      if (!found) {
+        return generic.emitOpError(kSpatialStreamsAttr)
+               << " names input " << list[i]
+               << ", which does not read another member of spatial group "
+               << group.id;
+      }
+    }
+  }
+
   MLIRContext *ctx = &getContext();
   OpBuilder builder(ctx);
   // Values whose defining chain may become dead once the members stop using
@@ -351,9 +400,15 @@ LogicalResult D2MMaterializeSpatialGroupsPass::materialize(Group &group,
       auto [it, inserted] = args.try_emplace(key, nullptr);
       if (inserted) {
         it->second = body->addArgument(edgeType, generic.getLoc());
-        edges.push_back(SpatialEdgeAttr::get(ctx, use.producer,
-                                             use.producerResult, c,
-                                             it->second.getArgNumber()));
+        auto stream = streamOf[c].find(key);
+        edges.push_back(
+            stream == streamOf[c].end()
+                ? SpatialEdgeAttr::get(ctx, use.producer, use.producerResult, c,
+                                       it->second.getArgNumber())
+                : SpatialEdgeAttr::get(ctx, use.producer, use.producerResult, c,
+                                       it->second.getArgNumber(),
+                                       stream->second.depth,
+                                       stream->second.block));
       }
       if (use.compositeInput >= 0) {
         auto composite = operand.get().getDefiningOp<CompositeViewOp>();
@@ -400,6 +455,7 @@ LogicalResult D2MMaterializeSpatialGroupsPass::materialize(Group &group,
     }
     generic->removeAttr(kSpatialGroupAttr);
     generic->removeAttr(kSpatialRangeAttr);
+    generic->removeAttr(kSpatialStreamsAttr);
   }
 
   // Erase what the fold left dead, then move every op before the spatial

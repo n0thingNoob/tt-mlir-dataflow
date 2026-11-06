@@ -54,6 +54,15 @@ struct D2MPipelineOptions : public PassPipelineOptions<D2MPipelineOptions> {
       llvm::cl::desc("Load regions given by hand: (generic, operand, y0, x0, "
                      "y1, x1) per DRAM input of a generic in spatial-groups; "
                      "inputs on the same cores share one load generic.")};
+  ListOption<int64_t> spatialStreams{
+      *this, "spatial-streams",
+      llvm::cl::desc("Streaming spatial edges given by hand: (generic, "
+                     "operand, depth) per input of a generic in "
+                     "spatial-groups whose edge should stream.")};
+  ListOption<int64_t> spatialStreamBlock{
+      *this, "spatial-stream-block",
+      llvm::cl::desc("Block (R, C tiles per core) for every edge in "
+                     "spatial-streams.")};
 
   ListOption<int64_t> spatialSkipGenerics{
       *this, "spatial-skip-generics",

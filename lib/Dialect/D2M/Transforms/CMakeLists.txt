@@ -39,6 +39,7 @@ add_mlir_dialect_library(MLIRD2MTransforms
         SplitUnifiedThread.cpp
         SpatialPlanning.cpp
         MaterializeSpatialGroups.cpp
+        MaterializeSpatialStreams.cpp
         PreallocateMcastSemaphores.cpp
         ScheduleDMA.cpp
         LowerDMAToFullyIndexedForm.cpp

@@ -130,6 +130,8 @@ void createD2MFrontendPipeline(OpPassManager &pm,
       planningOptions.policy = options.spatialPolicy;
       planningOptions.groups = llvm::to_vector(options.spatialGroups);
       planningOptions.loads = llvm::to_vector(options.spatialLoads);
+      planningOptions.streams = llvm::to_vector(options.spatialStreams);
+      planningOptions.streamBlock = llvm::to_vector(options.spatialStreamBlock);
       planningOptions.excludeCores = excludeCores;
       planningOptions.skipGenerics =
           llvm::to_vector(options.spatialSkipGenerics);
@@ -186,6 +188,8 @@ void createD2MFrontendPipeline(OpPassManager &pm,
   }
   pm.addPass(d2m::createD2MReblockGenerics(reblockGenericsOptions));
   pm.addPass(d2m::createD2MMaterializeViewReturns());
+  // Block factors are final here: decide which streaming edges can stream.
+  pm.addPass(d2m::createD2MMaterializeSpatialStreams());
 
   // Run right before allocate to mark synchronized buffers
   d2m::D2MMarkSynchronizedBuffersOptions markSyncBuffersOptions;

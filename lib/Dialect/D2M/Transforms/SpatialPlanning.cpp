@@ -225,13 +225,14 @@ public:
         nextGenericIndex += dag.size();
       }
     }
-    // Load regions go in last, so the generic indices they name are the same
-    // as in `groups` and `skip-generics`.
-    if (failed(insertGivenLoads(module))) {
+    // Streams and load regions go in last, so the generic indices they name
+    // are the same as in `groups` and `skip-generics`. Streams first: a load
+    // adds a generic but keeps the operand index of the input it replaces.
+    if (failed(applyGivenStreams(module)) || failed(insertGivenLoads(module))) {
       signalPassFailure();
       return;
     }
-    if (!greedy && !given && loads.empty()) {
+    if (!greedy && !given && loads.empty() && streams.empty()) {
       markAllAnalysesPreserved();
     }
   }
@@ -239,6 +240,7 @@ public:
 private:
   LogicalResult applyGivenGroups(ModuleOp module, bool &applied);
   LogicalResult insertGivenLoads(ModuleOp module);
+  LogicalResult applyGivenStreams(ModuleOp module);
   std::optional<NodeCost>
   costOf(GenericOp generic, const GridAnalysis &gridAnalysis, std::string &why);
   std::string tryAdd(Group &group, unsigned node, const GenericDAG &dag,
@@ -599,6 +601,76 @@ LogicalResult D2MSpatialPlanningPass::applyGivenGroups(ModuleOp module,
            << " generics";
   }
   applied = true;
+  return success();
+}
+
+// Records on each generic `streams` names which inputs should stream:
+// (generic, operand, depth) per input, plus the `stream-block` shape.
+LogicalResult D2MSpatialPlanningPass::applyGivenStreams(ModuleOp module) {
+  if (streams.empty()) {
+    if (!streamBlock.empty()) {
+      return module.emitError("stream-block needs streams");
+    }
+    return success();
+  }
+  if (streams.size() % 3 != 0) {
+    return module.emitError("streams takes (generic, operand, depth) per "
+                            "input, got ")
+           << streams.size() << " values";
+  }
+  if (!streamBlock.empty() &&
+      (streamBlock.size() != 2 || streamBlock[0] <= 0 || streamBlock[1] <= 0)) {
+    return module.emitError("stream-block takes two positive values (R, C)");
+  }
+  int64_t rows = streamBlock.empty() ? 0 : streamBlock[0];
+  int64_t cols = streamBlock.empty() ? 0 : streamBlock[1];
+  SmallVector<GenericOp> generics;
+  for (func::FuncOp func : module.getOps<func::FuncOp>()) {
+    for (Block &block : func.getBody()) {
+      for (const GenericDAGNode &node : buildGenericDAG(block)) {
+        generics.push_back(node.generic);
+      }
+    }
+  }
+  llvm::MapVector<Operation *, SmallVector<int64_t>> entries;
+  for (size_t i = 0; i < streams.size(); i += 3) {
+    int64_t index = streams[i], operand = streams[i + 1];
+    int64_t depth = streams[i + 2];
+    if (index < 0 || index >= static_cast<int64_t>(generics.size())) {
+      return module.emitError("streams names generic #")
+             << index << ", but the module has only " << generics.size()
+             << " generics";
+    }
+    GenericOp generic = generics[index];
+    if (!generic->hasAttr(kSpatialGroupAttr)) {
+      return generic.emitOpError("streams names generic #")
+             << index << ", which is not in a spatial group";
+    }
+    if (operand < 0 ||
+        operand >= static_cast<int64_t>(generic.getInputs().size())) {
+      return generic.emitOpError("streams names input ")
+             << operand << " of generic #" << index << ", which has "
+             << generic.getInputs().size() << " inputs";
+    }
+    if (depth < 1 || depth > SpatialEdgeAttr::kMaxStreamDepth) {
+      return generic.emitOpError("streams asks for depth ")
+             << depth << " on input " << operand << " of generic #" << index
+             << "; it must be in [1, " << SpatialEdgeAttr::kMaxStreamDepth
+             << "]";
+    }
+    SmallVector<int64_t> &list = entries[generic];
+    for (size_t j = 0; j < list.size(); j += 4) {
+      if (list[j] == operand) {
+        return generic.emitOpError("streams names input ")
+               << operand << " of generic #" << index << " twice";
+      }
+    }
+    list.append({operand, depth, rows, cols});
+  }
+  for (auto &[generic, list] : entries) {
+    generic->setAttr(kSpatialStreamsAttr,
+                     DenseI64ArrayAttr::get(&getContext(), list));
+  }
   return success();
 }
 

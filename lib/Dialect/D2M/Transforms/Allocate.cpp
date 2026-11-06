@@ -124,7 +124,11 @@ struct LivenessClosure {
   LiveRange live;
 };
 
-using LivenessClosureGraph = llvm::DenseMap<Operation *, LivenessClosure>;
+// Insertion-ordered (IR postorder): iterating it creates `analysis.memrefs`
+// entries, whose order becomes planner variable order and thus decides
+// address ties and dealloc order. A pointer-keyed DenseMap would make that
+// run-dependent.
+using LivenessClosureGraph = llvm::MapVector<Operation *, LivenessClosure>;
 
 template <typename T>
 using SpaceSpecific = std::array<T, ordinal(PlannerSpace::end)>;

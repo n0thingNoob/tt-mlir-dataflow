@@ -3997,6 +3997,13 @@ public:
         op.getLoc(), ttkernel::L1AddrPtrType::get(rewriter.getContext(), 32),
         semaphoreAddr);
 
+    if (op.getMin()) {
+      Value value = rewriter.create<arith::IndexCastOp>(
+          op.getLoc(), rewriter.getI32Type(), op.getValue());
+      rewriter.replaceOpWithNewOp<ttkernel::SemaphoreWaitMinOp>(
+          op, semaphorePtr, value);
+      return success();
+    }
     rewriter.replaceOpWithNewOp<ttkernel::SemaphoreWaitOp>(op, semaphorePtr,
                                                            op.getValue());
     if (op.getResetValue()) {

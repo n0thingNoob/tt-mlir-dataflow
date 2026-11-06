@@ -51,6 +51,13 @@ def D2MSpatialPlanning : Pass<"d2m-spatial-planning", "::mlir::ModuleOp"> {
     input into L1 on cores (y0, x0)-(y1, x1), in the consumer's group, and the
     consumer reads that copy (a spatial edge). Inputs given the same cores are
     copied by one generic.
+
+    `streams` asks for streaming edges by hand, one (generic, operand, depth)
+    per input of a grouped generic: the edge that input becomes gets
+    `stream<depth = depth>` (d2m-materialize-spatial-groups reads the
+    `d2m.spatial_streams` attribute this sets). Load copies keep the index of
+    the input they replace. `stream-block` (R, C) adds `block = RxC` to all of
+    them.
   }];
   let options = [
     Option<"policy", "policy", "std::string", /*default=*/"\"none\"",
@@ -63,6 +70,10 @@ def D2MSpatialPlanning : Pass<"d2m-spatial-planning", "::mlir::ModuleOp"> {
                "Groups given by hand: (group, generic, y0, x0, y1, x1) per generic, generic indices as in skip-generics. Applied with any policy.">,
     ListOption<"loads", "loads", "int64_t",
                "Load regions given by hand: (generic, operand, y0, x0, y1, x1) per DRAM input of a grouped generic, generic indices as in groups.">,
+    ListOption<"streams", "streams", "int64_t",
+               "Streaming edges given by hand: (generic, operand, depth) per input of a grouped generic, generic indices as in groups.">,
+    ListOption<"streamBlock", "stream-block", "int64_t",
+               "Block (R, C tiles per core) for every edge in streams; empty leaves it to d2m-reblock-generics.">,
     Option<"maxCbs", "max-cbs", "int64_t", /*default=*/"32",
            "CBs available per core.">,
     Option<"maxSemaphores", "max-semaphores", "int64_t", /*default=*/"16",
@@ -106,6 +117,9 @@ def D2MMaterializeSpatialGroups : Pass<"d2m-materialize-spatial-groups", "::mlir
       or shard change) is an error.
     - Every member output becomes a fresh `d2m.empty` (spatial `outs`), so
       edge buffers have the form `d2m-lower-spatial-edges` expects.
+    - A member with `d2m.spatial_streams` (set by d2m-spatial-planning's
+      `streams`) gets `stream<...>` on the edges of the inputs it names. A
+      named input that is not an edge is an error; the attribute is removed.
     - An input `d2m.to_layout` that also feeds another generic is copied, one
       per member (GridSelection's `recordGenericConsumer` resizes a
       `to_layout` for exactly one consumer).
@@ -1480,6 +1494,45 @@ def D2MHoistCBAllocs : Pass<"d2m-hoist-cb-allocs", "::mlir::ModuleOp"> {
   ];
 }
 
+def D2MMaterializeSpatialStreams : Pass<"d2m-materialize-spatial-streams", "::mlir::ModuleOp"> {
+  let summary = "Check which d2m.spatial edges can stream.";
+  let description = [{
+    For every edge with `stream<...>`, decides from the IR whether the
+    producer and consumer agree on a block order. Runs on affine blocked
+    generics after d2m-reblock-generics (block factors are final) and before
+    d2m-allocate.
+
+    Per (producer core, consumer core) pair it enumerates, with the blocking
+    loops' constant bounds and the generics' block factors:
+
+    - the producer's final writes of the edge buffer: each remote_store,
+      keeping only the last iteration of every reduction loop around it (an
+      output block is complete only then);
+    - the consumer's reads: each remote_load;
+
+    as sets of tiles of the edge buffer (through any views). The edge can
+    stream when every consumer core reads exactly one producer core's shard,
+    no other consumer core reads that shard, and it reads the same blocks in
+    the same order as the producer writes them, each block once ("FIFO"),
+    with more than one block per pair.
+
+    Otherwise the edge, and every other edge that leaves the same output, keeps
+    the whole-tensor handoff: its `stream` fields are dropped. A remark says
+    why, or, for an edge that can stream, its blocks.
+
+    An edge that can stream and is supported so far (one producer core, one
+    consumer core, no reduction loop around the producer's write, no fan-out)
+    gets its ring: the edge buffer is replaced by a `memref.alloc` of `depth`
+    blocks with the consumer's virtual grid mapping and `d2m.stream_ring`, so
+    d2m-allocate places it in the consumer's L1, and both accesses read and
+    write views of it whose block coordinates select slot (ordinal mod depth).
+    The producer then writes into the consumer's L1. Other edges that can
+    stream keep the whole-tensor handoff for now, with a remark.
+    d2m-lower-spatial-edges adds the per-block synchronization.
+  }];
+  let dependentDialects = ["::mlir::tt::d2m::D2MDialect"];
+}
+
 def D2MLowerSpatialEdges : Pass<"d2m-lower-spatial-edges", "::mlir::ModuleOp"> {
   let summary = "Synchronize d2m.spatial edges with local semaphores.";
   let description = [{
@@ -1497,6 +1550,18 @@ def D2MLowerSpatialEdges : Pass<"d2m-lower-spatial-edges", "::mlir::ModuleOp"> {
     - every consumer DM thread that reads the edge buffer waits, before
       anything else, until the semaphore reaches
       (producer cores) x (producer writing threads).
+
+    A streaming edge whose buffer is a ring (d2m-materialize-spatial-streams)
+    is lowered block by block instead, with one local semaphore: the consumer
+    core's copy counts blocks written into its ring, the producer core's copy
+    counts blocks read. For block n (the blocking loops' induction variables,
+    linearized), the producer's writing thread waits until at least
+    n + 1 - depth blocks were read, writes, waits for the write and increments
+    the consumer's count; the consumer's reading thread waits until n + 1
+    blocks were written, reads, waits for the read and increments the
+    producer's count. The producer finally waits until all blocks were read.
+    The waits are `semaphore_wait ... min`. A streaming edge without a ring
+    gets the whole-tensor handoff and a remark.
 
     Lowered edges are removed from `edges`; the attribute is dropped once
     empty. With `ttnn-mode` the pass does nothing (the TTNN lowering does not

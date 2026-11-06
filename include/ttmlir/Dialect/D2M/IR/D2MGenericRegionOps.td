@@ -2581,11 +2581,21 @@ def D2M_SemaphoreWaitOp : D2M_GenericRegionOp<"semaphore_wait", [MemoryEffects<[
       d2m.semaphore_wait %sem1, %c1
       d2m.semaphore_set %sem1, %c0
       ```
+
+      With `min` the wait ends once the semaphore is at least the value, for
+      a counter that only grows and that other cores may push past the value
+      (streaming spatial edges). A `min` wait cannot reset.
+
+      ```mlir
+      d2m.semaphore_wait %sem1, %c3 min
+      ```
     }];
 
-    let arguments = (ins AnyTypeOf<[D2M_LocalSemaphore, D2M_GlobalSemaphore]>:$semaphore, Index:$value, Optional<Index>:$resetValue);
+    let arguments = (ins AnyTypeOf<[D2M_LocalSemaphore, D2M_GlobalSemaphore]>:$semaphore, Index:$value, Optional<Index>:$resetValue, UnitAttr:$min);
 
-    let assemblyFormat = [{ $semaphore `,` $value (`reset` $resetValue^)? attr-dict `:` type($semaphore) }];
+    let assemblyFormat = [{ $semaphore `,` $value (`reset` $resetValue^)? (`min` $min^)? attr-dict `:` type($semaphore) }];
+
+    let hasVerifier = 1;
 
     let builders =
     [
