@@ -595,6 +595,15 @@ mlir::FailureOr<SystemDescAttr> SystemDescAttr::getFromBuffer(
           CoreCoordAttr::get(context, it->y(), it->x()));
     }
 
+    // Wormhole device firmware has 32 circular buffers (tt-metal
+    // circular_buffer_constants.h: NUM_CIRCULAR_BUFFERS under ARCH_WORMHOLE).
+    // System descriptors written by older runtimes recorded the host-side
+    // maximum (64); clamp so planning never uses ports the device lacks.
+    uint32_t numCBs = element->num_cbs();
+    if (arch == Arch::WormholeB0) {
+      numCBs = std::min<uint32_t>(numCBs, 32);
+    }
+
     auto currentChipDescAttr = ChipDescAttr::get(
         context, ArchAttr::get(context, arch),
         {element->grid_size()->y(), element->grid_size()->x()},
@@ -607,7 +616,7 @@ mlir::FailureOr<SystemDescAttr> SystemDescAttr::getFromBuffer(
         element->erisc_l1_unreserved_base(), element->dram_unreserved_base(),
         element->dram_unreserved_end(), supportedDataTypesAttr,
         supportedTileSizesAttr, element->dst_physical_size_tiles(),
-        element->num_cbs(), element->num_compute_threads(),
+        numCBs, element->num_compute_threads(),
         element->num_datamovement_threads(),
         {element->dram_grid_size()->y(), element->dram_grid_size()->x()},
         dramBankToLogicalWorkerNoc0Attr, dramBankToLogicalWorkerNoc1Attr);

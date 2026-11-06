@@ -283,6 +283,42 @@ TEST(GreedyAllocationTest, ConflictFree) {
   }
 }
 
+// Requests on disjoint core rectangles never conflict, even when their live
+// ranges overlap (each core has its own address space): twelve requests live
+// at the same time on twelve different cores share one offset. A request on
+// every core (the default rectangle) conflicts with all of them, and one on a
+// rectangle covering two of them conflicts with those two only.
+TEST(GreedyAllocationTest, DisjointCores) {
+  Planner::Problem problem;
+  auto add = [&](Planner::AllocSizeT size, Planner::CoreBox cores) {
+    return problem.def([&](Planner::VariableBuilder &builder) {
+      builder.request(Planner::Space::Scratch, size, 0, 10, cores);
+      builder.place(Planner::Space::Scratch);
+    });
+  };
+  for (int32_t i = 0; i < 12; ++i) {
+    add(100 + i, Planner::CoreBox{i / 4, i % 4, i / 4, i % 4});
+  }
+  add(1000, Planner::CoreBox{});
+  add(50, Planner::CoreBox{0, 0, 0, 1});
+
+  const Planner::AllocateStats allocateStats =
+      Planner::allocate(problem, Planner::Algorithm::Greedy);
+  // Greedy by size: the all-core request goes first, at 0. The twelve
+  // one-core requests then share one offset right above it.
+  ASSERT_EQ(problem.request(12).offset, 0);
+  for (int32_t i = 0; i < 12; ++i) {
+    ASSERT_EQ(problem.request(i).offset, 1000);
+  }
+  // The two-core request goes above requests 0 (100) and 1 (101) only.
+  ASSERT_EQ(problem.request(13).offset, 1000 + 101);
+  ASSERT_EQ(allocateStats.memUsage, 1000 + 101 + 50);
+
+  // verify() checks memory overlap only between conflicting requests.
+  [[maybe_unused]] const Planner::AllocateStats verifyStats =
+      Planner::verify(problem);
+}
+
 //===----------------------------------------------------------------------===//
 // Tests for space mapping algorithms.
 //===----------------------------------------------------------------------===//

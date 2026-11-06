@@ -1251,10 +1251,19 @@ std::shared_ptr<void> translateTTMetalToFlatbuffer(
 
         std::vector<flatbuffers::Offset<target::metal::CBRef>> cbs;
         cbs.reserve(enqueueProgramOp.getCbs().size());
-        for (auto [port, cb] : llvm::zip(enqueueProgramOp.getCbPorts(),
-                                         enqueueProgramOp.getCbs())) {
+        ArrayAttr cbCoreRanges = enqueueProgramOp.getCbCoreRangesAttr();
+        for (auto [idx, port, cb] : llvm::enumerate(
+                 enqueueProgramOp.getCbPorts(), enqueueProgramOp.getCbs())) {
           auto buffer = cache.at<target::metal::BufferRef>(cb);
-          cbs.push_back(target::metal::CreateCBRef(*cache.fbb, port, buffer));
+          flatbuffers::Offset<flatbuffers::Vector<const target::Dim2dRange *>>
+              coreRangeSet = 0;
+          if (cbCoreRanges) {
+            std::vector<target::Dim2dRange> ranges = {
+                toFlatbuffer(mlir::cast<CoreRangeAttr>(cbCoreRanges[idx]))};
+            coreRangeSet = cache.fbb->CreateVectorOfStructs(ranges);
+          }
+          cbs.push_back(target::metal::CreateCBRef(*cache.fbb, port, buffer,
+                                                   coreRangeSet));
         }
 
         std::vector<flatbuffers::Offset<target::metal::KernelConfig>>

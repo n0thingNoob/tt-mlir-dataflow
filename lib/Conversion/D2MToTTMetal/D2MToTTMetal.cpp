@@ -23,12 +23,15 @@
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Support/LogicalResult.h"
 
+#include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
 
+#include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <mlir-c/IR.h>
 #include <optional>
 
@@ -275,7 +278,8 @@ public:
       fabricConnectionConfigs = rewriter.getArrayAttr({fabricConfig});
     }
     rewriter.replaceOpWithNewOp<ttmetal::EnqueueProgramOp>(
-        op, args, cbs, cbPorts, kernelConfigs, fabricConnectionConfigs);
+        op, args, cbs, cbPorts, kernelConfigs, fabricConnectionConfigs,
+        /*cb_core_ranges=*/nullptr);
     return success();
   };
 
@@ -605,11 +609,10 @@ public:
 
 /// Second-phase lowering for d2m.spatial:
 /// - Merge all nested ttmetal.enqueue_program ops into one enqueue_program.
-/// - Concatenate per-region `cbs`. Temporary workaround: remap hardware
-/// `cb_ports` to globally unique ids (sequential 0..N-1) so merged regions do
-/// not reuse the same CB port id when circular-buffer placement is
-/// over-approximated to the full worker grid (see TTMetalToFlatbuffer
-/// circular_buffer_config).
+/// - Concatenate per-region `cbs` and `cb_ports`. Each region keeps its own
+/// hardware CB ports; `cb_core_ranges` places every CB on the cores of the
+/// region that uses it, so regions on disjoint cores may reuse port ids. The
+/// ports used on each core must be unique and below the chip's `num_cbs`.
 /// - Remap kernel-arg indices for merged enqueue: BufferAddress,
 /// GlobalSemaphore, and CBPort. Runtime resolves CBPort by indexing the merged
 /// `cbs` list, then reads that entry's hardware port.
@@ -643,12 +646,15 @@ public:
       return rewriter.notifyMatchFailure(
           op,
           "missing ttcore.system_desc on an enclosing module for spatial CB "
-          "port remap");
+          "port check");
     }
 
     SpatialRemapTable remapTable;
     SmallVector<Value> mergedCbs;
     SmallVector<int64_t> mergedCbPorts;
+    SmallVector<Attribute> mergedCbCoreRanges;
+    // CB ports in use per core (y, x), across all regions.
+    DenseMap<std::pair<int64_t, int64_t>, llvm::BitVector> portsPerCore;
     SmallVector<Attribute> mergedKernelConfigs;
     SmallVector<Attribute> mergedFabricConfigs;
     SmallVector<Operation *> preEnqueueOps;
@@ -666,17 +672,15 @@ public:
 
       const size_t mergedCbSlotBase = mergedCbs.size();
       llvm::append_range(mergedCbs, enqueueProgram.getCbs());
-      // Workaround: rebuild cb_ports as a contiguous global range when merging.
-      const size_t regionCbPortCount = enqueueProgram.getCbPorts().size();
-      if (mergedCbPorts.size() + regionCbPortCount > chipNumCbs) {
-        return rewriter.notifyMatchFailure(
-            op, "merged spatial enqueue_program cb_ports exceed chip num_cbs");
+      llvm::append_range(mergedCbPorts, enqueueProgram.getCbPorts());
+      ttmetal::CoreRangeAttr regionCoreRange =
+          getKernelsCoreRange(enqueueProgram);
+      mergedCbCoreRanges.append(enqueueProgram.getCbs().size(),
+                                regionCoreRange);
+      if (failed(markCbPorts(op, regionCoreRange, enqueueProgram.getCbPorts(),
+                             chipNumCbs, portsPerCore))) {
+        return failure();
       }
-      const int64_t portBase = static_cast<int64_t>(mergedCbPorts.size());
-      llvm::append_range(
-          mergedCbPorts,
-          llvm::seq<int64_t>(
-              portBase, portBase + static_cast<int64_t>(regionCbPortCount)));
 
       const size_t fabricConfigBase = mergedFabricConfigs.size();
       if (ArrayAttr regionFabricConfigs =
@@ -705,7 +709,8 @@ public:
             : rewriter.getArrayAttr(mergedFabricConfigs);
     rewriter.create<ttmetal::EnqueueProgramOp>(
         op.getLoc(), remapTable.getUnifiedArgs(), mergedCbs, mergedCbPorts,
-        rewriter.getArrayAttr(mergedKernelConfigs), fabricConnectionConfigs);
+        rewriter.getArrayAttr(mergedKernelConfigs), fabricConnectionConfigs,
+        rewriter.getArrayAttr(mergedCbCoreRanges));
 
     for (Operation *operation : postEnqueueOps) {
       rewriter.moveOpBefore(operation, op);
@@ -716,6 +721,59 @@ public:
   }
 
 private:
+  // Bounding box of the core ranges of all kernels in one region's program.
+  static ttmetal::CoreRangeAttr
+  getKernelsCoreRange(ttmetal::EnqueueProgramOp enqueueProgram) {
+    int64_t y0 = std::numeric_limits<int64_t>::max();
+    int64_t x0 = std::numeric_limits<int64_t>::max();
+    int64_t y1 = std::numeric_limits<int64_t>::min();
+    int64_t x1 = std::numeric_limits<int64_t>::min();
+    for (Attribute attr : enqueueProgram.getKernelConfigs()) {
+      auto coreRange = mlir::cast<ttmetal::CoreRangeAttr>(
+          mlir::cast<ttmetal::KernelConfigInterface>(attr).getCoreRange());
+      ArrayRef<int64_t> offset = coreRange.getOffset();
+      ArrayRef<int64_t> size = coreRange.getSize();
+      y0 = std::min(y0, offset[0]);
+      x0 = std::min(x0, offset[1]);
+      y1 = std::max(y1, offset[0] + size[0]);
+      x1 = std::max(x1, offset[1] + size[1]);
+    }
+    int64_t offset[] = {y0, x0};
+    int64_t size[] = {y1 - y0, x1 - x0};
+    return ttmetal::CoreRangeAttr::get(enqueueProgram.getContext(), offset,
+                                       size);
+  }
+
+  // Record `cbPorts` on every core of `coreRange`. Fails if a port is not
+  // below `numCbs` or is already used on that core by another region.
+  static LogicalResult markCbPorts(
+      d2m::SpatialOp op, ttmetal::CoreRangeAttr coreRange,
+      ArrayRef<int64_t> cbPorts, unsigned numCbs,
+      DenseMap<std::pair<int64_t, int64_t>, llvm::BitVector> &portsPerCore) {
+    ArrayRef<int64_t> offset = coreRange.getOffset();
+    ArrayRef<int64_t> size = coreRange.getSize();
+    for (int64_t y = offset[0]; y < offset[0] + size[0]; ++y) {
+      for (int64_t x = offset[1]; x < offset[1] + size[1]; ++x) {
+        llvm::BitVector &used = portsPerCore[{y, x}];
+        used.resize(numCbs);
+        for (int64_t port : cbPorts) {
+          if (port < 0 || port >= static_cast<int64_t>(numCbs)) {
+            return op.emitOpError("CB port ")
+                   << port << " on core (" << y << ", " << x
+                   << ") is out of range for chip num_cbs " << numCbs;
+          }
+          if (used.test(port)) {
+            return op.emitOpError("CB port ")
+                   << port << " is used by two regions on core (" << y << ", "
+                   << x << ")";
+          }
+          used.set(port);
+        }
+      }
+    }
+    return success();
+  }
+
   class SpatialRemapTable {
     using LocalKey = std::pair<Operation *, size_t>;
 

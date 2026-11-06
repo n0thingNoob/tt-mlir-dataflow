@@ -298,8 +298,10 @@ llvm::Expected<Tools::Problem> Tools::read(std::istream &in) {
   Tools::Problem problem;
 
   for (llvm::json::Value v : *requests) {
+    // [varIndex, first, last, size, offset] plus [y0, x0, y1, x1] for a
+    // request not on every core.
     llvm::json::Array &req = *v.getAsArray();
-    TT_assert(req.size() == 5u);
+    TT_assert((req.size() == 5u || req.size() == 9u));
 
     const PlannerImpl::IndexT varIndex = *req[0].getAsInteger();
     const PlannerImpl::SequenceT first = *req[1].getAsInteger();
@@ -307,8 +309,16 @@ llvm::Expected<Tools::Problem> Tools::read(std::istream &in) {
     const PlannerImpl::AllocSizeT size = *req[3].getAsInteger();
     const PlannerImpl::AllocSizeT offset = *req[4].getAsInteger();
 
-    problem.requests.emplace_back(
-        PlannerImpl::VarRequest{{{first, last}, size, offset}, varIndex});
+    CoreBox cores;
+    if (req.size() == 9u) {
+      cores = {static_cast<std::int32_t>(*req[5].getAsInteger()),
+               static_cast<std::int32_t>(*req[6].getAsInteger()),
+               static_cast<std::int32_t>(*req[7].getAsInteger()),
+               static_cast<std::int32_t>(*req[8].getAsInteger())};
+    }
+
+    problem.requests.emplace_back(PlannerImpl::VarRequest{
+        {{first, last}, size, offset, cores}, varIndex});
   }
 
   for (llvm::json::Value v : *variables) {
@@ -415,7 +425,12 @@ void Tools::write(const Tools::Problem &problem, std::ostream &out) {
       for (std::size_t ri = 0; ri < problem.requests.size(); ++ri) {
         const auto &r = problem.requests[ri];
         out << indent() << '[' << r.varIndex << ", " << r.first << ", "
-            << r.last << ", " << r.size << ", " << r.offset << ']';
+            << r.last << ", " << r.size << ", " << r.offset;
+        if (!r.cores.all()) {
+          out << ", " << r.cores.y0 << ", " << r.cores.x0 << ", " << r.cores.y1
+              << ", " << r.cores.x1;
+        }
+        out << ']';
         if (ri + 1 < problem.requests.size()) {
           out << ',';
         }

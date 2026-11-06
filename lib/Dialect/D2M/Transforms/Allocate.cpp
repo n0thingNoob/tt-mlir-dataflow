@@ -986,6 +986,85 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
   ///     generic op streaming but will still need a valid L1/DRAM memory
   ///     address assigned.
   ///
+  // The smallest core rectangle holding `map`'s image of a 2D grid of shape
+  // `gridShape` (the core y, x are the results right after the leading
+  // results beyond the map's dims, i.e. after a device index if there is one;
+  // trailing dims, e.g. shard indices, are evaluated at 0). Every core when
+  // the grid is not 2D or the image leaves `deviceGrid`.
+  static Planner::CoreBox coreBoxOfGrid(ArrayRef<int64_t> gridShape,
+                                        AffineMap map,
+                                        ArrayRef<int64_t> deviceGrid) {
+    constexpr int64_t kMaxPoints = 4096;
+    if (gridShape.size() != 2 || deviceGrid.size() != 2 ||
+        gridShape[0] * gridShape[1] > kMaxPoints) {
+      return {};
+    }
+    int64_t yIdx = 0;
+    if (map) {
+      if (map.getNumDims() < 2 || map.getNumSymbols() != 0 ||
+          map.getNumResults() < 2) {
+        return {};
+      }
+      // (y, x, shard...) or (device, y, x).
+      yIdx = map.getNumResults() > map.getNumDims() ? 1 : 0;
+      if (map.getNumResults() < yIdx + 2) {
+        return {};
+      }
+    }
+    Planner::CoreBox box{std::numeric_limits<std::int32_t>::max(),
+                         std::numeric_limits<std::int32_t>::max(), -1, -1};
+    for (int64_t y = 0; y < gridShape[0]; ++y) {
+      for (int64_t x = 0; x < gridShape[1]; ++x) {
+        int64_t cy = y, cx = x;
+        if (map) {
+          SmallVector<int64_t> point(map.getNumDims(), 0);
+          point[0] = y;
+          point[1] = x;
+          SmallVector<int64_t> core = map.compose(point);
+          cy = core[yIdx];
+          cx = core[yIdx + 1];
+        }
+        if (cy < 0 || cx < 0 || cy >= deviceGrid[0] || cx >= deviceGrid[1]) {
+          return {};
+        }
+        box.y0 = std::min<std::int32_t>(box.y0, cy);
+        box.x0 = std::min<std::int32_t>(box.x0, cx);
+        box.y1 = std::max<std::int32_t>(box.y1, cy);
+        box.x1 = std::max<std::int32_t>(box.x1, cx);
+      }
+    }
+    return box;
+  }
+
+  // The cores an L1 buffer holds memory on (a conservative rectangle; the
+  // planner lets buffers on disjoint rectangles share addresses, as d2m.spatial
+  // regions on disjoint core ranges do). An alloc inside a generic lives on
+  // the generic's cores; any other alloc on its own grid, placed by its
+  // virtual grid forward mapping (at the origin without one). Outside a
+  // spatial every such rectangle contains core (0, 0), so nothing changes
+  // there.
+  static Planner::CoreBox coreBoxOf(memref::AllocOp alloc,
+                                    ArrayRef<int64_t> deviceGrid) {
+    if (auto generic = alloc->getParentOfType<d2m::GenericOp>()) {
+      ttcore::GridAttr grid = generic.getGrid();
+      AffineMap map = grid.getVirtToPhysicalMap();
+      return coreBoxOfGrid(grid.getShape(), map.isEmpty() ? AffineMap() : map,
+                           deviceGrid);
+    }
+    MemRefType type = alloc.getType();
+    auto shardLayout =
+        mlir::dyn_cast<ttcore::ShardLayoutAttr>(type.getLayout());
+    if (!shardLayout) {
+      return {};
+    }
+    AffineMap map;
+    if (auto fwd = alloc->getAttrOfType<AffineMapAttr>(
+            utils::kVirtualGridForwardMappingAttr)) {
+      map = fwd.getValue();
+    }
+    return coreBoxOfGrid(shardLayout.getGridShape(type), map, deviceGrid);
+  }
+
   LogicalResult prepareMemoryPlanner(func::FuncOp funcOp,
                                      FuncAnalysisData &analysis) {
     [[maybe_unused]] AsOperandPrinter asOperand{funcOp};
@@ -993,6 +1072,8 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
     IRRewriter rewriter(funcOp->getContext());
 
     Planner::Problem &problem = analysis.problem(MemorySpace::DeviceL1);
+    SmallVector<int64_t> deviceGrid = llvm::to_vector(
+        ttcore::lookupDevice(funcOp).getWorkerGrid().getShape());
 
     for (auto &[memref, memrefCtx] : analysis.memrefs) {
       const MemorySpace memspace =
@@ -1013,12 +1094,13 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
             // If `memref` is being defined inside `funcOp` and is initially
             // placed in L1, it will require scratch memory to hold its tensor
             // data.
-            if (memref.getDefiningOp<memref::AllocOp>() &&
-                memspace == MemorySpace::DeviceL1) {
+            if (auto alloc = memref.getDefiningOp<memref::AllocOp>();
+                alloc && memspace == MemorySpace::DeviceL1) {
               memrefCtx.reqIndex = b.request(
                   PlannerSpace::Scratch,
                   memrefCtx.allocSize[ordinal(asPlannerSpace(memspace))],
-                  memrefCtx.live.first, memrefCtx.live.last);
+                  memrefCtx.live.first, memrefCtx.live.last,
+                  coreBoxOf(alloc, deviceGrid));
             }
 
             // This decision variable must be bound to its incoming memspace

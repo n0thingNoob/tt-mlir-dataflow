@@ -255,7 +255,10 @@ static std::unique_ptr<::tt::runtime::SystemDesc> getCurrentSystemDescImpl(
         l1Alignment, pcieAlignment, dramAlignment, l1UnreservedBase,
         ::tt::tt_metal::hal::get_erisc_l1_unreserved_base(), dramUnreservedBase,
         dramUnreservedEnd, supportedDataTypes, supportedTileSizes,
-        kDstPhysicalSizeTiles, NUM_CIRCULAR_BUFFERS, kNumComputeThreads,
+        kDstPhysicalSizeTiles,
+        // Device limit of the architecture (32 on Wormhole); the host-side
+        // NUM_CIRCULAR_BUFFERS is the maximum over all architectures.
+        ::tt::tt_metal::hal::get_arch_num_circular_buffers(), kNumComputeThreads,
         kNumDatamovementThreads, &dramGridSize,
         fbb.CreateVectorOfStructs(dramBankToLogicalWorkerNoc0),
         fbb.CreateVectorOfStructs(dramBankToLogicalWorkerNoc1)));

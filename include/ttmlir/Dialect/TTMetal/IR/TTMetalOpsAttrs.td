@@ -149,4 +149,6 @@ def TTMetal_KernelConfigAttr : AnyAttrOf<[TTMetal_ComputeConfigAttr, TTMetal_Noc
 
 def TTMetal_KernelConfigArrayAttr : TypedArrayAttrBase<TTMetal_KernelConfigAttr, "">;
 
+def TTMetal_CoreRangeArrayAttr : TypedArrayAttrBase<TTMetal_CoreRangeAttr, "">;
+
 #endif

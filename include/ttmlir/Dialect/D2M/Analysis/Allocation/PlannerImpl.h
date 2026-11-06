@@ -13,8 +13,10 @@
 #include "llvm/Support/Format.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <string>
 
 namespace mlir::tt::d2m::allocation {
@@ -79,6 +81,32 @@ public:
   }
 };
 
+/// The cores a request holds memory on, as an inclusive rectangle
+/// `[y0, y1] x [x0, x1]`. Every core has its own address space, so two
+/// requests on disjoint rectangles never conflict. The default covers all
+/// cores.
+struct CoreBox {
+  std::int32_t y0 = 0;
+  std::int32_t x0 = 0;
+  std::int32_t y1 = std::numeric_limits<std::int32_t>::max();
+  std::int32_t x1 = std::numeric_limits<std::int32_t>::max();
+
+  bool intersects(const CoreBox &other) const {
+    return y0 <= other.y1 && other.y0 <= y1 && x0 <= other.x1 && other.x0 <= x1;
+  }
+
+  bool contains(std::int32_t y, std::int32_t x) const {
+    return y0 <= y && y <= y1 && x0 <= x && x <= x1;
+  }
+
+  bool all() const { return *this == CoreBox{}; }
+
+  friend bool operator==(const CoreBox &lhs, const CoreBox &rhs) {
+    return lhs.y0 == rhs.y0 && lhs.x0 == rhs.x0 && lhs.y1 == rhs.y1 &&
+           lhs.x1 == rhs.x1;
+  }
+};
+
 class PlannerImpl : public PlannerBase {
 public:
   /// Type for address-like values.
@@ -100,18 +128,29 @@ public:
     }
   };
 
+  using CoreBox = allocation::CoreBox;
+
   /// An allocation descriptor, a region of memory usage `[offset, offset+size)`
-  /// reserved over a liveness range `[first, last]`.
+  /// reserved over a liveness range `[first, last]` on the cores `cores`.
+  /// Two requests conflict if their live ranges overlap and their `cores`
+  /// intersect.
   struct Request : LiveRange {
     AllocSizeT size = -1;   ///< Requested memory size.
     AllocSizeT offset = -1; ///< Start memory address (negative means N/A).
+    CoreBox cores = {};     ///< Cores holding the memory.
+
+    bool conflictsWith(const Request &other) const {
+      return std::max(first, other.first) <= std::min(last, other.last) &&
+             cores.intersects(other.cores);
+    }
 
     friend bool operator==(const Request &lhs, const Request &rhs) {
       if (!(static_cast<const LiveRange &>(lhs) ==
             static_cast<const LiveRange &>(rhs))) {
         return false;
       }
-      return (lhs.size == rhs.size) && (lhs.offset == rhs.offset);
+      return (lhs.size == rhs.size) && (lhs.offset == rhs.offset) &&
+             (lhs.cores == rhs.cores);
     }
 
     friend llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
@@ -127,6 +166,10 @@ public:
       }
       os << this->size << " [" << this->first << ", " << this->last << "] @ "
          << this->offset;
+      if (!cores.all()) {
+        os << " on (" << cores.y0 << ", " << cores.x0 << ")-(" << cores.y1
+           << ", " << cores.x1 << ")";
+      }
       if (!Nested) {
         os << '}';
       }
@@ -193,9 +236,9 @@ public:
 
   struct VariableBuilder {
     IndexT request(Space space, AllocSizeT size, SequenceT first,
-                   SequenceT last) {
+                   SequenceT last, CoreBox cores = {}) {
       const IndexT reqIndex = (parent->requests.size() + requests.size());
-      requests.emplace_back(Request{{first, last}, size, -1});
+      requests.emplace_back(Request{{first, last}, size, -1, cores});
       spaces.emplace_back(space);
       return reqIndex;
     }

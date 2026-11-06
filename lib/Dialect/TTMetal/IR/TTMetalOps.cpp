@@ -36,6 +36,18 @@ namespace mlir::tt::ttmetal {
 }
 
 ::mlir::LogicalResult EnqueueProgramOp::verify() {
+  if (getCbs().size() != getCbPorts().size()) {
+    return emitOpError("cb_ports size ")
+           << getCbPorts().size() << " does not match cbs size "
+           << getCbs().size();
+  }
+  if (ArrayAttr cbCoreRanges = getCbCoreRangesAttr();
+      cbCoreRanges && cbCoreRanges.size() != getCbs().size()) {
+    return emitOpError("cb_core_ranges size ")
+           << cbCoreRanges.size() << " does not match cbs size "
+           << getCbs().size();
+  }
+
   for (auto operand : getOperands()) {
     if (auto memRefType = mlir::dyn_cast<MemRefType>(operand.getType());
         memRefType) {
